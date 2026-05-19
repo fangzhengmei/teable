@@ -849,28 +849,40 @@ const freezeField = async () => {
 
 ## 六、完整传递路径总结
 
-### 6.1 数据流总览
+### 6.1 数据流总览（准确版）
 
 ```
-用户操作前端组件
-    ↓
-调用 View 模型方法 (updateFilter/updateSort/updateGroup/updateColumnMeta/updateOption*)
-    ↓
-发送 API 请求到后端
-    ↓
-后端 ViewService 更新数据库（JSON序列化存储）
-    │
-    ├─→ columnMeta 更新时：自动调用 adjustFrozenField 联动 frozenFieldId
-    │
-    ↓
-保存 OT 操作日志（ShareDB 实时同步）
+前端组件（Filter/Sort/Group/Grid）
+    ↓ [packages/sdk/src/model/view/*.view.ts]
+调用具体视图类型的 updateFilter/updateSort/updateGroup/updateColumnMeta/updateOption*
+    ↓ [packages/sdk/src/utils/requestWrap.ts]
+HTTP 请求到后端 API
+    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.controller.ts]
+ZodValidationPipe 校验 + Permissions('view|update') 鉴权
+    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:385-446]
+setViewProperty / patchViewOptions / updateViewColumnMeta：
+  1. findFirstOrThrow({ tableId, id, deletedTime: null })
+  2. filter/sort/group validate 分支（仅 setViewProperty）
+  3. VIEW_JSON_KEYS 解析 oldValue
+  4. ViewOpBuilder 构建 OT 操作
+  5. updateViewByOps 事务包裹
+  6. 发送 OPERATION_VIEW_UPDATE 事件
+    ↓ [apps/nestjs-backend/src/features/view/view.service.ts:439-533]
+batchUpdateViewByOps：
+  1. 解析 opsMap
+  2. 更新数据库
+  3. columnMeta 更新时 adjustFrozenField 联动 frozenFieldId
+  4. 🔴 batchService.saveRawOps() 持久化 rawOps
     ↓
 ShareDB 广播变更到所有在线客户端
-    ↓
-前端 ViewProvider 中的 useInstances 自动更新
+    ↓ [packages/sdk/src/context/use-instances/useInstances.ts]
+useInstances：
+  - op batch 事件触发
+  - dispatch({ type: 'update', doc })
+  - instanceReducer 重新创建 View 实例
     ↓
 useView Hook 获取最新视图数据
-    ↓
+    ↓ [packages/sdk/src/hooks/use-fields.ts]
 useFields Hook 按 columnMeta.order 重新排序字段
     ↓
 消费组件（useGridColumns/Sort/ViewFilter/Group）重新渲染
@@ -959,16 +971,27 @@ useView() 获取 view.group
 
 ```
 用户更新 columnMeta（拖动列/删除列）
-    ↓
+    ↓ [packages/sdk/src/model/view/view.ts:53-54]
+前端 View.updateColumnMeta 发送 API
+    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.controller.ts:189-203]
 后端 updateViewColumnMeta API
-    ↓
-🔴 view.service.ts 中调用 adjustFrozenField：
-   - 检查 frozen 字段是否在 columnMeta 更新中
-   - 如果 frozen 字段被删除 → 移到前一个字段
-   - 如果 frozen 字段 order 变化 → 移到前一个字段
-   - 如果没有前一个字段 → 清除 frozenFieldId
+    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:240-285]
+ViewOpenApiService.updateViewColumnMeta：
+  - 构建多个 updateViewColumnMeta op
+  - 调用 updateViewByOps
+    ↓ [apps/nestjs-backend/src/features/view/view.service.ts:439-533]
+🔴 view.service.batchUpdateViewByOps 中：
+   - 检查 columnMeta 更新
+   - 检查视图类型是否为 Grid
+   - 调用 adjustFrozenField：
+     * 如果 frozen 字段被删除 → 移到前一个字段
+     * 如果 frozen 字段 order 变化 → 移到前一个字段
+     * 如果没有前一个字段 → 清除 frozenFieldId
+   - 如果 options 变化，追加 setViewProperty op
     ↓
 更新 options.frozenFieldId
+    ↓
+batchService.saveRawOps 持久化所有 ops
     ↓
 ShareDB 实时同步到前端
     ↓
@@ -1009,13 +1032,14 @@ Grid 组件重新计算 freezeColumnCount
 
 ### 7.4 columnMeta 变更如何联动 frozen fields options 与实时同步？
 
-**答案**：**后端自动联动，ShareDB 实时同步**
+**答案**：**后端 batchUpdateViewByOps 中自动联动，ShareDB 实时同步**
 
-1. **触发时机**：`apps/nestjs-backend/src/features/view/view.service.ts:484-491` 在 columnMeta 更新时检查视图类型是否为 Grid
+1. **触发时机**：`apps/nestjs-backend/src/features/view/view.service.ts:476-501` 在 `batchUpdateViewByOps` 中检查 `updateViewKeySet.has('columnMeta')` 和视图类型是否为 Grid
 2. **联动逻辑**：`adjustFrozenField()` 函数处理两种场景：
    - frozen 字段被删除 → 移到前一个字段
    - frozen 字段 order 变化（拖动）→ 移到前一个字段
-3. **实时同步**：通过 OT 操作记录 → ShareDB 广播 → 前端 `useInstances` 自动更新
+3. **op 追加**：如果 options 变化，自动追加 `setViewProperty` op 到 opsMap
+4. **实时同步**：所有 ops 通过 `batchService.saveRawOps` 持久化 → ShareDB 广播 → 前端 `useInstances` 自动更新
 
 ---
 
@@ -1045,7 +1069,9 @@ Grid 组件重新计算 freezeColumnCount
 | 前端组件 | `packages/sdk/src/components/group/Group.tsx` | 🔴 分组组件（UI limit=3） |
 | 前端组件 | `packages/sdk/src/components/grid-enhancements/hooks/use-grid-group-collection.ts` | 分组集合 Hook |
 | 后端控制器 | `apps/nestjs-backend/src/features/view/open-api/view-open-api.controller.ts` | 视图配置更新 API 路由 |
-| 后端服务 | `apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts` | setViewProperty + updateViewByOps 实现 |
+| 后端服务 | `apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts` | setViewProperty + updateViewByOps 事务包裹 |
+| 后端服务 | `apps/nestjs-backend/src/features/view/view.service.ts` | 🔴 batchUpdateViewByOps（数据库更新 + rawOps 持久化） |
+| 后端服务 | `apps/nestjs-backend/src/features/view/utils/derive-frozen-fields.ts` | adjustFrozenField 实现 |
 | 前端模型 | `packages/sdk/src/model/view/grid.view.ts` | GridView 的 updateOption 实现 |
 | 前端模型 | `packages/sdk/src/model/view/kanban.view.ts` | KanbanView 的 updateOption 实现 |
 | 前端模型 | `packages/sdk/src/model/view/gallery.view.ts` | GalleryView 的 updateOption 实现 |
@@ -1106,9 +1132,9 @@ async updateViewFilter(
 }
 ```
 
-### 9.3 setViewProperty 实现
+### 9.3 setViewProperty 真实实现
 
-**位置**：`apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:385-420`
+**位置**：`apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:385-446`
 
 ```typescript
 async setViewProperty(
@@ -1118,94 +1144,223 @@ async setViewProperty(
   newValue: unknown,
   windowId?: string
 ) {
-  const curView = await this.prismaService.view.findUniqueOrThrow({
-    where: { id: viewId },
-    select: { [key]: true, type: true },
+  // 步骤1: 查询当前视图，条件：tableId + viewId + deletedTime: null
+  const curView = await this.prismaService.view
+    .findFirstOrThrow({
+      select: { [key]: true },
+      where: { tableId, id: viewId, deletedTime: null },
+    })
+    .catch(() => {
+      throw new CustomHttpException(
+        `View not found with id: ${viewId} and tableId: ${tableId}`,
+        HttpErrorCode.NOT_FOUND,
+        {
+          localization: {
+          i18nKey: 'httpErrors.view.notFound',
+        },
+      });
+    });
+
+  // 步骤2: filter/sort/group 三段 validate 分支
+  if (key === 'filter') {
+    await this.validateFilter(tableId, newValue as IFilter);
+  }
+
+  if (key === 'sort') {
+    await this.validateSort(tableId, newValue as ISort);
+  }
+
+  if (key === 'group') {
+    await this.validateGroup(tableId, newValue as IGroup);
+  }
+
+  // 步骤3: VIEW_JSON_KEYS 解析 oldValue
+  // VIEW_JSON_KEYS = ['options', 'sort', 'filter', 'group', 'shareMeta', 'columnMeta']
+  const oldValue =
+    curView[key] != null && VIEW_JSON_KEYS.includes(key)
+      ? JSON.parse(curView[key])
+      : curView[key];
+
+  // 步骤4: 构建 OT 操作
+  const ops = ViewOpBuilder.editor.setViewProperty.build({
+    key,
+    newValue,
+    oldValue,
   });
 
-  const oldValue = curView[key];
-  const parsedOldValue = oldValue ? JSON.parse(oldValue as string) : null;
+  // 步骤5: 应用到数据库
+  await this.updateViewByOps(tableId, viewId, [ops]);
 
-  // 1. 构建 OT 操作
-  const ops = [
-    ViewOpBuilder.editor.setViewProperty.build({
-      key,
-      newValue,
-      oldValue: parsedOldValue,
-    }),
-  ];
-
-  // 2. 应用到数据库
-  await this.updateViewByOps(tableId, viewId, ops);
-
-  // 3. 发送事件
+  // 步骤6: 发送 byKey 事件负载（如果有 windowId）
   if (windowId) {
     this.eventEmitterService.emitAsync(Events.OPERATION_VIEW_UPDATE, {
       tableId,
       windowId,
       viewId,
       userId: this.cls.get('user.id'),
-      byOps: ops,
+      byKey: {
+        key,
+        newValue,
+        oldValue,
+      },
     });
   }
 }
 ```
 
-### 9.4 updateViewByOps 实现
+**validateFilter 逻辑**：
+- 提取过滤条件中的字段ID
+- 检查是否包含 Button 类型字段（不支持过滤
+- 验证过滤条件兼容性
 
-**位置**：`apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:185-215`
+**validateSort 逻辑**：
+- 提取排序条件中的字段ID
+- 检查是否包含 Button 类型字段（不支持排序）
+
+**validateGroup 逻辑**：
+- 提取分组条件中的字段ID
+- 检查是否包含 Button 类型字段（不支持分组）
+
+### 9.4 updateViewByOps 职责边界
+
+**open-api 层的 updateViewByOps**：
+**位置**：`apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:448-452`
 
 ```typescript
-private async updateViewByOps(tableId: string, viewId: string, ops: IOtOperation[]) {
-  const rawOps: IRawOp[] = ops.map((op) => ({
-    id: generateId(IdPrefix.Op),
-    ...op,
-    docType: RawOpType.Edit,
-    docId: viewId,
-  }));
-
-  // 1. 更新数据库
-  await this.viewService.updateViewByOps(tableId, viewId, ops);
-
-  // 2. 保存操作日志（用于 ShareDB 实时同步）
-  await this.batchService.saveRawOps(tableId, RawOpType.Edit, IdPrefix.View, rawOps);
+async updateViewByOps(tableId: string, viewId: string, ops: IOtOperation[]) {
+  return await this.prismaService.$tx(async () => {
+    return await this.viewService.updateViewByOps(tableId, viewId, ops);
+  });
 }
 ```
 
-### 9.5 完整链路图
+**职责**：
+- ✅ 仅负责开启数据库事务
+- ✅ 转发调用 `viewService.updateViewByOps`
+- ❌ **不负责 rawOps 持久化**
+
+**view.service 层的 updateViewByOps**：
+**位置**：`apps/nestjs-backend/src/features/view/view.service.ts:435-437`
+
+```typescript
+async updateViewByOps(tableId: string, viewId: string, ops: IOtOperation[]) {
+  await this.batchUpdateViewByOps(tableId, { [viewId]: ops });
+}
+```
+
+**batchUpdateViewByOps - rawOps 持久化的真正位置**：
+**位置**：`apps/nestjs-backend/src/features/view/view.service.ts:439-533`
+
+```typescript
+async batchUpdateViewByOps(tableId: string, opsMap: { [viewId: string]: IOtOperation[] }) {
+  // 1. 解析 opsMap，获取需要更新的视图和属性
+  const { updateViewMap, updateViewKeySet } = this.getBatchUpdateViewContext(opsMap);
+  
+  // 2. 查询当前视图数据（含 version, columnMeta, options, type）
+  const viewRaws = await this.prismaService.txClient().view.findMany({...});
+  
+  // 3. 构建更新数据
+  const data = viewRaws.map((view) => {
+    // columnMeta 更新时联动 frozenFieldId
+    if (updateView.columnMeta && type === ViewType.Grid) {
+      const newOptions = adjustFrozenField(...);
+      if (newOptions) {
+        values.options = JSON.stringify(newOptions);
+        // 追加 options 更新 op
+        opsMap[viewId] = [...(opsMap[viewId] ?? []), newOptionsOp];
+      }
+    }
+    return { id: viewId, values };
+  });
+  
+  // 4. 更新数据库
+  if (data.length === 1) {
+    await this.prismaService.txClient().view.update({...});
+  } else if (data.length > 1) {
+    await this.batchUpdateDB(data);
+  }
+  
+  // 🔴 5. rawOps 持久化（发生在 view.service，不是 open-api）
+  const opDataList = viewRaws.map((view) => ({
+    docId: view.id,
+    version: view.version,
+    data: opsMap[view.id],
+  }));
+  
+  this.batchService.saveRawOps(tableId, RawOpType.Edit, IdPrefix.View, opDataList);
+}
+```
+
+**职责边界总结**：
+
+| 层级 | 职责 | rawOps 持久化 |
+|------|------|--------------|
+| open-api.controller | 路由、权限校验、Zod 校验 | ❌ |
+| open-api.service | setViewProperty（validate + 构建 op + 事务包裹）） | ❌ |
+| view.service | batchUpdateViewByOps（解析 op、更新数据库、持久化 rawOps | ✅ |
+
+### 9.5 配置更新到实时同步的端到端路径（准确文件与函数名）
 
 ```
-前端组件（Filter/Sort/Group/Grid）
-    ↓
-调用 View 模型方法（updateFilter/updateSort/updateGroup/updateColumnMeta/updateOption）
-    ↓
-HTTP 请求到后端 API
-    ↓
-ZodValidationPipe 校验请求参数
-    ↓
-Permissions 装饰器校验权限（view|update）
-    ↓
-setViewProperty 方法：
-  1. 查询当前视图数据
-  2. 构建 OT 操作（ViewOpBuilder）
-  3. 调用 updateViewByOps
-    ↓
-updateViewByOps：
-  1. 更新数据库（view 表
-  2. 保存 rawOps 到操作日志
-    ↓
-ShareDB 订阅服务监听 rawOps 变化
-    ↓
-ShareDB 广播 op 到所有在线客户端
-    ↓
-前端 useInstances 收到 op 事件
-    ↓
-useInstances 调用 dispatch({ type: 'update', doc })
-    ↓
-instanceReducer 更新 instances 数组
-    ↓
-React 重新渲染依赖视图
+前端组件（Grid/Sort/Filter/Group）
+    ↓ [packages/sdk/src/model/view/*.view.ts]
+调用具体视图类型的 updateOption/updateFilter/updateSort/updateGroup/updateColumnMeta
+    ↓ [packages/sdk/src/utils/requestWrap.ts]
+requestWrap 发送 HTTP PUT/PATCH 请求
+    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.controller.ts]
+ViewOpenApiController 接收请求：
+  - @Permissions('view|update') 权限校验
+  - ZodValidationPipe 参数校验
+  - 调用 viewOpenApiService.setViewProperty
+    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:385-446]
+ViewOpenApiService.setViewProperty：
+  1. prisma.view.findFirstOrThrow({ where: { tableId, id: viewId, deletedTime: null } })
+  2. filter/sort/group 三段 validate 分支
+  3. VIEW_JSON_KEYS 判断是否 JSON.parse(oldValue)
+  4. ViewOpBuilder.editor.setViewProperty.build(...) 构建 OT 操作
+  5. 调用 this.updateViewByOps(tableId, viewId, [ops])
+  6. 发送 Events.OPERATION_VIEW_UPDATE 事件（byKey 负载）
+    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:448-452]
+ViewOpenApiService.updateViewByOps：
+  - prismaService.$tx() 开启事务
+  - 调用 viewService.updateViewByOps
+    ↓ [apps/nestjs-backend/src/features/view/view.service.ts:435-437]
+ViewService.updateViewByOps：
+  - 调用 this.batchUpdateViewByOps(tableId, { [viewId]: ops })
+    ↓ [apps/nestjs-backend/src/features/view/view.service.ts:439-533]
+ViewService.batchUpdateViewByOps：
+  1. getBatchUpdateViewContext(opsMap) 解析操作
+  2. prisma.txClient().view.findMany() 查询当前视图
+  3. 构建更新数据（columnMeta 更新时调用 adjustFrozenField 联动 options
+  4. prisma.txClient().view.update() / batchUpdateDB() 更新数据库
+  5. 🔴 batchService.saveRawOps() 持久化 rawOps
+    ↓ [ShareDB 服务]
+ShareDB 监听到 rawOps 变化，广播 op 消息
+    ↓ [packages/sdk/src/hooks/use-connection.ts]
+前端 ShareDB 连接收到 op 消息
+    ↓ [sharedb/lib/client]
+ShareDB Doc 对象自动应用 op 到本地数据
+    ↓ [packages/sdk/src/context/use-instances/opListener.ts:15]
+Doc 触发 'op batch' 事件
+    ↓ [packages/sdk/src/context/use-instances/useInstances.ts:608-613]
+OpListenersManager 中注册的 handler 被调用：
+  - dispatch({ type: 'update', doc })
+    ↓ [packages/sdk/src/context/use-instances/reducer.ts:28-41]
+instanceReducer 处理 'update' action：
+  - factory(action.doc.data, action.doc) 重新创建实例
+    ↓ [React]
+React 检测到 instances 变化，触发重新渲染
+    ↓ [packages/sdk/src/context/view/ViewProvider.tsx]
+ViewProvider 中 views 数组更新
+    ↓ [packages/sdk/src/hooks/use-view.ts]
+useView() 返回最新视图数据
+    ↓ [packages/sdk/src/hooks/use-fields.ts]
+useFields() 按新的 columnMeta.order 重新排序字段
+    ↓ [下游组件]
+useGridColumns / Sort / ViewFilter / Group 等组件重新渲染
 ```
+
+> **注**：更新 `options` 时不走 `setViewProperty`，而是通过单独的 `patchViewOptions` 方法，最终同样调用 `updateViewByOps`。更新 `columnMeta` 时通过 `updateViewColumnMeta` 方法，构建多个 `updateViewColumnMeta` op 而不是 `setViewProperty` op。
 
 ---
 

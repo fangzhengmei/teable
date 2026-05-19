@@ -859,14 +859,14 @@ const freezeField = async () => {
 HTTP 请求到后端 API
     ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.controller.ts]
 ZodValidationPipe 校验 + Permissions('view|update') 鉴权
-    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:385-446]
-setViewProperty / patchViewOptions / updateViewColumnMeta：
-  1. findFirstOrThrow({ tableId, id, deletedTime: null })
-  2. filter/sort/group validate 分支（仅 setViewProperty）
-  3. VIEW_JSON_KEYS 解析 oldValue
-  4. ViewOpBuilder 构建 OT 操作
-  5. updateViewByOps 事务包裹
-  6. 发送 OPERATION_VIEW_UPDATE 事件
+    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts]
+三条更新入口（查询条件不同）：
+  A) setViewProperty (filter/sort/group/description/name 等)
+     findFirstOrThrow({ where: { tableId, id: viewId, deletedTime: null } })
+  B) patchViewOptions (options)
+     findFirstOrThrow({ where: { tableId, id: viewId, deletedTime: null } })
+  C) updateViewColumnMeta (columnMeta)
+     findFirstOrThrow({ where: { tableId, id: viewId } })  ⚠️ 不含 deletedTime
     ↓ [apps/nestjs-backend/src/features/view/view.service.ts:439-533]
 batchUpdateViewByOps：
   1. 解析 opsMap
@@ -889,6 +889,7 @@ useFields Hook 按 columnMeta.order 重新排序字段
 ```
 
 > *注：`updateOption` 是抽象方法，由各视图类型（GridView/KanbanView/GalleryView 等）具体实现，详见第十章。
+> **⚠️ 注意**：三条更新入口的查询条件不同，`updateViewColumnMeta` 不含 `deletedTime: null`，详见 9.4 节的差异说明表。
 
 ### 6.2 三组状态的具体路径
 
@@ -1291,13 +1292,23 @@ async batchUpdateViewByOps(tableId: string, opsMap: { [viewId: string]: IOtOpera
 }
 ```
 
+**三条更新入口的查询条件差异**：
+
+| 更新入口 | 查询条件 | 说明 |
+|---------|---------|------|
+| `setViewProperty` (line 393) | `where: { tableId, id: viewId, deletedTime: null }` | 按属性更新，含软删除过滤 |
+| `patchViewOptions` (line 462) | `where: { tableId, id: viewId, deletedTime: null }` | 部分更新 options，含软删除过滤 |
+| `updateViewColumnMeta` (line 194) | `where: { tableId, id: viewId }` | 批量更新 columnMeta，**不含 soft delete 过滤** |
+
+> ⚠️ 注意：`updateViewColumnMeta` 的查询条件与其他两个入口不同，不包含 `deletedTime: null`，这意味着它可以对已软删除的视图执行操作。请不要把三条更新入口混成同一个查询模板。
+
 **职责边界总结**：
 
 | 层级 | 职责 | rawOps 持久化 |
 |------|------|--------------|
 | open-api.controller | 路由、权限校验、Zod 校验 | ❌ |
-| open-api.service | setViewProperty（validate + 构建 op + 事务包裹）） | ❌ |
-| view.service | batchUpdateViewByOps（解析 op、更新数据库、持久化 rawOps | ✅ |
+| open-api.service | setViewProperty（validate + 构建 op + 事务包裹） | ❌ |
+| view.service | batchUpdateViewByOps（解析 op、更新数据库、持久化 rawOps） | ✅ |
 
 ### 9.5 配置更新到实时同步的端到端路径（准确文件与函数名）
 
@@ -1311,22 +1322,15 @@ requestWrap 发送 HTTP PUT/PATCH 请求
 ViewOpenApiController 接收请求：
   - @Permissions('view|update') 权限校验
   - ZodValidationPipe 参数校验
-  - 调用 viewOpenApiService.setViewProperty
-    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:385-446]
-ViewOpenApiService.setViewProperty：
-  1. prisma.view.findFirstOrThrow({ where: { tableId, id: viewId, deletedTime: null } })
-  2. filter/sort/group 三段 validate 分支
-  3. VIEW_JSON_KEYS 判断是否 JSON.parse(oldValue)
-  4. ViewOpBuilder.editor.setViewProperty.build(...) 构建 OT 操作
-  5. 调用 this.updateViewByOps(tableId, viewId, [ops])
-  6. 发送 Events.OPERATION_VIEW_UPDATE 事件（byKey 负载）
-    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:448-452]
-ViewOpenApiService.updateViewByOps：
-  - prismaService.$tx() 开启事务
-  - 调用 viewService.updateViewByOps
-    ↓ [apps/nestjs-backend/src/features/view/view.service.ts:435-437]
-ViewService.updateViewByOps：
-  - 调用 this.batchUpdateViewByOps(tableId, { [viewId]: ops })
+  - 分发到对应 service 方法
+    ↓ [apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts]
+ViewOpenApiService 三条入口（三入口：
+  A) setViewProperty (filter/sort/group/description/name等)
+     findFirstOrThrow({ where: { tableId, id: viewId, deletedTime: null }
+  B) patchViewOptions (options)
+     findFirstOrThrow({ where: { tableId, id: viewId, deletedTime: null }
+  C) updateViewColumnMeta (columnMeta)
+     findFirstOrThrow({ where: { tableId, id: viewId }  ⚠️ 不含 deletedTime
     ↓ [apps/nestjs-backend/src/features/view/view.service.ts:439-533]
 ViewService.batchUpdateViewByOps：
   1. getBatchUpdateViewContext(opsMap) 解析操作
@@ -1360,7 +1364,7 @@ useFields() 按新的 columnMeta.order 重新排序字段
 useGridColumns / Sort / ViewFilter / Group 等组件重新渲染
 ```
 
-> **注**：更新 `options` 时不走 `setViewProperty`，而是通过单独的 `patchViewOptions` 方法，最终同样调用 `updateViewByOps`。更新 `columnMeta` 时通过 `updateViewColumnMeta` 方法，构建多个 `updateViewColumnMeta` op 而不是 `setViewProperty` op。
+> **注**：三条更新入口的查询条件不同。`updateViewColumnMeta` 不含 `deletedTime: null`，详见 9.4 节的差异说明表。
 
 ---
 

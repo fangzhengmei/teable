@@ -65,12 +65,19 @@ PapaParse 的 `dynamicTyping: true` 在采样阶段执行**第一层类型识别
 | `"123"` | `number` (123) | 整数自动转数字 |
 | `"123.45"` | `number` (123.45) | 浮点数自动转数字 |
 | `"1.2e3"` | `number` (1200) | 科学记数法自动转数字 |
-| `"true"` | `boolean` (true) | 布尔值自动转换 |
-| `"false"` | `boolean` (false) | 布尔值自动转换 |
+| `"true"` | `boolean` (true) | 小写布尔值自动转换 |
+| `"false"` | `boolean` (false) | 小写布尔值自动转换 |
+| `"True"` | `string` ("True") | **首字母大写不转换**，保持字符串 |
+| `"TRUE"` | `boolean` (true) | 全大写布尔值自动转换 |
+| `"FALSE"` | `boolean` (false) | 全大写布尔值自动转换 |
 | `"2024-01-01"` | `string` ("2024-01-01") | **日期不自动转换**，保持字符串 |
-| `"null"` | `null` | 特殊值转 null |
-| `"undefined"` | `undefined` | 特殊值转 undefined |
+| `"null"` | `string` ("null") | **不自动转换**，保持字符串 |
+| `"undefined"` | `string` ("undefined") | **不自动转换**，保持字符串 |
+| `"NULL"` | `string` ("NULL") | **不自动转换**，保持字符串 |
+| `""` (空) | `string` ("") | 空字段保持空字符串 |
 | `"hello"` | `string` ("hello") | 普通文本保持字符串 |
+
+**重要修正**：PapaParse 的 `dynamicTyping` 仅转换数字和全小写/全大写的布尔值，**不会**将 `"null"`/`"undefined"` 字符串转换为 `null`/`undefined` 值。
 
 ### 采样特点
 
@@ -173,12 +180,31 @@ public static readonly SUPPORTEDTYPE: IValidateTypes[] = [
 | `"12-34"` | NaN | ❌ 否（中间有横杠） |
 | `"N/A"` | NaN | ❌ 否（空值标记） |
 | `""` | 0 | ✅ 是（但空值会被提前跳过） |
-| `" "` | 0 | ✅ 是（但空值会被提前跳过） |
+| `" "` | 0 | ✅ 是（**不会被跳过**，会被识别为 Number！） |
+| `"  "` | 0 | ✅ 是（多个空格同样被识别为 Number） |
 
-**特殊边界**：
-- `Number("")` 返回 `0`，但空字符串在类型推断前会被跳过（`column[i] === ''`）
-- `Number(" ")` 返回 `0`，同样会被跳过
+**重要修正 - 空格字符串的实际行为**：
+
+代码 `import.class.ts:314` 中的空值判断：
+```typescript
+if (column[i] === '' || column[i] == null || i === 0) {
+  continue;  // 跳过
+}
+```
+
+- `""`（空字符串）：`=== ''` 匹配 → **被跳过**
+- `null`：`== null` 匹配 → **被跳过**
+- `undefined`：`== null` 匹配 → **被跳过**
+- `" "`（一个空格）：**不匹配任何条件** → **不会被跳过**
+- `"  "`（多个空格）：**不匹配任何条件** → **不会被跳过**
+
+**特殊边界情况**：
+- `Number(" ")` 返回 `0`，且空格字符串**不会被跳过**，会被识别为 Number
+- `Number("")` 返回 `0`，但空字符串会被跳过（`column[i] === ''`）
 - `Number(null)` 返回 `0`，但 `null` 会被跳过（`column[i] == null`）
+- `Number(undefined)` 返回 `NaN`，但 `undefined` 会被跳过（`column[i] == null`）
+- `Number("null")` 返回 `NaN` → 不会被识别为 Number
+- `Number("undefined")` 返回 `NaN` → 不会被识别为 Number
 
 #### 3.2.3 Date 类型（日期白名单机制）
 
@@ -328,77 +354,149 @@ for each column:
 
 #### 3.4.2 典型收敛场景示例
 
+**注意**：PapaParse 的 `dynamicTyping: true` 会先将数字字符串转为 number 类型，布尔字符串转为 boolean 类型。
+
 **场景 1：纯数字列**
 ```
-单元格值: "100", "200", "300", "400"
+CSV 原始值: "100", "200", "300", "400"
+PapaParse 后: 100 (number), 200 (number), 300 (number), 400 (number)
+
 步骤:
   初始: [Checkbox, Number, Date, LongText, SingleLineText]
-  "100": 过滤 Checkbox → [Number, Date, LongText, SingleLineText]
-  "200": 过滤 Date → [Number, LongText, SingleLineText]
-  "300": 过滤 LongText → [Number, SingleLineText]
-  "400": 候选集仍为 [Number, SingleLineText]
+  100 (number):
+    Checkbox ❌ (不是 boolean，也不是 "true"/"false" 字符串)
+    Number ✅ (!isNaN(Number(100)) = true)
+    Date ✅ (new Date(100) = 1970-01-01, 年份有效)
+    LongText ❌ (不是 string)
+    SingleLineText ❌ (不是 string)
+    → 候选集: [Number, Date]
+  200 (number): 同样 → [Number, Date]
+  300 (number): 同样 → [Number, Date]
+  400 (number): 同样 → [Number, Date]
 结果: Number（优先级更高）
 ```
 
 **场景 2：数字+文本混合列**
 ```
-单元格值: "100", "200", "N/A", "400"
+CSV 原始值: "100", "200", "N/A", "400"
+PapaParse 后: 100 (number), 200 (number), "N/A" (string), 400 (number)
+
 步骤:
   初始: [Checkbox, Number, Date, LongText, SingleLineText]
-  "100": → [Number, Date, LongText, SingleLineText]
-  "200": → [Number, LongText, SingleLineText]
-  "N/A": 过滤 Number → [Date, LongText, SingleLineText]
-         过滤 Date → [LongText, SingleLineText]
-         过滤 LongText → [SingleLineText]
-         提前终止！
+  100 → [Number, Date]
+  200 → [Number, Date]
+  "N/A" (string):
+    Checkbox ❌ (不是 "true"/"false")
+    Number ❌ (Number("N/A") = NaN)
+    Date ❌ (不匹配日期正则)
+    LongText ❌ (无换行符)
+    SingleLineText ✅ (是 string)
+    → 候选集: [SingleLineText]，提前终止！
 结果: SingleLineText
 ```
 
-**场景 3：日期+数字混合列**
+**场景 3：日期+数字混合列（修正版）**
 ```
-单元格值: "2024-01-01", "2024-01-02", "12345", "2024-01-04"
+CSV 原始值: "2024-01-01", "2024-01-02", "12345", "2024-01-04"
+PapaParse 后: "2024-01-01" (string), "2024-01-02" (string), 12345 (number), "2024-01-04" (string)
+
 步骤:
   初始: [Checkbox, Number, Date, LongText, SingleLineText]
-  "2024-01-01": 过滤 Checkbox → [Number, Date, LongText, SingleLineText]
-                Date 通过，Number 通过（Number("2024-01-01") = NaN ❌）
-                → [Date, LongText, SingleLineText]
-  "2024-01-02": → [Date, LongText, SingleLineText]
-  "12345": 过滤 Date → [LongText, SingleLineText]
-           过滤 LongText → [SingleLineText]
-           提前终止！
-结果: SingleLineText
+  "2024-01-01" (string):
+    Checkbox ❌
+    Number ❌ (Number("2024-01-01") = NaN)
+    Date ✅ (匹配日期正则，有效)
+    LongText ❌ (无换行符)
+    SingleLineText ✅ (是 string)
+    → 候选集: [Date, SingleLineText]
+  "2024-01-02" → [Date, SingleLineText]
+  12345 (number):
+    Checkbox ❌
+    Number ✅ (!isNaN(12345) = true)
+    Date ✅ (new Date(12345) 有效，年份 1970)
+    LongText ❌ (不是 string)
+    SingleLineText ❌ (不是 string)
+    → 过滤 [Date, SingleLineText]，只有 Date 匹配
+    → 候选集: [Date]，提前终止！
+结果: Date（⚠️ 注意：数字 12345 会被识别为有效 Date！因为 new Date(12345) 是有效的时间戳）
 ```
 
-**场景 4：含 LongText 的列**
+**场景 4：含 LongText 的列（修正版）**
 ```
-单元格值: "hello", "world\nline2", "test"
+CSV 原始值: "hello\nworld", "test", "other"
+PapaParse 后: "hello\nworld" (string), "test" (string), "other" (string)
+
 步骤:
   初始: [Checkbox, Number, Date, LongText, SingleLineText]
-  "hello": → [Date, LongText, SingleLineText]
-  "world\nline2": 匹配 LongText → 立即设置 [LongText]，break！
+  "hello\nworld" (string):
+    → LongText 特殊检查（代码第 322-325 行）：
+      是 string ✓，包含 "\n" ✓ → 匹配 LongText！
+    → 立即设置候选集: [LongText]，break！
 结果: LongText（短路规则）
+
+⚠️ 重要注意：如果第一个单元格是普通文本（无换行符），会立即收敛到 SingleLineText，
+后续单元格即使包含换行符也不会被检查到！
+
+反例（错误推断）:
+  CSV: "hello", "world\nline2", "test"
+  "hello" → 候选集: [SingleLineText] → 提前终止！
+  结果: SingleLineText（漏掉了后续的 LongText）
 ```
 
 **场景 5：大部分数字，个别文本**
 ```
-单元格值: "1", "2", "3", ..., "498", "499", "500", "invalid"
-（前 499 个是数字，第 500 个是文本）
+CSV 原始值: "1", "2", "3", ..., "499", "500", "invalid"
+PapaParse 后: 1, 2, 3, ..., 500 (number), "invalid" (string)
+
 步骤:
-  前 499 个数字: 候选集收敛到 [Number, SingleLineText]
-  第 500 个 "invalid": 过滤 Number → [SingleLineText]
-结果: SingleLineText
+  初始: [Checkbox, Number, Date, LongText, SingleLineText]
+  1 → [Number, Date]
+  2 → [Number, Date]
+  ... (前 500 个数字都保持 [Number, Date])
+  "invalid" (string):
+    Checkbox ❌
+    Number ❌ (Number("invalid") = NaN)
+    Date ❌ (不匹配日期正则)
+    LongText ❌ (无换行符)
+    SingleLineText ✅
+    → 过滤 [Number, Date]，无匹配类型 → 候选集: []
+结果: SingleLineText（候选集为空时，fallback 到默认类型）
 ```
 
 **场景 6：空值不影响收敛**
 ```
-单元格值: "100", "", "200", null, "300"
+CSV 原始值: "100", "", "200", null, "300"
+PapaParse 后: 100 (number), "" (string), 200 (number), null, 300 (number)
+
 步骤:
-  "100": → [Number, Date, LongText, SingleLineText]
-  "": 跳过
-  "200": → [Number, LongText, SingleLineText]
-  null: 跳过
-  "300": → [Number, SingleLineText]
+  初始: [Checkbox, Number, Date, LongText, SingleLineText]
+  100 → [Number, Date]
+  "" → column[i] === '' → 跳过 ✓
+  200 → [Number, Date]
+  null → column[i] == null → 跳过 ✓
+  300 → [Number, Date]
 结果: Number（空值被跳过，不影响类型判断）
+```
+
+**场景 7：空格字符串的特殊处理**
+```
+CSV 原始值: " ", "100", "200"
+PapaParse 后: " " (string), 100 (number), 200 (number)
+
+步骤:
+  初始: [Checkbox, Number, Date, LongText, SingleLineText]
+  " " (string):
+    column[i] === ''? " " !== '' → 不跳过！⚠️
+    LongText 检查: string ✓，无 "\n" ❌
+    Checkbox ❌
+    Number ✅ (Number(" ") = 0，!isNaN(0) = true)
+    Date ❌ (trim 后为空字符串，isValidDateForImport 返回 false)
+    LongText ❌
+    SingleLineText ✅ (是 string)
+    → 候选集: [Number, SingleLineText]
+  100 → [Number, Date] 与 [Number, SingleLineText] 取交集 → [Number]
+  → 候选集: [Number]，提前终止！
+结果: Number（⚠️ 单个空格字符串会被识别为 Number！因为 Number(" ") = 0）
 ```
 
 #### 3.4.3 收敛过程中的关键规则
@@ -615,7 +713,34 @@ private buildTableFromHeaders(...) {
 
 **注意**：Excel 中的大数字可能自动显示为科学记数法，CSV 导出时可能变成 `"1.2E+10"` 字符串
 
-### 7.6 类型推断错误怎么办？
+### 7.6 空格字符串会被识别为 Number 吗？
+
+**是的，这是一个已知的边界问题**：
+
+- 代码只检查 `column[i] === ''`，**不检查** `" "`（空格字符串）
+- `Number(" ")` 返回 `0`，`!isNaN(0)` 为 `true`
+- 所以单个或多个空格字符串会被识别为 Number 类型
+- 如果某列首行是空格，后续是数字，整列会被推断为 Number
+
+**临时解决方案**：在导入前清理数据中的空格值
+
+### 7.7 数字会被误识别为 Date 吗？
+
+**是的**：
+
+- 日期校验 `isValidDateForImport()` 对 number 类型直接使用 `new Date(value)` 解析
+- `new Date(12345)` 返回 `1970-01-01T00:00:12.345Z`，年份 1970 在有效范围内
+- 所以任何正整数都会被识别为有效 Date
+- 如果某列先出现日期字符串，后出现数字，数字不会过滤掉 Date 类型
+
+### 7.8 LongText 检测有什么局限性？
+
+**两个重要局限性**：
+
+1. **顺序敏感**：如果第一个数据单元格是普通文本（无换行符），会立即收敛到 SingleLineText，后续单元格即使包含换行符也不会被检测到
+2. **需要至少一个含换行符的单元格在前部**：LongText 检测是短路的，但只有检测到才会生效
+
+### 7.9 类型推断错误怎么办？
 
 **V1 流程**：前端展示推断结果时，用户可手动修改每列类型
 
@@ -634,7 +759,9 @@ private buildTableFromHeaders(...) {
 | 日期有效性校验 | `import.class.ts` | 52-74 |
 | 候选类型优先级 | `import.class.ts` | 209-215 |
 | Number 验证规则 | `import.class.ts` | 93-98 |
+| 空值跳过检查 | `import.class.ts` | 314 |
 | LongText 短路逻辑 | `import.class.ts` | 322-325 |
+| 候选集为空 fallback | `import.class.ts` | 336-338 |
 | API 分析接口 | `import-open-api.service.ts` | 107-116 |
 | V2 简化导入 | `ImportCsvHandler.ts` | 305-333 |
 | V2 字段值映射 | `ImportRecordsHandler.ts` | 478-493 |

@@ -550,7 +550,12 @@ export abstract class View extends ViewCore {
   protected doc!: Doc<IViewVo>;  // ShareDB 文档实例
   tableId!: string;
 
-  // 更新方法调用后端 API
+  // updateOption 是抽象方法，由各视图类型具体实现
+  abstract updateOption(
+    option: object
+  ): Promise<AxiosResponse<void, any>> | void;
+
+  // 其他更新方法调用后端 API
   async updateFilter(filter: IFilter) {
     return await requestWrap(updateViewFilter)(this.tableId, this.id, { filter });
   }
@@ -566,12 +571,10 @@ export abstract class View extends ViewCore {
   async updateColumnMeta(columnMetaRo: IColumnMetaRo) {
     return await requestWrap(updateViewColumnMeta)(this.tableId, this.id, columnMetaRo);
   }
-
-  async updateOption(options: Partial<IViewOptions>) {
-    return await requestWrap(patchViewOptions)(this.tableId, this.id, options);
-  }
 }
 ```
+
+> **注意**：`updateOption` 是抽象方法，没有基类实现。具体实现分布在各视图类型中（GridView、KanbanView、GalleryView 等），详见第十章。
 
 ### 4.3 useView Hook
 
@@ -851,7 +854,7 @@ const freezeField = async () => {
 ```
 用户操作前端组件
     ↓
-调用 View 模型方法 (updateFilter/updateSort/updateGroup/updateColumnMeta/updateOption)
+调用 View 模型方法 (updateFilter/updateSort/updateGroup/updateColumnMeta/updateOption*)
     ↓
 发送 API 请求到后端
     ↓
@@ -872,6 +875,8 @@ useFields Hook 按 columnMeta.order 重新排序字段
     ↓
 消费组件（useGridColumns/Sort/ViewFilter/Group）重新渲染
 ```
+
+> *注：`updateOption` 是抽象方法，由各视图类型（GridView/KanbanView/GalleryView 等）具体实现，详见第十章。
 
 ### 6.2 三组状态的具体路径
 
@@ -1039,3 +1044,608 @@ Grid 组件重新计算 freezeColumnCount
 | 前端组件 | `packages/sdk/src/components/filter/view-filter/ViewFilter.tsx` | 过滤组件 |
 | 前端组件 | `packages/sdk/src/components/group/Group.tsx` | 🔴 分组组件（UI limit=3） |
 | 前端组件 | `packages/sdk/src/components/grid-enhancements/hooks/use-grid-group-collection.ts` | 分组集合 Hook |
+| 后端控制器 | `apps/nestjs-backend/src/features/view/open-api/view-open-api.controller.ts` | 视图配置更新 API 路由 |
+| 后端服务 | `apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts` | setViewProperty + updateViewByOps 实现 |
+| 前端模型 | `packages/sdk/src/model/view/grid.view.ts` | GridView 的 updateOption 实现 |
+| 前端模型 | `packages/sdk/src/model/view/kanban.view.ts` | KanbanView 的 updateOption 实现 |
+| 前端模型 | `packages/sdk/src/model/view/gallery.view.ts` | GalleryView 的 updateOption 实现 |
+| 前端模型 | `packages/sdk/src/model/view/form.view.ts` | FormView 的 updateOption 实现 |
+| 前端模型 | `packages/sdk/src/model/view/calendar.view.ts` | CalendarView 的 updateOption 实现 |
+| 前端模型 | `packages/sdk/src/model/view/plugin.view.ts` | PluginView 的 updateOption 实现（抛错） |
+| 前端模型 | `packages/sdk/src/model/view/factory.ts` | 视图实例创建工厂 |
+| 前端核心 | `packages/sdk/src/context/use-instances/useInstances.ts` | 🔴 实时同步核心 Hook |
+| 前端核心 | `packages/sdk/src/context/use-instances/opListener.ts` | OpListenersManager 实现 |
+| 前端核心 | `packages/sdk/src/context/use-instances/reducer.ts` | instanceReducer 状态更新 |
+
+---
+
+## 九、view 配置更新接口的完整暴露链路
+
+### 9.1 接口路由一览
+
+**位置**：`apps/nestjs-backend/src/features/view/open-api/view-open-api.controller.ts`
+
+所有视图配置更新接口都在 `ViewOpenApiController` 中，使用 `@Controller('api/table/:tableId/view')` 路由前缀。
+
+| HTTP方法 | 路由路径 | 权限 | 功能 |
+|---------|---------|------|------|
+| `@Put` | `/:viewId/name` | `view|update` | 更新视图名称 |
+| `@Put` | `/:viewId/description` | `view|update` | 更新视图描述 |
+| `@Put` | `/:viewId/locked` | `view|update` | 更新视图锁定状态 |
+| `@Put` | `/:viewId/share-meta` | `view|update` | 更新视图分享元数据 |
+| `@Put` | `/:viewId/column-meta` | `view|update` | 更新列元数据（字段顺序/宽度/可见性） |
+| `@Put` | `/:viewId/filter` | `view|update` | 更新过滤条件 |
+| `@Put` | `/:viewId/sort` | `view|update` | 更新排序规则 |
+| `@Put` | `/:viewId/group` | `view|update` | 更新分组规则 |
+| `@Patch` | `/:viewId/options` | `view|update` | 部分更新视图选项（含frozenFieldId） |
+| `@Put` | `/:viewId/order` | `view|update` | 更新视图排序 |
+| `@Put` | `/:viewId/manual-sort` | `view|update` | 手动排序 |
+| `@Put` | `/:viewId/record-order` | `view|update` | 更新记录物理顺序 |
+
+### 9.2 Zod 校验层
+
+每个接口都使用 `@Body(new ZodValidationPipe(schema))` 进行请求体校验：
+
+```typescript
+// 示例：更新过滤条件
+@Permissions('view|update')
+@Put('/:viewId/filter')
+async updateViewFilter(
+  @Param('tableId') tableId: string,
+  @Param('viewId') viewId: string,
+  @Body(new ZodValidationPipe(filterRoSchema)) updateViewFilterRo: IFilterRo,
+  @Headers('x-window-id') windowId?: string
+): Promise<void> {
+  return await this.viewOpenApiService.setViewProperty(
+    tableId,
+    viewId,
+    'filter',
+    updateViewFilterRo.filter,
+    windowId
+  );
+}
+```
+
+### 9.3 setViewProperty 实现
+
+**位置**：`apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:385-420`
+
+```typescript
+async setViewProperty(
+  tableId: string,
+  viewId: string,
+  key: IViewPropertyKeys,
+  newValue: unknown,
+  windowId?: string
+) {
+  const curView = await this.prismaService.view.findUniqueOrThrow({
+    where: { id: viewId },
+    select: { [key]: true, type: true },
+  });
+
+  const oldValue = curView[key];
+  const parsedOldValue = oldValue ? JSON.parse(oldValue as string) : null;
+
+  // 1. 构建 OT 操作
+  const ops = [
+    ViewOpBuilder.editor.setViewProperty.build({
+      key,
+      newValue,
+      oldValue: parsedOldValue,
+    }),
+  ];
+
+  // 2. 应用到数据库
+  await this.updateViewByOps(tableId, viewId, ops);
+
+  // 3. 发送事件
+  if (windowId) {
+    this.eventEmitterService.emitAsync(Events.OPERATION_VIEW_UPDATE, {
+      tableId,
+      windowId,
+      viewId,
+      userId: this.cls.get('user.id'),
+      byOps: ops,
+    });
+  }
+}
+```
+
+### 9.4 updateViewByOps 实现
+
+**位置**：`apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:185-215`
+
+```typescript
+private async updateViewByOps(tableId: string, viewId: string, ops: IOtOperation[]) {
+  const rawOps: IRawOp[] = ops.map((op) => ({
+    id: generateId(IdPrefix.Op),
+    ...op,
+    docType: RawOpType.Edit,
+    docId: viewId,
+  }));
+
+  // 1. 更新数据库
+  await this.viewService.updateViewByOps(tableId, viewId, ops);
+
+  // 2. 保存操作日志（用于 ShareDB 实时同步）
+  await this.batchService.saveRawOps(tableId, RawOpType.Edit, IdPrefix.View, rawOps);
+}
+```
+
+### 9.5 完整链路图
+
+```
+前端组件（Filter/Sort/Group/Grid）
+    ↓
+调用 View 模型方法（updateFilter/updateSort/updateGroup/updateColumnMeta/updateOption）
+    ↓
+HTTP 请求到后端 API
+    ↓
+ZodValidationPipe 校验请求参数
+    ↓
+Permissions 装饰器校验权限（view|update）
+    ↓
+setViewProperty 方法：
+  1. 查询当前视图数据
+  2. 构建 OT 操作（ViewOpBuilder）
+  3. 调用 updateViewByOps
+    ↓
+updateViewByOps：
+  1. 更新数据库（view 表
+  2. 保存 rawOps 到操作日志
+    ↓
+ShareDB 订阅服务监听 rawOps 变化
+    ↓
+ShareDB 广播 op 到所有在线客户端
+    ↓
+前端 useInstances 收到 op 事件
+    ↓
+useInstances 调用 dispatch({ type: 'update', doc })
+    ↓
+instanceReducer 更新 instances 数组
+    ↓
+React 重新渲染依赖视图
+```
+
+---
+
+## 十、updateOption 抽象方法与各视图类型的真实实现
+
+### 10.1 View 基类为 abstract 的事实
+
+**位置**：`packages/sdk/src/model/view/view.ts:32-39`
+
+```typescript
+export abstract class View extends ViewCore {
+  protected doc!: Doc<IViewVo>;
+  tableId!: string;
+
+  abstract updateOption(
+    option: object
+  ): Promise<AxiosResponse<void, any>> | void;
+}
+```
+
+**关键事实**：
+- ✅ `View` 类声明为 `abstract class`
+- ✅ `updateOption` 方法声明为 `abstract`，没有具体实现
+- ❌ 之前文档中写的 `async updateOption(options: Partial<IViewOptions>)` 是错误的，基类中没有这个实现
+
+### 10.2 各视图类型的真实实现分布
+
+所有具体视图类型使用 `ts-mixer` 的 `Mixin` 实现多继承，各自实现 `updateOption` 方法：
+
+#### GridView - 网格视图
+**位置**：`packages/sdk/src/model/view/grid.view.ts`
+
+```typescript
+export class GridView extends Mixin(GridViewCore, View) {
+  async updateOption(options: Partial<GridView['options']>) {
+    return await requestWrap(updateViewOptions)(this.tableId, this.id, { options });
+  }
+}
+```
+
+#### KanbanView - 看板视图
+**位置**：`packages/sdk/src/model/view/kanban.view.ts`
+
+```typescript
+export class KanbanView extends Mixin(KanbanViewCore, View) {
+  async updateOption({
+    stackFieldId, coverFieldId, isCoverFit, isFieldNameHidden, isEmptyStackHidden,
+  }: KanbanView['options']) {
+    return await requestWrap(updateViewOptions)(this.tableId, this.id, {
+      options: { stackFieldId, coverFieldId, isCoverFit, isFieldNameHidden, isEmptyStackHidden },
+    });
+  }
+}
+```
+
+#### GalleryView - 画廊视图
+**位置**：`packages/sdk/src/model/view/gallery.view.ts`
+
+```typescript
+export class GalleryView extends Mixin(GalleryViewCore, View) {
+  async updateOption({ coverFieldId, isCoverFit, isFieldNameHidden }: GalleryView['options']) {
+    return await requestWrap(updateViewOptions)(this.tableId, this.id, {
+      options: { coverFieldId, isCoverFit, isFieldNameHidden },
+    });
+  }
+}
+```
+
+#### FormView - 表单视图
+**位置**：`packages/sdk/src/model/view/form.view.ts`
+
+```typescript
+export class FormView extends Mixin(FormViewCore, View) {
+  async updateOption({ coverUrl, logoUrl, submitLabel }: FormView['options']) {
+    return await requestWrap(updateViewOptions)(this.tableId, this.id, {
+      options: { coverUrl, logoUrl, submitLabel },
+    });
+  }
+}
+```
+
+#### CalendarView - 日历视图
+**位置**：`packages/sdk/src/model/view/calendar.view.ts`
+
+```typescript
+export class CalendarView extends Mixin(CalendarViewCore, View) {
+  async updateOption({ titleFieldId, startFieldId, endFieldId, isAllDayFieldId, recurrenceFieldId, colorFieldId }: CalendarView['options']) {
+    return await requestWrap(updateViewOptions)(this.tableId, this.id, {
+      options: { titleFieldId, startFieldId, endFieldId, isAllDayFieldId, recurrenceFieldId, colorFieldId },
+    });
+  }
+}
+```
+
+#### PluginView - 插件视图
+**位置**：`packages/sdk/src/model/view/plugin.view.ts`
+
+```typescript
+export class PluginView extends Mixin(PluginViewCore, View) {
+  async updateOption(_options: unknown): Promise<AxiosResponse<void, unknown>> {
+    throw new Error('Plugin view does not support update option');
+  }
+}
+```
+
+### 10.3 视图实例创建工厂
+
+**位置**：`packages/sdk/src/model/view/factory.ts`
+
+```typescript
+export function createViewInstance(vo: IViewVo, doc?: Doc<IViewVo>): View {
+  switch (vo.type) {
+    case ViewType.Grid:
+      return new GridView(vo, doc);
+    case ViewType.Kanban:
+      return new KanbanView(vo, doc);
+    case ViewType.Gallery:
+      return new GalleryView(vo, doc);
+    case ViewType.Calendar:
+      return new CalendarView(vo, doc);
+    case ViewType.Form:
+      return new FormView(vo, doc);
+    case ViewType.Plugin:
+      return new PluginView(vo, doc);
+    default:
+      throw new Error(`Unknown view type: ${vo.type}`);
+  }
+}
+```
+
+---
+
+## 十一、实时同步机制深度解析：useInstances 内部工作原理
+
+### 11.1 整体架构
+
+**位置**：`packages/sdk/src/context/use-instances/useInstances.ts`
+
+`useInstances` 是整个前端实时同步的核心 Hook，负责：
+- 创建 ShareDB 订阅查询
+- 监听文档变更
+- 管理实例状态
+- 处理 Schema 刷新
+
+### 11.2 createSubscribeQuery - 创建订阅查询
+
+#### 查询缓存机制
+
+```typescript
+// 全局缓存，跨 Hook 实例去重相同订阅查询
+type CachedQuery = { query: Query; refCount: number };
+const subscribeQueryCache = new Map<string, CachedQuery>();
+
+const acquireQuery = <T>(
+  collection: string,
+  connection: ReturnType<typeof useConnection>['connection'],
+  queryParams: unknown,
+  refreshToken = 0
+) => {
+  const key = makeQueryKey(collection, queryParams, refreshToken);
+  const cached = subscribeQueryCache.get(key);
+  if (cached) {
+    cached.refCount += 1;
+    return { key, query: cached.query };
+  }
+  // 创建新的 ShareDB 订阅查询
+  const query = connection!.createSubscribeQuery<T>(collection, queryParams);
+  subscribeQueryCache.set(key, { query, refCount: 1 });
+  return { key, query };
+};
+```
+
+**查询键生成**：
+- 对 queryParams 递归排序键，保证相同参数生成相同 key
+- Set 转为排序后的数组
+- Map 转为排序后的 entries
+
+#### 查询生命周期
+
+```
+useInstances Effect 触发
+    ↓
+makeQueryKey(collection, queryParams, schemaRefreshToken)
+    ↓
+acquireQuery()：
+  - 查询缓存命中 → refCount++
+  - 未命中 → connection.createSubscribeQuery()
+    ↓
+query.on('ready') → dispatch({ type: 'ready', results, extra })
+    ↓
+query.on('insert') / 'remove' / 'move' → dispatch 对应 action
+    ↓
+instanceReducer 更新 instances 数组
+```
+
+### 11.3 presence receive - 监听 Schema 变更广播
+
+**位置**：`packages/sdk/src/context/use-instances/useInstances.ts:532-595`
+
+#### Presence 订阅
+
+```typescript
+useEffect(() => {
+  if (!connection || !schemaRefreshCollectionTableId || !isRecordCollection(collection)) {
+    return;
+  }
+
+  const presence: Presence = connection.getPresence(
+    getActionTriggerChannel(schemaRefreshCollectionTableId)
+  );
+
+  if (!presence.subscribed) {
+    presence.subscribe((error) => { /* ... */ });
+  }
+
+  const receiveListener = (_id: string, batch: unknown) => {
+    // 处理批量操作
+  };
+
+  presence.addListener('receive', receiveListener);
+
+  return () => {
+    presence.removeListener('receive', receiveListener);
+    if (presence.listenerCount('receive') === 0) {
+      presence.unsubscribe();
+      presence.destroy();
+    }
+  };
+}, [/* ... */]);
+```
+
+#### receive 事件处理分支
+
+```typescript
+const receiveListener = (_id: string, batch: unknown) => {
+  // 分支1: 删除记录（skipRealtime=true)
+  const deletedRecordIds = getProjectedDeleteRecordIds(schemaRefreshCollectionTableId, batch);
+  if (deletedRecordIds?.length) {
+    removeProjectedRecordsByIds(deletedRecordIds);
+    return;
+  }
+
+  // 分支2: 批量修改/新增记录（skipRealtime=true)
+  if (
+    shouldRefreshAfterProjectedMutation(..., 'setRecord') ||
+    shouldRefreshAfterProjectedMutation(..., 'addRecord')
+  ) {
+    setSchemaRefreshToken((current) => current + 1);
+    return;
+  }
+
+  // 分支3: Schema 相关字段变更
+  if (!isSchemaRefreshAction(schemaRefreshCollectionTableId, batch)) {
+    return;
+  }
+
+  // 分支4: 字段 Schema 变更，尝试增量刷新
+  const fieldIds = getSchemaRefreshRecordFieldIds(schemaRefreshCollectionTableId, batch);
+  if (fieldIds?.length) {
+    void refreshProjectedRecordFields(fieldIds).then((handled) => {
+      if (!handled) {
+        setSchemaRefreshToken((current) => current + 1);
+      }
+    });
+    return;
+  }
+
+  // 分支5: 其他情况，全量刷新
+  setSchemaRefreshToken((current) => current + 1);
+};
+```
+
+#### Schema 刷新触发字段
+
+```typescript
+const schemaRefreshFieldProperties = new Set([
+  'type',
+  'options',
+  'expression',
+  'lookupOptions',
+  'rollupConfig',
+  'linkConfig',
+  'linkRelationship',
+]);
+```
+
+### 11.4 schemaRefreshToken - Schema 刷新令牌
+
+**位置**：`packages/sdk/src/context/use-instances/useInstances.ts:412`
+
+```typescript
+const [schemaRefreshToken, setSchemaRefreshToken] = useState(0);
+```
+
+**作用**：
+- `schemaRefreshToken` 是一个递增的数字状态，用于触发重新创建 ShareDB 查询
+- 当 Schema 发生变更时（如字段类型、选项、表达式等变化
+- 通过 `setSchemaRefreshToken((current) => current + 1` 递增令牌
+- 令牌变化会触发 `useEffect` 重新执行 `acquireQuery`
+- 新的查询会携带新的数据，确保前端数据与后端 Schema 一致
+
+**触发场景**：
+1. 字段类型变更
+2. 字段选项变更
+3. 查找/汇总/链接字段配置变更
+4. 链接关系变更
+5. 批量记录修改/新增（skipRealtime=true)
+6. 批量记录删除（skipRealtime=true)
+7. 其他需要全量刷新的场景
+
+### 11.5 op batch - 文档操作批量更新
+
+#### OpListenersManager - 操作监听管理器
+
+**位置**：`packages/sdk/src/context/use-instances/opListener.ts`
+
+```typescript
+export class OpListenersManager<T> {
+  private opListeners: Map<string, () => void> = new Map();
+
+  add(doc: Doc<T>, handler: (op: unknown[]) => void) {
+    if (this.opListeners.has(doc.id)) {
+      return;
+    }
+    doc.on('op batch', handler);
+    this.opListeners.set(doc.id, () => {
+      doc.removeListener('op batch', handler);
+      doc.listenerCount('op batch') === 0 && doc.destroy();
+    });
+  }
+
+  remove(doc: Doc<T>) {
+    const cleanupFunction = this.opListeners.get(doc.id);
+    cleanupFunction && cleanupFunction();
+    this.opListeners.delete(doc.id);
+  }
+
+  clear() {
+    this.opListeners.forEach((cleanupFunction) => cleanupFunction());
+    this.opListeners.clear();
+  }
+}
+```
+
+#### op batch 事件监听
+
+**位置**：`packages/sdk/src/context/use-instances/useInstances.ts:608-613`
+
+```typescript
+const handleReady = useCallback((query: Query<T>) => {
+  dispatch({ type: 'ready', results: query.results, extra: query.extra });
+  query.results.forEach((doc) => {
+    opListeners.current.add(doc, (op) => {
+      console.log(`${query.collection} on op:', op, doc);
+      dispatch({ type: 'update', doc });
+    });
+  });
+}, []);
+```
+
+#### instanceReducer - 状态更新
+
+**位置**：`packages/sdk/src/context/use-instances/reducer.ts:22-102`
+
+```typescript
+export function instanceReducer<T, R extends { id: string }>(
+  state: IInstanceState<R>,
+  action: IInstanceAction<T>,
+  factory: (data: T, doc?: Doc<T>) => R
+): IInstanceState<R> {
+  switch (action.type) {
+    case 'update': {
+      if (!hasDocData(action.doc)) {
+        return state;
+      }
+      return {
+        ...state,
+        instances: state.instances.map((instance) => {
+          if (instance.id === action.doc.id) {
+            return factory(action.doc.data, action.doc);
+          }
+          return instance;
+        }),
+      };
+    }
+    // ... 其他 action 类型
+  }
+}
+```
+
+### 11.6 完整实时同步流程图
+
+```
+后端保存 rawOps 到数据库
+    ↓
+ShareDB 服务监听到 rawOps 变化
+    ↓
+ShareDB 广播 op 消息到所有订阅客户端
+    ↓
+前端 ShareDB 客户端收到 op 消息
+    ↓
+ShareDB Doc 对象自动应用 op 到本地数据
+    ↓
+Doc 触发 'op batch' 事件
+    ↓
+OpListenersManager 中注册的 handler 被调用
+    ↓
+dispatch({ type: 'update', doc })
+    ↓
+instanceReducer 重新创建实例（factory(doc.data, doc)
+    ↓
+React 重新渲染
+```
+
+### 11.7 与视图配置相关的 Schema 刷新流程
+
+```
+用户修改视图配置（filter/sort/group/columnMeta/options)
+    ↓
+HTTP 请求到后端
+    ↓
+后端更新数据库 + 保存 rawOps
+    ↓
+ShareDB 广播 op 到所有客户端
+    ↓
+前端 ShareDB 客户端收到 op
+    ↓
+View Doc 数据更新
+    ↓
+op batch 事件触发
+    ↓
+useInstances dispatch update action
+    ↓
+instanceReducer 重新创建 View 实例
+    ↓
+ViewProvider 中 views 数组更新
+    ↓
+useView() 返回新的视图数据
+    ↓
+useFields/useGridColumns 等重新计算
+    ↓
+Grid/Sort/Filter/Group 组件重新渲染
+```

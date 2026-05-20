@@ -356,25 +356,67 @@ for each column:
 
 **注意**：PapaParse 的 `dynamicTyping: true` 会先将数字字符串转为 number 类型，布尔字符串转为 boolean 类型。
 
-**场景 1：纯数字列**
-```
-CSV 原始值: "100", "200", "300", "400"
-PapaParse 后: 100 (number), 200 (number), 300 (number), 400 (number)
+**场景 1：纯数字列（完整收敛路径）**
 
-步骤:
-  初始: [Checkbox, Number, Date, LongText, SingleLineText]
-  100 (number):
-    Checkbox ❌ (不是 boolean，也不是 "true"/"false" 字符串)
-    Number ✅ (!isNaN(Number(100)) = true)
-    Date ✅ (new Date(100) = 1970-01-01, 年份有效)
-    LongText ❌ (不是 string)
-    SingleLineText ❌ (不是 string)
-    → 候选集: [Number, Date]
-  200 (number): 同样 → [Number, Date]
-  300 (number): 同样 → [Number, Date]
-  400 (number): 同样 → [Number, Date]
-结果: Number（优先级更高）
+假设 CSV 有 10 行数据（第 1 行表头，2-10 行数据）：
+
 ```
+行1 (表头): "数量"
+行2: "100" → PapaParse → 100 (number)
+行3: "200" → PapaParse → 200 (number)
+行4: "300" → PapaParse → 300 (number)
+行5: "400" → PapaParse → 400 (number)
+行6: "500" → PapaParse → 500 (number)
+...
+行10: "900" → PapaParse → 900 (number)
+```
+
+**收敛过程逐行追踪**：
+
+```
+初始候选集: [Checkbox, Number, Date, LongText, SingleLineText] (长度=5)
+跳过行1 (i=0, 表头)
+
+处理行2 (i=1, 值=100, number类型):
+  候选集长度 5 > 1，继续
+  不是空值，继续
+  LongText 检查: 不是 string → 不触发短路
+  逐个验证:
+    Checkbox: ❌ (不是 boolean，也不是 "true"/"false" 字符串)
+    Number:   ✅ (!isNaN(Number(100)) = true)
+    Date:     ✅ (new Date(100) = 1970-01-01, 年份在 1-9999)
+    LongText: ❌ (不是 string)
+    SingleLineText: ❌ (不是 string)
+  过滤后候选集: [Number, Date] (长度=2)
+
+处理行3 (i=2, 值=200, number类型):
+  候选集长度 2 > 1，继续
+  LongText 检查: 不是 string → 不触发短路
+  逐个验证 [Number, Date]:
+    Number: ✅ (!isNaN(200) = true)
+    Date:   ✅ (new Date(200) 有效，年份 1970)
+  过滤后候选集: [Number, Date] (长度=2)
+
+处理行4 (i=3, 值=300, number类型):
+  候选集长度 2 > 1，继续
+  验证结果同上 → [Number, Date] (长度=2)
+
+... 行5-行10 全部相同 ...
+
+候选集始终保持 [Number, Date]，从未达到 <=1，因此不会提前终止！
+遍历完所有 9 行数据后结束循环
+
+最终结果: Number（候选集[0]，优先级更高）
+```
+
+**关键发现 - 纯数字列不会提前终止**：
+- 数字类型同时通过 Number 和 Date 验证
+- 候选集始终保持 `[Number, Date]`（长度=2）
+- 永远不会触发 `length <= 1` 的提前终止条件
+- 会遍历完所有 500 行采样数据
+
+**什么时候纯数字列会提前终止？**
+只有当后续出现非数字值（如文本、日期字符串等）时，才会过滤掉 Number 或 Date，使候选集长度变为 1，从而触发提前终止。
 
 **场景 2：数字+文本混合列**
 ```
@@ -444,23 +486,28 @@ PapaParse 后: "hello\nworld" (string), "test" (string), "other" (string)
 ```
 
 **场景 5：大部分数字，个别文本**
+
+由于纯数字列候选集始终是 `[Number, Date]`（长度=2），**不会提前终止**，会遍历所有 500 行采样数据。
+
 ```
 CSV 原始值: "1", "2", "3", ..., "499", "500", "invalid"
 PapaParse 后: 1, 2, 3, ..., 500 (number), "invalid" (string)
 
 步骤:
-  初始: [Checkbox, Number, Date, LongText, SingleLineText]
-  1 → [Number, Date]
-  2 → [Number, Date]
-  ... (前 500 个数字都保持 [Number, Date])
-  "invalid" (string):
+  初始: [Checkbox, Number, Date, LongText, SingleLineText] (长度=5)
+  1 → [Number, Date] (长度=2，不会终止，继续)
+  2 → [Number, Date] (长度=2，继续)
+  ... (前 500 个数字都保持 [Number, Date]，遍历所有 500 行)
+  第 501 行 "invalid" (string): （假设在 500 行采样范围内）
     Checkbox ❌
     Number ❌ (Number("invalid") = NaN)
     Date ❌ (不匹配日期正则)
     LongText ❌ (无换行符)
     SingleLineText ✅
-    → 过滤 [Number, Date]，无匹配类型 → 候选集: []
-结果: SingleLineText（候选集为空时，fallback 到默认类型）
+    → 过滤 [Number, Date]，无匹配类型 → 候选集: [] (长度=0，终止)
+结果: SingleLineText（候选集为空时，通过 validatingFieldTypes[0] || DEFAULT fallback）
+
+⚠️ 关键：如果 "invalid" 在第 501 行（超出采样范围），则不会被检测到，结果为 Number
 ```
 
 **场景 6：空值不影响收敛**
@@ -508,32 +555,76 @@ PapaParse 后: " " (string), 100 (number), 200 (number)
 | **LongText 短路** | 匹配 LongText 立即终止 | LongText 优先级最高，一旦出现整列锁定 |
 | **优先级兜底** | 候选集取[0] | 优先级高的类型在前面，保证严格类型优先 |
 
-#### 3.4.4 提前终止的局限性
+#### 3.4.4 提前终止的触发条件与局限性
+
+##### 触发提前终止的 4 种典型场景
+
+| 场景 | 触发时机 | 候选集变化 | 风险 |
+|------|----------|------------|------|
+| **纯文本列** | 第 1 个非空单元格 | [SingleLineText] | 后续出现 LongText 不会被检测 |
+| **含 LongText 列** | 第 1 个含换行符的单元格 | [LongText] | 无风险（LongText 是最强类型） |
+| **数字+文本混合列** | 第 1 个文本值出现时 | [SingleLineText] | 无风险（已收敛到最宽松类型） |
+| **日期字符串列** | 第 1 个日期值出现时 | [Date, SingleLineText]（长度=2，不会终止！） | 后续出现数字不会被过滤 |
+
+##### ⚠️ 不会触发提前终止的场景
+
+**纯数字列不会提前终止**：
+- 候选集始终保持 `[Number, Date]`（长度=2）
+- 永远不会触发 `length <= 1` 条件
+- 会遍历完所有 500 行采样数据
+
+**纯日期字符串列不会提前终止**：
+- 候选集始终保持 `[Date, SingleLineText]`（长度=2）
+- 永远不会触发提前终止
+
+##### 提前终止导致漏检的真实风险场景
 
 ```
+场景：普通文本后跟随 LongText
+
 CSV 内容:
-  行1: 100
-  行2: 200
+  行1 (表头): "备注"
+  行2: "简单文本"    ← string，无换行符
+  行3: "普通内容"    ← string，无换行符
   ...
-  行100: 10000  ← 候选集收敛到 [Number, SingleLineText]，提前终止！
-  行101: "文本" ← 不会被检查到！
+  行50: "简短描述"   ← 候选集收敛到 [SingleLineText]（长度=1），提前终止！
+  行51: "第一行\n第二行"  ← 含换行符，但不会被检查到！
   ...
-  行500: "数据"
+  行500: ...
 
-推断结果: Number（错误）
-实际情况: 混合类型，应为 SingleLineText
+推断结果: SingleLineText（错误）
+实际情况: 应该是 LongText
 ```
 
-**风险**：前 100 行纯数字导致提前终止，后面的文本值不会被检查到。
+**风险**：前 N 行都是简单文本导致收敛到 SingleLineText 并提前终止，后续出现的多行文本（LongText）不会被检测到。这是实际生产中最可能遇到的类型推断错误场景。
+
+##### 另一个风险场景
+
+```
+场景：布尔值后跟随其他类型
+
+CSV 内容:
+  行1: "启用"
+  行2: "true"   ← 转为 boolean
+  行3: "false"  ← 转为 boolean
+  行4: true     ← 候选集收敛到 [Checkbox]（长度=1），提前终止！
+  行5: "1"      ← 不会被检查到
+  行6: "是"     ← 不会被检查到
+
+推断结果: Checkbox（可能错误）
+实际情况: 如果后续有非布尔值，应该是 SingleLineText
+```
 
 ### 3.5 关键规则总结
 
 1. **提前终止**：候选类型只剩 1 个时立即停止遍历该列剩余单元格
-2. **空值忽略**：空单元格不参与类型判断
-3. **首行跳过**：第一行作为表头，不参与类型推断
-4. **LongText 短路**：只要有一个单元格包含换行符，整列立即判定为 LongText
-5. **空列兜底**：整列为空时默认 SingleLineText
-6. **分层识别**：PapaParse dynamicTyping 做第一层，Zod Schema 做第二层
+2. **纯数字列不终止**：候选集始终 `[Number, Date]`（长度=2），会遍历全部 500 行采样
+3. **空值忽略**：空单元格（`""`, `null`, `undefined`）不参与类型判断，但**空格字符串 `" "` 不被跳过**
+4. **首行跳过**：第一行作为表头，不参与类型推断
+5. **LongText 短路**：只要有一个单元格包含换行符，整列立即判定为 LongText
+6. **空列兜底**：整列为空时默认 SingleLineText
+7. **候选集为空兜底**：过滤后候选集为空时，取 `validatingFieldTypes[0] || DEFAULT`（SingleLineText）
+8. **分层识别**：PapaParse dynamicTyping 做第一层，Zod Schema 做第二层
 
 ---
 

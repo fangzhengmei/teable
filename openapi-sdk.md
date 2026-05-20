@@ -1173,11 +1173,65 @@ export const ErrorCodeToStatusMap: Record<HttpErrorCode, number> = {
   export class RecordOpenApiController { ... }
   ```
 
+#### @AllowAnonymous 三种级别的真实鉴权语义
+
+**重要修正**：`@AllowAnonymous()` **不等同于无需鉴权**。它是一个三级别的鉴权策略，控制**匿名用户（未登录）**的访问权限，而**已登录用户**始终会通过鉴权（但仍需权限检查）。
+
+[apps/nestjs-backend/src/features/auth/decorators/allow-anonymous.decorator.ts:3-7](apps/nestjs-backend/src/features/auth/decorators/allow-anonymous.decorator.ts)
+```typescript
+export enum AllowAnonymousType {
+  RESOURCE = 'resource',  // 默认值
+  USER = 'user',
+  PUBLIC = 'public',
+}
+```
+
+**鉴权判断流程**（AuthGuard）:
+
+[apps/nestjs-backend/src/features/auth/guard/auth.guard.ts:31-41](apps/nestjs-backend/src/features/auth/guard/auth.guard.ts)
+```typescript
+async validate(context: ExecutionContext) {
+  const result = (await super.canActivate(context)) as boolean;
+  const isAllowAnonymous = this.reflector.getAllAndOverride<boolean>(IS_ALLOW_ANONYMOUS, [...]);
+  // ⚠️ 关键：只有当 NOT AllowAnonymous 且用户是匿名时，才抛出 401
+  if (!isAllowAnonymous && isAnonymous(this.cls.get('user.id'))) {
+    throw new UnauthorizedException();
+  }
+  return result;
+}
+```
+
+**三种级别的语义对比**:
+
+| 级别 | 语义 | 已登录用户 | 匿名用户（未登录） | 典型使用场景 |
+|------|------|------------|-------------------|-------------|
+| **`RESOURCE`** (默认) | 资源级鉴权 | ✅ 通过鉴权 | 需通过资源特定授权（base share header 或 template header），否则降级到正常检查可能失败 | 记录、字段、视图等资源操作接口 |
+| **`USER`** | 用户级鉴权 | ✅ 通过鉴权 | ✅ 直接通过（允许完全匿名访问） | 用户注册、登录、健康检查等 |
+| **`PUBLIC`** | 公开级鉴权 | ✅ 通过鉴权，权限检查失败时回退到模板权限 | ✅ 通过鉴权，降级到模板权限检查 | 公开共享的页面、模板预览 |
+
+**PERMISSION GUARD 中的具体逻辑**（针对匿名用户）:
+
+[apps/nestjs-backend/src/features/auth/guard/permission.guard.ts:345-356](apps/nestjs-backend/src/features/auth/guard/permission.guard.ts)
+```typescript
+private async resolveAnonymousPermission(
+  context: ExecutionContext,
+  allowAnonymousType: AllowAnonymousType | undefined
+): Promise<boolean> {
+  if (allowAnonymousType === AllowAnonymousType.PUBLIC) {
+    return this.templatePermissionCheck(context);  // 模板权限检查
+  }
+  if (allowAnonymousType === AllowAnonymousType.USER) {
+    return true;  // 直接允许
+  }
+  throw new UnauthorizedException();  // RESOURCE 级别匿名用户直接失败
+}
+```
+
 **受影响接口**:
-- 所有使用 `@AllowAnonymous()` 的接口
-- 共享视图接口 (`/share/{shareId}/view/records`)
-- 记录相关接口 (`/table/{tableId}/record`)
-- 其他公开接口
+- `@AllowAnonymous(AllowAnonymousType.RESOURCE)`: 记录、字段、视图等资源操作接口
+- `@AllowAnonymous(AllowAnonymousType.USER)`: 用户注册、登录等
+- `@AllowAnonymous(AllowAnonymousType.PUBLIC)`: 公开共享页面、模板预览
+- 所有使用 `@Public()` 的接口：完全跳过所有鉴权和权限检查
 
 **影响**: Swagger UI 测试时需要填写不必要的 Authorization header
 
@@ -1587,7 +1641,217 @@ Teable 的 OpenAPI 与 SDK 对齐机制经历了从 **v1 手动契约** 到 **v2
 
 ### 关键发现
 
-1. **openapi-typescript 链路悬空**: 脚本 `scripts/generate-openapi-types.mjs` 生成的 `apps/nextjs-app/src/api/types.ts` 目前没有被 SDK 或业务代码使用，手写 SDK 仍然直接使用 Zod 推导的类型。
+1. **openapi-typescript 链路悬空**: 脚本 `scripts/generate-openapi-types.mjs` 配置生成 `apps/nextjs-app/src/api/types.ts`，但目标目录和文件目前不存在，链路处于"有脚本但未执行或产物已失效"的状态。
+
+---
+
+## 第十一部分：v2Contract 文档覆盖 vs 运行时实现边界
+
+### 11.1 v2Contract 文档可描述能力边界
+
+**契约定义文件**: [packages/v2/contract-http/src/contract.ts](packages/v2/contract-http/src/contract.ts)
+
+**v2Contract 定义的接口总数**: **36 个**
+
+| 模块 | 接口数量 | 接口列表 |
+|------|----------|---------|
+| **bases** | 2 | create, list |
+| **tables** | 34 | create, createTables, createField, explainCreateField, updateField, explainUpdateField, updateRecords, createRecord, submitRecord, createRecords, deleteRecords, deleteField, explainDeleteField, explainDeleteTable, delete, restore, getById, getRecord, importCsv, importRecords, listRecords, list, rename, updateRecord, reorderRecords, duplicateField, duplicateRecord, duplicateTable, paste, clear, deleteByRange, explainCreateRecord, explainUpdateRecord, explainDeleteRecords |
+
+**文档可描述的能力**:
+- ✅ HTTP 方法、路径、成功状态码
+- ✅ 请求输入 Schema（通过 Zod）
+- ✅ 成功响应 Schema（通过 Zod）
+- ✅ 接口摘要、标签
+- ✅ 部分错误响应 Schema（`v2ContractErrors` 定义了 400, 404, 500）
+- ❌ 中间件、守卫、鉴权要求（契约层不描述）
+- ❌ 完整的错误状态码列表（只声明了 3 种）
+- ❌ 限流、超时等运维属性
+
+---
+
+### 11.2 NestJS 当前实际实现覆盖边界
+
+**NestJS 实现文件**: [apps/nestjs-backend/src/features/v2/v2.controller.ts](apps/nestjs-backend/src/features/v2/v2.controller.ts)
+
+**NestJS 实际实现的接口数**: **4 个**（仅为契约定义的 11%）
+
+| 契约接口 | NestJS 实现状态 | 说明 |
+|----------|----------------|------|
+| `tables.create` | ✅ 已实现 | `executeCreateTableEndpoint` |
+| `tables.getById` | ✅ 已实现 | `executeGetTableByIdEndpoint` |
+| `tables.deleteRecords` | ✅ 已实现 | `executeDeleteRecordsEndpoint` |
+| `tables.updateRecords` | ✅ 已实现 | `executeUpdateRecordsEndpoint` |
+| **其余 32 个接口** | ❌ 未实现 | 契约中声明但 NestJS 中无对应 handler |
+
+**代码证据**:
+
+[apps/nestjs-backend/src/features/v2/v2.controller.ts:44-91](apps/nestjs-backend/src/features/v2/v2.controller.ts)
+```typescript
+@Implement(v2Contract.tables)
+tables() {
+  return {
+    create: implement(v2Contract.tables.create).handler(...),
+    getById: implement(v2Contract.tables.getById).handler(...),
+    deleteRecords: implement(v2Contract.tables.deleteRecords).handler(...),
+    updateRecords: implement(v2Contract.tables.updateRecords).handler(...),
+    // ⚠️ 其余 30 个 tables 接口未实现
+    // ⚠️ bases 模块的 2 个接口完全未实现
+  };
+}
+```
+
+**边界总结**:
+
+| 维度 | 文档可描述 (v2Contract) | 运行时已实现 (NestJS) | 覆盖率 |
+|------|------------------------|----------------------|--------|
+| bases 模块 | 2 个接口 | 0 个 | 0% |
+| tables 模块 | 34 个接口 | 4 个 | ~12% |
+| 总计 | 36 个接口 | 4 个 | ~11% |
+
+**设计意图**: v2Contract 作为**目标契约**先行定义，NestJS 实现按优先级逐步迁移，形成"契约先行、实现后补"的演进模式。
+
+---
+
+## 第十二部分：openapi-typescript 链路的可验证表述
+
+### 12.1 脚本配置与预期输出
+
+**脚本文件**: [scripts/generate-openapi-types.mjs](scripts/generate-openapi-types.mjs)
+
+```javascript
+import openapiTS from 'openapi-typescript';
+
+async function generateTypes() {
+  // 输入：后端构建产物
+  const localPath = path.resolve(process.cwd(), 'apps/nestjs-backend/dist/openapi.json');
+  
+  // 输出：nextjs-app 下的类型文件
+  const outputPath = path.resolve(process.cwd(), 'apps/nextjs-app/src/api/types.ts');
+  
+  const output = await openapiTS(localPath, {
+    commentHeader: [
+      '/* eslint-disable sonarjs/no-duplicate-string */',
+      '/* eslint-disable @typescript-eslint/naming-convention */',
+      '/* eslint-disable prettier/prettier */',
+    ].join('\n') + '\n',
+  });
+  
+  fs.writeFileSync(outputPath, output);
+}
+```
+
+**预期产物特征**（基于 openapi-typescript 6.x 版本输出）:
+- 导出 `paths` 接口：包含所有 API 路径的请求/响应类型
+- 导出 `components` 接口：包含所有复用的 Schema 定义
+- 导出 `operations` 接口：按 operationId 索引的操作类型
+- 文件头部包含三个 eslint-disable 注释
+
+---
+
+### 12.2 仓库当前实际产物状态（可核验）
+
+**核验方法**: 检查文件系统和代码引用
+
+```powershell
+# 1. 检查预期输出目录是否存在
+Test-Path "apps/nextjs-app/src/api"
+# 结果: False ❌ （目录不存在）
+
+# 2. 检查预期输出文件是否存在
+Test-Path "apps/nextjs-app/src/api/types.ts"
+# 结果: False ❌ （文件不存在）
+
+# 3. 检查代码库中是否有对该文件的引用
+Get-ChildItem -Recurse -Filter "*.ts" -Path "apps/nextjs-app/src" | 
+  Select-String -Pattern "types\.ts|from ['\"].*api/types" | 
+  Measure-Object | Select-Object -ExpandProperty Count
+# 结果: 0 ❌ （无引用）
+```
+
+**目录实际结构**:
+```
+apps/nextjs-app/src/
+├── backend/
+│   └── api/
+│       └── rest/
+│           ├── axios.ts
+│           ├── get-user.ts
+│           └── ssr-api.ts
+├── components/
+├── features/
+└── ...
+```
+
+注意：实际存在的是 `backend/api/rest/` 目录，而非脚本配置的 `api/` 目录。
+
+---
+
+### 12.3 链路状态结论
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| ✅ 脚本存在 | 通过 | `scripts/generate-openapi-types.mjs` 存在且配置完整 |
+| ✅ 输入依赖路径 | 可验证 | 依赖 `apps/nestjs-backend/dist/openapi.json`（后端构建产物） |
+| ❌ 输出目录存在 | 失败 | `apps/nextjs-app/src/api/` 目录不存在 |
+| ❌ 输出文件存在 | 失败 | `apps/nextjs-app/src/api/types.ts` 文件不存在 |
+| ❌ 产物被引用 | 失败 | 代码库中无对该文件的 import 引用 |
+
+**链路状态**: **配置定义完整，但实际产物缺失且未被使用**
+
+可能的原因：
+1. 脚本从未被执行过
+2. 脚本执行过但产物被清理（如 .gitignore 排除）
+3. 目录结构变更后脚本未同步更新
+
+---
+
+## 第十三部分：最终结论与统一口径
+
+### 13.1 AllowAnonymous 语义（统一口径）
+
+❌ **错误说法**: `@AllowAnonymous()` = 无需鉴权
+
+✅ **正确表述**:
+- `@AllowAnonymous()` 是**三级别的匿名访问控制策略**，仅影响**未登录用户**
+- **已登录用户**始终通过身份认证（但仍需后续权限检查）
+- 三个级别差异：
+  - `RESOURCE` (默认): 匿名用户需资源特定授权（base share/template header）
+  - `USER`: 匿名用户可直接访问
+  - `PUBLIC`: 匿名用户降级到模板权限
+- 与 `@Public()` 的本质区别：`@Public()` 完全跳过所有鉴权和权限检查
+
+---
+
+### 13.2 V1 对齐结论（统一口径）
+
+**总体对齐度: ~60-70%**
+
+| 维度 | 对齐度 | 备注 |
+|------|--------|------|
+| 路径与方法 | 100% | 完全一致 |
+| 请求参数结构 | 100% | 共享 Zod Schema |
+| 成功响应结构 | 95% | V2 切换时格式转换兼容 |
+| 鉴权声明 | 0% | 文档过度覆盖，未区分 AllowAnonymous 三级别 |
+| 状态码声明 | 8% | 只声明成功码，缺少 15+ 错误码 |
+| 路由唯一性 | 99% | 机制有风险但当前无重复 |
+| 错误响应结构 | 0% | 文档完全未声明 |
+
+---
+
+### 13.3 V2 契约与实现边界（统一口径）
+
+- **v2Contract**: 定义了 36 个接口的**目标契约**，作为文档和客户端的单一真相源
+- **NestJS 实现**: 仅实现了 4 个接口（~11%），按优先级逐步迁移
+- **设计模式**: 契约先行（Contract-First），实现后补，文档始终反映目标状态
+
+---
+
+### 13.4 openapi-typescript 链路（统一口径）
+
+- 脚本配置完整，定义了从 `openapi.json` 到 `types.ts` 的转换
+- **当前仓库状态**: 产物文件不存在，也未被任何代码引用
+- 链路处于"有定义但未激活"的悬空状态，手写 SDK 仍使用 Zod 推导类型
 
 2. **状态码不一致可核验**: 以创建记录接口为例，文档只声明 201，但运行时实际可能返回 400, 401, 403, 404, 409, 422, 429, 500, 503, 504 等状态码，对齐度仅约 8%。
 

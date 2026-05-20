@@ -564,7 +564,7 @@ PapaParse 后: " " (string), 100 (number), 200 (number)
 | **纯文本列** | 第 1 个非空单元格 | [SingleLineText] | 后续出现 LongText 不会被检测 |
 | **含 LongText 列** | 第 1 个含换行符的单元格 | [LongText] | 无风险（LongText 是最强类型） |
 | **数字+文本混合列** | 第 1 个文本值出现时 | [SingleLineText] | 无风险（已收敛到最宽松类型） |
-| **日期字符串列** | 第 1 个日期值出现时 | [Date, SingleLineText]（长度=2，不会终止！） | 后续出现数字不会被过滤 |
+| **布尔值+文本混合列** | 非布尔字符串出现时 | [SingleLineText] | 后续出现 LongText 不会被检测 |
 
 ##### ⚠️ 不会触发提前终止的场景
 
@@ -575,6 +575,11 @@ PapaParse 后: " " (string), 100 (number), 200 (number)
 
 **纯日期字符串列不会提前终止**：
 - 候选集始终保持 `[Date, SingleLineText]`（长度=2）
+- 永远不会触发提前终止
+
+**纯布尔值列不会提前终止**：
+- 候选集始终保持 `[Checkbox, Number]`（boolean 类型）
+- 或 `[Checkbox, SingleLineText]`（首字母大写字符串类型）
 - 永远不会触发提前终止
 
 ##### 提前终止导致漏检的真实风险场景
@@ -598,33 +603,67 @@ CSV 内容:
 
 **风险**：前 N 行都是简单文本导致收敛到 SingleLineText 并提前终止，后续出现的多行文本（LongText）不会被检测到。这是实际生产中最可能遇到的类型推断错误场景。
 
-##### 另一个风险场景
+##### 布尔值列的实际收敛路径（不会提前终止！）
+
+让我们分析布尔值（经过 PapaParse dynamicTyping 后为 `true`/`false` boolean 类型）在三类校验下的处理结果：
 
 ```
-场景：布尔值后跟随其他类型
+对于 true (boolean 类型):
+  Checkbox: ✅ typeof value === 'boolean' → 返回 true
+  Number:   ✅ !isNaN(Number(true)) = !isNaN(1) = true
+  Date:     ❌ typeof value 是 'boolean'，不是 'number' 也不是 'string' → 返回 false
+  LongText: ❌ 不是 string
+  SingleLineText: ❌ 不是 string
+  → 候选集: [Checkbox, Number] (长度=2，不会终止！)
+
+对于 false (boolean 类型):
+  同样的逻辑 → 候选集: [Checkbox, Number] (长度=2，不会终止！)
+
+对于 "True" (首字母大写字符串，PapaParse 不转换):
+  Checkbox: ✅ value.toLowerCase() === 'true'
+  Number:   ❌ Number("True") = NaN
+  Date:     ❌ 不匹配日期正则
+  LongText: ❌ 无换行符
+  SingleLineText: ✅ 是 string
+  → 候选集: [Checkbox, SingleLineText] (长度=2，不会终止！)
+```
+
+**结论**：布尔值列候选集长度始终为 2，**永远不会触发提前终止**，会遍历全部 500 行采样数据。
+
+##### 布尔值列的真实风险场景
+
+```
+场景：首字母大写布尔值后跟随其他文本
 
 CSV 内容:
   行1: "启用"
-  行2: "true"   ← 转为 boolean
-  行3: "false"  ← 转为 boolean
-  行4: true     ← 候选集收敛到 [Checkbox]（长度=1），提前终止！
-  行5: "1"      ← 不会被检查到
-  行6: "是"     ← 不会被检查到
+  行2: "True"   ← string，首字母大写
+  行3: "False"  ← string，首字母大写
+  行4: "True"   ← 候选集 [Checkbox, SingleLineText] (长度=2，继续)
+  行5: "是"     ← string
+           Checkbox ❌ ("是".toLowerCase() !== 'true/false')
+           SingleLineText ✅
+           → 候选集: [SingleLineText] (长度=1，提前终止！)
+  行6: "第一行\n第二行"  ← 含换行符，但不会被检查到
 
-推断结果: Checkbox（可能错误）
-实际情况: 如果后续有非布尔值，应该是 SingleLineText
+推断结果: SingleLineText（可能错误，漏检了 LongText）
+实际情况: 如果后续有 LongText，应该是 LongText
 ```
+
+**真正的风险**：布尔值列本身不会提前终止，但当出现非布尔字符串时，候选集会收敛到 `[SingleLineText]` 并提前终止，后续可能漏检 LongText。
 
 ### 3.5 关键规则总结
 
 1. **提前终止**：候选类型只剩 1 个时立即停止遍历该列剩余单元格
 2. **纯数字列不终止**：候选集始终 `[Number, Date]`（长度=2），会遍历全部 500 行采样
-3. **空值忽略**：空单元格（`""`, `null`, `undefined`）不参与类型判断，但**空格字符串 `" "` 不被跳过**
-4. **首行跳过**：第一行作为表头，不参与类型推断
-5. **LongText 短路**：只要有一个单元格包含换行符，整列立即判定为 LongText
-6. **空列兜底**：整列为空时默认 SingleLineText
-7. **候选集为空兜底**：过滤后候选集为空时，取 `validatingFieldTypes[0] || DEFAULT`（SingleLineText）
-8. **分层识别**：PapaParse dynamicTyping 做第一层，Zod Schema 做第二层
+3. **纯布尔值列不终止**：候选集始终 `[Checkbox, Number]` 或 `[Checkbox, SingleLineText]`（长度=2）
+4. **纯日期字符串列不终止**：候选集始终 `[Date, SingleLineText]`（长度=2）
+5. **空值忽略**：空单元格（`""`, `null`, `undefined`）不参与类型判断，但**空格字符串 `" "` 不被跳过**
+6. **首行跳过**：第一行作为表头，不参与类型推断
+7. **LongText 短路**：只要有一个单元格包含换行符，整列立即判定为 LongText
+8. **空列兜底**：整列为空时默认 SingleLineText
+9. **候选集为空兜底**：过滤后候选集为空时，取 `validatingFieldTypes[0] || DEFAULT`（SingleLineText）
+10. **分层识别**：PapaParse dynamicTyping 做第一层，Zod Schema 做第二层
 
 ---
 

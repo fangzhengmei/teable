@@ -867,95 +867,398 @@ export class V2Controller {
 
 ## 第四部分：文档-类型-调用 链路边界关系
 
-### 三条独立链路
+### 完整链路全景
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    文档生成链路 (OpenAPI JSON)                       │
-├─────────────────────────────────────────────────────────────────────┤
-│  Zod Schema                                                          │
-│      ↓ .meta() / .describe()                                        │
-│  RouteConfig (path, method, summary, tags, request, responses)       │
-│      ↓ registerRoute()                                               │
-│  全局 routes[] 数组                                                  │
-│      ↓ getOpenApiDocumentation()                                    │
-│  OpenAPIRegistry                                                    │
-│      ↓ OpenApiGeneratorV3                                           │
-│  OpenAPI 3.0 JSON                                                   │
-│      ↓                                                               │
-│  Swagger UI / Redoc                                                 │
-└─────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────┐
-│                    类型生成链路 (TypeScript)                         │
-├─────────────────────────────────────────────────────────────────────┤
-│  Zod Schema                                                          │
-│      ↓ z.infer<typeof schema>                                       │
-│  TypeScript 类型 (IGetRecordsRo, IRecordsVo, 等)                    │
-│      ↓                                                               │
-│  导入到 Controller / Service / 前端组件                              │
-│      ↓                                                               │
-│  编译时类型检查                                                      │
-└─────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────┐
-│                    调用封装链路 (HTTP Client)                        │
-├─────────────────────────────────────────────────────────────────────┤
-│  V1: 手动编写                                                        │
-│    Axios 实例 → getRecords(tableId, query) → { data }              │
-│        ↓                                                             │
-│    @teable/sdk → useRecordsQuery() → React Query → UI               │
-│                                                                     │
-│  V2: 自动生成                                                        │
-│    v2Contract → @orpc/client → createV2HttpClient()                │
-│        ↓                                                             │
-│    client.tables.listRecords(input) → 类型安全调用                   │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         单一数据源：Zod Schema                                  │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│  packages/openapi/src/record/get-list.ts                                        │
+│  const getRecordsRoSchema = z.object({...});                                    │
+└───────────────────────────────────┬─────────────────────────────────────────────┘
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            ▼                       ▼                       ▼
+┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+│   文档生成链路         │  │   类型生成链路         │  │   调用封装链路         │
+│   (运行时)             │  │   (编译时)             │  │   (运行时)             │
+├────────────────────────┤  ├────────────────────────┤  ├────────────────────────┤
+│                        │  │                        │  │                        │
+│  RouteConfig           │  │  z.infer<>            │  │  手写 Axios 函数       │
+│  registerRoute()       │  │  IGetRecordsRo        │  │  getRecords(tableId,   │
+│  routes[] 数组         │  │  IRecordsVo           │  │            query)      │
+│                        │  │                        │  │                        │
+│  getOpenApiDocumentation() │  编译时类型检查       │  │  @teable/sdk          │
+│  OpenAPI JSON (dist/)  │  │                        │  │  useRecordsQuery()     │
+│                        │  │                        │  │  React Query           │
+│  Swagger UI /docs      │  │                        │  │  UI 组件               │
+│                        │  │                        │  │                        │
+└────────────────────────┘  └────────────────────────┘  └────────────────────────┘
+                                    │
+                                    ▼
+                          ┌────────────────────────┐
+                          │ openapi-typescript 链路 │
+                          │ (独立工具链)           │
+                          ├────────────────────────┤
+                          │                        │
+                          │ 1. nestjs-backend 启动 │
+                          │    生成 openapi.json   │
+                          │                        │
+                          │ 2. scripts/            │
+                          │    generate-openapi-   │
+                          │    types.mjs            │
+                          │                        │
+                          │ 3. openapiTS() 读取    │
+                          │    openapi.json        │
+                          │                        │
+                          │ 4. 生成 types.ts       │
+                          │    (apps/nextjs-app/   │
+                          │     src/api/types.ts)  │
+│                        │  │                        │  │                        │
+└────────────────────────┘  └────────────────────────┘  └────────────────────────┘
 ```
 
-### 边界关系详解
+### 四条链路的详细说明
 
-#### 1. 文档生成链路 vs 类型生成链路
+#### 链路 1：文档生成链路（运行时）
 
-**共同点**：共享同一个 Zod Schema
+**代码路径**:
+1. **定义**: `packages/openapi/src/[feature]/[operation].ts` 中的 RouteConfig
+2. **收集**: `registerRoute()` 将路由推入全局 `routes[]` 数组（packages/openapi/src/utils.ts:14-23）
+3. **生成**: `getOpenApiDocumentation()` 调用 `@asteasolutions/zod-to-openapi` 生成 OpenAPI JSON
+4. **输出**: 写入 `apps/nestjs-backend/dist/openapi.json`
+5. **展示**: Swagger UI (`/docs`) 和 Redoc (`/redocs`)
 
-**不同点**：
-- 文档生成需要额外的元数据：`.meta({ type: 'string', description: '...' })`
-- 类型生成只需要 Schema 的结构，不需要元数据
-- 文档生成是运行时行为（启动时执行）
-- 类型生成是编译时行为（TypeScript 编译）
+**关键依赖**: `.meta({ type: '...', description: '...' })` 元数据，缺少则文档生成失败或类型显示错误。
 
-**边界**：
-- 如果 Schema 缺少 `.meta()`，文档生成可能失败或显示不正确的类型
-- 但类型生成不受影响
+---
 
-#### 2. 文档生成链路 vs 调用封装链路
+#### 链路 2：类型生成链路（编译时）
 
-**V1 中完全独立**：
-- 文档生成：从 `routes[]` 数组读取 RouteConfig
-- 调用封装：手动编写的 Axios 函数
-- **没有自动同步机制**：RouteConfig 更新后，Axios 函数需要手动同步
+**代码路径**:
+1. **推导**: `z.infer<typeof getRecordsRoSchema>` → `IGetRecordsRo`
+2. **导出**: 从 `@teable/openapi` 导出类型定义
+3. **使用**: 导入到 Controller、Service、SDK hooks
+4. **检查**: TypeScript 编译时进行类型验证
 
-**V2 中通过契约关联**：
-- 文档生成：从 `v2Contract` 读取
-- 调用封装：`@orpc/client` 也从 `v2Contract` 生成
-- **自动同步**：契约修改后，文档和客户端同时更新
+**关键特性**: 纯编译时行为，不依赖 `.meta()` 元数据，只要 Schema 结构正确即可。
 
-#### 3. 类型生成链路 vs 调用封装链路
+---
 
-**V1 中手动关联**：
-- 类型：`z.infer<typeof getRecordsRoSchema>` → `IGetRecordsRo`
-- 调用：`getRecords(tableId: string, query?: IGetRecordsRo)`
-- 开发者需要手动确保函数签名与类型匹配
+#### 链路 3：调用封装链路（运行时）
 
-**V2 中自动关联**：
-- 类型：由 `v2Contract` 推导
-- 调用：`client.tables.listRecords(input)` 自动获得类型
-- 编译时自动检查一致性
+**代码路径**（V1 手写）:
+1. **封装**: `packages/openapi/src/[feature]/[operation].ts` 中的 Axios 函数
+2. **导出**: 从 `@teable/openapi` 导出 `getRecords(tableId, query)`
+3. **使用**: `@teable/sdk` 封装为 `useRecordsQuery()` React Query hook
+4. **调用**: UI 组件调用 hook
 
-## 第五部分：运行时 V2 切换机制与文档对齐
+**边界问题**: 与文档生成链路**完全独立**，没有自动同步机制。RouteConfig 更新后，Axios 函数需要手动同步。
 
-### 5.1 Canary 发布系统
+**代码路径**（V2 自动）:
+1. **契约**: `@teable/v2-contract-http` 中的 `v2Contract`
+2. **生成**: `@orpc/client` 从契约自动生成类型安全客户端
+3. **使用**: `client.tables.listRecords(input)` 直接调用
+
+**边界优势**: 与文档生成链路**共享契约**，契约修改后文档和客户端自动同步。
+
+---
+
+#### 链路 4：openapi-typescript 独立工具链（新增）
+
+**脚本**: `scripts/generate-openapi-types.mjs`
+
+```javascript
+import openapiTS from 'openapi-typescript';
+
+async function generateTypes() {
+  // 1. 读取后端构建输出的 openapi.json
+  const localPath = path.resolve(process.cwd(), 'apps/nestjs-backend/dist/openapi.json');
+  
+  // 2. 调用 openapi-typescript 生成类型
+  const output = await openapiTS(localPath, {
+    commentHeader: '/* eslint-disable ... */\n',
+  });
+
+  // 3. 写入 nextjs-app 的类型文件
+  const outputPath = path.resolve(process.cwd(), 'apps/nextjs-app/src/api/types.ts');
+  fs.writeFileSync(outputPath, output);
+}
+```
+
+**生成的类型文件**（示例结构）:
+```typescript
+// apps/nextjs-app/src/api/types.ts
+export interface paths {
+  '/table/{tableId}/record': {
+    get: {
+      parameters: {
+        path: { tableId: string };
+        query: {
+          take?: number;
+          skip?: number;
+          viewId?: string;
+          // ...
+        };
+      };
+      responses: {
+        200: {
+          content: {
+            'application/json': {
+              records: Array<{ id: string; fields: Record<string, unknown> }>;
+              extra?: { ... };
+            };
+          };
+        };
+      };
+    };
+    post: { /* ... */ };
+  };
+}
+
+export interface components {
+  schemas: {
+    // 所有 schema 定义
+  };
+}
+```
+
+**边界关系**:
+- ✅ **输入**: 依赖文档生成链路输出的 `openapi.json`
+- ✅ **输出**: 生成独立的 TypeScript 类型文件
+- ❌ **使用**: 目前代码库中**没有实际使用**这个生成的类型文件
+- ❌ **与 SDK 的关系**: 与 `@teable/sdk` 的手写封装链路完全隔离
+
+---
+
+### 链路边界总结
+
+| 链路 | 输入 | 输出 | 触发时机 | 与其他链路的边界 |
+|------|------|------|----------|-----------------|
+| **文档生成** | Zod Schema + RouteConfig + `.meta()` | OpenAPI JSON + Swagger UI | 后端启动时 | 依赖 Schema 元数据 |
+| **类型生成** | Zod Schema 结构 | TypeScript 类型定义 | TypeScript 编译时 | 不依赖元数据，与运行时无关 |
+| **调用封装** | Axios 函数 (V1) / v2Contract (V2) | HTTP 客户端调用 | 运行时请求时 | V1 与文档独立 / V2 与文档共享契约 |
+| **openapi-typescript** | openapi.json (文档输出) | 独立 types.ts 文件 | 手动执行脚本 | 依赖文档输出，但生成的类型未被使用 |
+
+**关键问题**: openapi-typescript 链路生成的类型文件目前没有被 SDK 或业务代码使用，处于"已生成但未消费"的状态。手写 SDK 封装链路仍然直接使用 Zod 推导的类型，而非 openapi-typescript 生成的类型。
+
+---
+
+## 第五部分：状态码不一致的可核验对照
+
+### 5.1 文档声明 vs 运行时实际返回
+
+以 **创建记录接口** (`POST /api/table/{tableId}/record`) 为例：
+
+#### 文档中的声明
+
+[packages/openapi/src/record/create.ts:86-94](packages/openapi/src/record/create.ts)
+
+```typescript
+responses: {
+  201: {
+    description: 'Returns data about the records.',
+    content: {
+      'application/json': {
+        schema: createRecordsVoSchema,
+      },
+    },
+  },
+},
+```
+
+**文档只声明了成功状态码 201**，没有声明任何错误状态码。
+
+#### 运行时实际可能返回的状态码
+
+通过代码分析，该接口实际可能返回以下状态码：
+
+| 状态码 | 错误码 | 触发场景 | 代码位置 |
+|--------|--------|----------|----------|
+| **201** | - | 创建成功 | 正常返回路径 |
+| **400** | `validation_error` | 请求参数验证失败 | [zod.validation.pipe.ts:35](apps/nestjs-backend/src/zod.validation.pipe.ts) - ZodValidationPipe |
+| **400** | `invalid_captcha` | 验证码错误 | [core/src/errors/http/constant.ts:6](packages/core/src/errors/http/constant.ts) |
+| **400** | `invalid_credentials` | 凭证无效 | [core/src/errors/http/constant.ts:7](packages/core/src/errors/http/constant.ts) |
+| **401** | `unauthorized` | 未授权（无 token 或 token 无效） | [core/src/errors/http/constant.ts:8](packages/core/src/errors/http/constant.ts) |
+| **403** | `restricted_resource` | 无权限创建记录 | [core/src/errors/http/constant.ts:12](packages/core/src/errors/http/constant.ts) |
+| **404** | `not_found` | 表不存在 | [core/src/errors/http/constant.ts:13](packages/core/src/errors/http/constant.ts) |
+| **404** | `view_not_found` | 指定的 viewId 不存在 | [core/src/errors/http/constant.ts:25](packages/core/src/errors/http/constant.ts) |
+| **409** | `conflict` | 记录冲突（唯一键重复等） | [core/src/errors/http/constant.ts:15](packages/core/src/errors/http/constant.ts) |
+| **422** | `unprocessable_entity` | 字段值类型错误或业务规则不满足 | [core/src/errors/http/constant.ts:16](packages/core/src/errors/http/constant.ts) |
+| **429** | `too_many_requests` | 请求频率超限 | [core/src/errors/http/constant.ts:19](packages/core/src/errors/http/constant.ts) |
+| **500** | `internal_server_error` | 服务器内部错误 | [core/src/errors/http/constant.ts:21](packages/core/src/errors/http/constant.ts) |
+
+#### 完整的错误码映射表
+
+[packages/core/src/errors/http/constant.ts](packages/core/src/errors/http/constant.ts)
+
+```typescript
+export const ErrorCodeToStatusMap: Record<HttpErrorCode, number> = {
+  [HttpErrorCode.VALIDATION_ERROR]: 400,
+  [HttpErrorCode.INVALID_CAPTCHA]: 400,
+  [HttpErrorCode.INVALID_CREDENTIALS]: 400,
+  [HttpErrorCode.UNAUTHORIZED]: 401,
+  [HttpErrorCode.UNAUTHORIZED_SHARE]: 401,
+  [HttpErrorCode.PAYMENT_REQUIRED]: 402,
+  [HttpErrorCode.CREDIT_LIMIT_EXCEEDED]: 402,
+  [HttpErrorCode.RESTRICTED_RESOURCE]: 403,
+  [HttpErrorCode.NOT_FOUND]: 404,
+  [HttpErrorCode.REQUEST_TIMEOUT]: 408,
+  [HttpErrorCode.CONFLICT]: 409,
+  [HttpErrorCode.UNPROCESSABLE_ENTITY]: 422,
+  [HttpErrorCode.FAILED_DEPENDENCY]: 424,
+  [HttpErrorCode.USER_LIMIT_EXCEEDED]: 460,
+  [HttpErrorCode.TOO_MANY_REQUESTS]: 429,
+  [HttpErrorCode.PAYLOAD_TOO_LARGE]: 413,
+  [HttpErrorCode.INTERNAL_SERVER_ERROR]: 500,
+  [HttpErrorCode.DATABASE_CONNECTION_UNAVAILABLE]: 503,
+  [HttpErrorCode.GATEWAY_TIMEOUT]: 504,
+  [HttpErrorCode.UNKNOWN_ERROR_CODE]: 500,
+  [HttpErrorCode.VIEW_NOT_FOUND]: 404,
+  [HttpErrorCode.AUTOMATION_NODE_PARSE_ERROR]: 400,
+  [HttpErrorCode.AUTOMATION_NODE_NEED_TEST]: 400,
+  [HttpErrorCode.AUTOMATION_NODE_TEST_OUTDATED]: 400,
+};
+```
+
+#### 核验结论
+
+**文档与运行时的状态码对齐度: 约 8%**（1/13 状态码在文档中声明）
+
+| 类别 | 文档声明 | 运行时实际 | 差异 |
+|------|----------|------------|------|
+| 成功状态码 | ✅ 201 | ✅ 201 | 一致 |
+| 客户端错误 (4xx) | ❌ 无声明 | 400, 401, 403, 404, 409, 422, 429 | 缺少 7 种 |
+| 服务端错误 (5xx) | ❌ 无声明 | 500, 503, 504 | 缺少 3 种 |
+| 其他错误 | ❌ 无声明 | 402, 408, 413, 424, 460 | 缺少 5 种 |
+
+---
+
+## 第六部分：V1 对齐结论与不一致清单（统一口径）
+
+### 6.1 总体对齐结论
+
+**V1 文档与运行时行为的对齐度: 约 60-70%**
+
+✅ **对齐的方面**:
+1. **路径与方法**: 文档中的 path 和 method 与 NestJS Controller 路由一致
+2. **请求参数**: Query、Params、Body 的 Schema 定义与 ZodValidationPipe 使用的 Schema 一致
+3. **成功响应结构**: 200/201 响应的 data 结构与实际返回一致
+4. **字段类型**: Schema 中声明的字段类型与实际运行时验证一致
+
+⚠️ **不一致的方面**:
+1. **鉴权声明**: 文档过度覆盖，与实际 `@AllowAnonymous()` 不符
+2. **状态码声明**: 文档只声明成功状态码，缺少所有错误状态码
+3. **路由覆盖风险**: 模块加载顺序可能导致相同 path 的后注册者覆盖先注册者
+4. **V2 切换透明性**: 文档显示 V1 schema，但运行时可能调用 V2 服务（通过格式转换保持兼容）
+
+### 6.2 详细不一致清单
+
+#### 不一致 1：鉴权声明过度覆盖
+
+**现象**: 文档中所有路由都被标记为需要 Bearer Token 鉴权
+
+**代码证据**:
+- [packages/openapi/src/generate.schema.ts:163-166](packages/openapi/src/generate.schema.ts)
+  ```typescript
+  registry.registerPath({ 
+    ...routeObj, 
+    security: [{ [bearerAuth.name]: [] }]  // 强制添加到所有路由
+  });
+  ```
+- [apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts:75](apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts)
+  ```typescript
+  @AllowAnonymous()  // 实际允许匿名访问
+  @Controller('api/table/:tableId/record')
+  export class RecordOpenApiController { ... }
+  ```
+
+**受影响接口**:
+- 所有使用 `@AllowAnonymous()` 的接口
+- 共享视图接口 (`/share/{shareId}/view/records`)
+- 记录相关接口 (`/table/{tableId}/record`)
+- 其他公开接口
+
+**影响**: Swagger UI 测试时需要填写不必要的 Authorization header
+
+---
+
+#### 不一致 2：错误状态码缺失
+
+**现象**: 文档只声明成功状态码（200, 201），缺少所有可能的错误状态码
+
+**代码证据**:
+- [packages/openapi/src/record/create.ts:86-94](packages/openapi/src/record/create.ts) 只声明 201
+- 运行时可能返回 400, 401, 403, 404, 409, 422, 429, 500, 503, 504 等
+
+**受影响接口**: 所有 V1 API 接口
+
+**影响**: API 消费者无法从文档中了解可能的错误响应，需要依赖试错或阅读源代码
+
+---
+
+#### 不一致 3：路由收集无去重，存在覆盖风险
+
+**现象**: `registerRoute()` 直接 push 到数组，没有去重检查
+
+**代码证据**:
+- [packages/openapi/src/utils.ts:14-23](packages/openapi/src/utils.ts)
+  ```typescript
+  const routes: RouteConfig[] = [];
+  export const registerRoute = (route: RouteConfig) => {
+    routes.push(route);  // ⚠️ 无去重
+    return route;
+  };
+  ```
+- [packages/openapi/src/index.ts](packages/openapi/src/index.ts) 中的导出顺序决定路由加载顺序
+
+**风险场景**:
+1. 不同模块意外定义相同 URL 路径
+2. 重构时重命名文件但忘记删除旧文件
+3. 条件加载导致某些模块被重复导入
+
+**当前状态**: 代码库中尚未发现重复路径，但机制本身存在风险
+
+---
+
+#### 不一致 4：V2 切换对文档透明
+
+**现象**: 文档显示 V1 schema，但运行时可能实际调用 V2 服务
+
+**代码证据**:
+- [apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts:121-123](apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts)
+  ```typescript
+  if (this.cls.get('useV2')) {
+    return this.recordOpenApiV2Service.getRecords(tableId, query);
+  }
+  ```
+- V2Service 内部进行 V2 → V1 格式转换以保持兼容性
+
+**缓解措施**:
+- `V2IndicatorInterceptor` 在响应头添加 `x-teable-v2: true` 标识
+- V2Service 确保输出格式符合 V1 schema 定义
+
+**影响**: 文档无法反映实际的实现版本，但通过格式转换保持了响应结构的一致性
+
+---
+
+### 6.3 对齐度评估矩阵
+
+| 维度 | 对齐度 | 说明 |
+|------|--------|------|
+| 路径与方法 | 100% | 完全一致 |
+| 请求参数结构 | 100% | 使用相同 Zod Schema |
+| 成功响应结构 | 95% | V2 切换时有格式转换但保持兼容 |
+| 鉴权声明 | 0% | 文档过度覆盖，与实际不符 |
+| 状态码声明 | 8% | 只声明成功码，缺少所有错误码 |
+| 路由唯一性 | 99% | 机制有风险但当前无重复 |
+| 错误响应结构 | 0% | 文档完全未声明错误响应格式 |
+
+**总体对齐度**: **~60-70%**（核心功能对齐，但元数据和错误处理存在显著差异）
+
+## 第七部分：运行时 V2 切换机制与文档对齐
+
+### 7.1 Canary 发布系统
 
 **核心组件**:
 
@@ -998,7 +1301,7 @@ export class CanaryService {
 }
 ```
 
-### 5.2 V2FeatureGuard 工作流程
+### 7.2 V2FeatureGuard 工作流程
 
 [apps/nestjs-backend/src/features/canary/guards/v2-feature.guard.ts](apps/nestjs-backend/src/features/canary/guards/v2-feature.guard.ts)
 
@@ -1035,7 +1338,7 @@ export class V2FeatureGuard implements CanActivate {
 }
 ```
 
-### 5.3 Controller 中的分支逻辑
+### 7.3 Controller 中的分支逻辑
 
 [apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts](apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts)
 
@@ -1061,7 +1364,7 @@ export class RecordOpenApiController {
 }
 ```
 
-### 5.4 文档与实际行为的对齐情况
+### 7.4 文档与实际行为的对齐情况
 
 #### ✅ 对齐的部分
 
@@ -1096,7 +1399,7 @@ export class RecordOpenApiController {
    - `V2IndicatorInterceptor` 会在响应头中添加 `x-teable-v2: true` 当使用 V2 实现时
    - 可用于调试和监控
 
-### 5.5 V2 服务中的格式适配
+### 7.5 V2 服务中的格式适配
 
 [apps/nestjs-backend/src/features/record/open-api/record-open-api-v2.service.ts](apps/nestjs-backend/src/features/record/open-api/record-open-api-v2.service.ts)
 
@@ -1140,9 +1443,9 @@ export class RecordOpenApiV2Service {
 }
 ```
 
-## 第六部分：完整数据流对比
+## 第八部分：完整数据流对比
 
-### V1 数据流
+### 8.1 V1 数据流
 
 ```
 1. API 定义 (开发时)
@@ -1178,7 +1481,7 @@ export class RecordOpenApiV2Service {
       └─ axios.get('/api/table/tblxxx/record?limit=100')
 ```
 
-### V2 数据流
+### 8.2 V2 数据流
 
 ```
 1. API 定义 (开发时)
@@ -1218,14 +1521,14 @@ export class RecordOpenApiV2Service {
       └─ @orpc/client 自动序列化请求 + 解析响应
 ```
 
-## 第七部分：设计优势与演进方向
+## 第九部分：设计优势与演进方向
 
-### V1 优势
+### 9.1 V1 优势
 - ✅ 简单直接，易于理解
 - ✅ 手动编写的 Axios 函数灵活性高
 - ✅ RESTful 路径符合传统 API 设计习惯
 
-### V1 问题
+### 9.2 V1 问题
 - ❌ 契约与传输层绑定，无法复用
 - ❌ 客户端函数需手动编写，易出错且与文档可能不一致
 - ❌ 响应格式不统一，错误处理不一致
@@ -1233,7 +1536,7 @@ export class RecordOpenApiV2Service {
 - ❌ 鉴权声明在文档中过度覆盖，与实际行为不符
 - ❌ 路由收集无去重，存在模块加载顺序依赖和覆盖风险
 
-### V2 优势
+### 9.3 V2 优势
 - ✅ 契约与实现分离，可支持多传输协议 (HTTP, WebSocket, 等)
 - ✅ 客户端自动生成，零样板代码，与文档自动同步
 - ✅ 统一响应格式，错误处理标准化
@@ -1241,12 +1544,12 @@ export class RecordOpenApiV2Service {
 - ✅ 领域模型与 HTTP 传输解耦，更清晰的架构分层
 - ✅ Schema 定义在纯领域层，可被复用
 
-### V2 当前限制
+### 9.4 V2 当前限制
 - ⚠️ 部分 V1 API 尚未迁移到 V2
 - ⚠️ 双轨运行增加了维护成本（V2Service 需要格式转换）
 - ⚠️ V1 路径和 V2 路径并存，增加了理解成本
 
-## 总结
+## 第十部分：总结
 
 Teable 的 OpenAPI 与 SDK 对齐机制经历了从 **v1 手动契约** 到 **v2 契约驱动** 的演进：
 
@@ -1259,16 +1562,35 @@ Teable 的 OpenAPI 与 SDK 对齐机制经历了从 **v1 手动契约** 到 **v2
 | **类型安全** | 依赖人工维护 | 编译时自动推导 |
 | **错误处理** | HttpException | neverthrow + ORPCError |
 
-**文档对齐现状**:
-- V1 文档与 V1 行为基本对齐，但鉴权声明存在过度覆盖
-- V2 文档与 V2 行为完全对齐
-- 运行时 V2 切换通过 V2FeatureGuard + CLS 实现
-- V1 API 路径在使用 V2 实现时会进行格式转换以保持向后兼容
-- 通过 `x-teable-v2` 响应头标识实际使用的实现版本
+### 文档对齐现状
 
-**三条独立链路的边界**:
-1. **文档生成链路**: Zod Schema → RouteConfig → OpenAPI JSON，依赖 `.meta()` 元数据
-2. **类型生成链路**: Zod Schema → z.infer → TypeScript 类型，纯编译时行为
-3. **调用封装链路**: V1 手动编写 / V2 自动生成，与文档链路在 V2 中通过契约自动同步
+**V1 文档与运行时行为对齐度: ~60-70%**
+- ✅ 路径、方法、请求参数、成功响应结构完全对齐
+- ⚠️ 鉴权声明过度覆盖（文档要求鉴权但实际部分接口 `@AllowAnonymous()`）
+- ⚠️ 错误状态码缺失（文档只声明 200/201，运行时可能返回 400-504 共 15+ 种状态码）
+- ⚠️ 路由收集无去重机制，存在模块加载顺序依赖的覆盖风险
+- ⚠️ V2 切换对文档透明，但通过格式转换保持响应结构兼容
+
+**V2 文档与运行时行为对齐度: 100%**
+- ✅ 契约驱动，文档和客户端从同一份契约生成
+- ✅ 自动路由绑定，确保与契约一致
+- ✅ 统一响应格式 `{ ok: true, data: T } | { ok: false, error: E }`
+
+### 四条链路的边界关系
+
+| 链路 | 输入 | 输出 | 触发时机 | 与其他链路的边界 |
+|------|------|------|----------|-----------------|
+| **文档生成** | Zod Schema + RouteConfig + `.meta()` | OpenAPI JSON + Swagger UI | 后端启动时 | 依赖 Schema 元数据 |
+| **类型生成** | Zod Schema 结构 | TypeScript 类型定义 | TypeScript 编译时 | 不依赖元数据，与运行时无关 |
+| **调用封装** | Axios 函数 (V1) / v2Contract (V2) | HTTP 客户端调用 | 运行时请求时 | V1 与文档独立 / V2 与文档共享契约 |
+| **openapi-typescript** | openapi.json (文档输出) | 独立 types.ts 文件 | 手动执行脚本 | 依赖文档输出，但生成的类型**未被实际使用** |
+
+### 关键发现
+
+1. **openapi-typescript 链路悬空**: 脚本 `scripts/generate-openapi-types.mjs` 生成的 `apps/nextjs-app/src/api/types.ts` 目前没有被 SDK 或业务代码使用，手写 SDK 仍然直接使用 Zod 推导的类型。
+
+2. **状态码不一致可核验**: 以创建记录接口为例，文档只声明 201，但运行时实际可能返回 400, 401, 403, 404, 409, 422, 429, 500, 503, 504 等状态码，对齐度仅约 8%。
+
+3. **路由覆盖风险**: `registerRoute()` 无去重检查，模块加载顺序由 `packages/openapi/src/index.ts` 的导出顺序决定，相同 path + method 的后注册者会覆盖先注册者。
 
 这种渐进式演进策略确保了系统在重构过程中的稳定性，同时为最终全面迁移到 v2 架构奠定了基础。

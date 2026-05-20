@@ -93,13 +93,157 @@ async getPermissions(resourceId: string, accessTokenId?: string) {
 
 ### 2.4 基表分享的空间边界校验
 
-`base-share` 模式下，`PermissionService.getBaseSharePermissions()`（`permission.service.ts:602-652`）会校验：
+`base-share` 模式下，`PermissionService.getBaseSharePermissions()`（`permission.service.ts:602-652`）会按以下顺序执行严格的权限控制：
 
-1. **资源归属校验**：通过 `checkResourceBelongsToShare()` 递归校验资源是否属于分享节点子树
-2. **关联表穿透**：`isTableLinkedFromSharedNode()` 允许链接字段引用的外部表被访问（即使不在分享节点内）
-3. **权限降级**：
-   - `allowEdit=true` 且已登录：授予 Editor 权限，但排除 `SHARE_EXCLUDED_PERMISSIONS`（分享、邀请、读邮箱等敏感操作）
-   - 其他情况：授予 TemplatePermissions（只读），`allowCopy=true` 时追加 `record|copy`
+#### 2.4.1 资源归属校验与硬拒绝机制
+
+节点级分享（`nodeId != null`）时，首先执行资源归属校验，**校验失败直接抛出异常（硬拒绝），不存在权限收敛**：
+
+```typescript
+// permission.service.ts:617-634
+if (nodeId) {
+  // Node-level share: verify the resource belongs to the shared node subtree
+  const resourceBelongsToShare = await this.checkResourceBelongsToShare(
+    resourceId,
+    baseId,
+    nodeId
+  );
+
+  if (!resourceBelongsToShare) {
+    this.logger.warn(
+      `[BaseShare] Resource ${resourceId} is not accessible via share ${shareId}`
+    );
+    // 硬拒绝：直接抛出异常，不返回任何权限，请求终止
+    throw new CustomHttpException(
+      `Resource ${resourceId} is not accessible via share ${shareId}`,
+      HttpErrorCode.RESTRICTED_RESOURCE
+    );
+  }
+}
+// When nodeId is null (whole-base share), all resources in the base are accessible
+```
+
+**资源归属校验的完整判定链**：
+```
+resourceId
+    │
+    ▼
+checkResourceBelongsToShare() → 根据 ID 前缀分发
+    │
+    ├─ Base (bso) → resourceId === baseId
+    │
+    ├─ Table (tbl) → checkTableBelongsToShare()
+    │   ├─ 校验 table.baseId === 分享 baseId
+    │   ├─ 校验 table 是否在分享节点子树内 (isTableAllowedByNodeId)
+    │   └─ 校验失败时尝试链接字段穿透 (isTableLinkedFromSharedNode)
+    │
+    ├─ View (viw) → checkViewBelongsToShare() → 追溯到所属 table 后复用 table 校验逻辑
+    │
+    ├─ Field (fld) → checkFieldBelongsToShare() → 追溯到所属 table 后复用 table 校验逻辑
+    │
+    └─ App (app) → checkAppBelongsToShare() → 校验 app 节点是否在分享子树内
+```
+
+#### 2.4.2 关联表穿透机制
+
+当表不在分享节点子树内时，会尝试链接字段穿透（`isTableLinkedFromSharedNode`）：
+1. 收集分享节点子树内的所有表
+2. 查询这些表中的所有链接字段
+3. 如果任何链接字段的 `foreignTableId` 指向目标表，则允许访问
+4. 确保链接功能正常工作，即使关联表不在分享范围内
+
+#### 2.4.3 权限降级（归属校验通过后）
+
+资源归属校验通过后，根据分享配置和用户身份进行权限降级（这是真正的"权限收敛"）：
+
+| 权限模式 | 触发条件 | 权限内容 |
+|---------|---------|---------|
+| 可编辑权限 | `allowEdit=true` **且** 用户已登录（非匿名） | `getPermissions(Role.Editor)` - `SHARE_EXCLUDED_PERMISSIONS` |
+| 匿名只读权限 | 上述条件不满足 | `TemplatePermissions` + `allowCopy ? ['record|copy'] : []` |
+
+---
+
+### 2.5 匿名只读与可编辑权限的详细触发条件
+
+#### 2.5.1 可编辑权限触发条件（**必须同时满足**）
+
+```typescript
+// permission.service.ts:640-644
+if (baseShare.allowEdit && !this.isAnonymous()) {
+  return getPermissions(Role.Editor).filter((p) => !SHARE_EXCLUDED_PERMISSIONS.has(p));
+}
+```
+
+**条件 1：`baseShare.allowEdit === true`**
+- 分享创建时通过 `BaseShareService.updateBaseShare()` 设置
+- 仅支持表（Table）和文件夹（Folder）节点类型
+- `allowEdit` 与 `allowSave` 互斥：设置 `allowEdit=true` 会强制 `allowSave=false`
+
+**条件 2：`!this.isAnonymous()`（用户已登录）**
+- 判定逻辑：`isAnonymous(this.cls.get('user.id'))`
+- 匿名用户 ID 为 `ANONYMOUS_USER_ID`（值为 `"anon_anonymous"`）
+- 即使 `allowEdit=true`，匿名用户也**无法**获得编辑权限
+
+**可编辑权限的范围限制（排除敏感操作）**：
+`SHARE_EXCLUDED_PERMISSIONS` 集合中定义了即使是可编辑模式也禁止的操作：
+```typescript
+// permission.service.ts:35-41
+const SHARE_EXCLUDED_PERMISSIONS = new Set<Action>([
+  'view|share',        // 禁止分享视图
+  'space|invite_email',// 禁止空间邮件邀请
+  'base|invite_email', // 禁止基表邮件邀请
+  'user|email_read',   // 禁止读取用户邮箱
+  'user|integrations', // 禁止读取用户集成配置
+]);
+```
+
+#### 2.5.2 匿名只读权限触发条件（**满足任一即可**）
+
+```typescript
+// permission.service.ts:646-651
+const permissions = [...TemplatePermissions];
+if (baseShare.allowCopy) {
+  permissions.push('record|copy');
+}
+return permissions;
+```
+
+**触发场景 1：`baseShare.allowEdit !== true`**
+- 分享未开启可编辑功能
+- 或者 `allowEdit` 为 `null`/`false`
+
+**触发场景 2：用户为匿名用户**
+- `this.isAnonymous() === true`
+- 即使 `allowEdit=true`，匿名用户也只能获得只读权限
+
+**匿名只读权限的组成**：
+- 基础权限：`TemplatePermissions`（完整的只读权限集，定义于 `packages/core/src/auth/role/template.ts`）
+- 可选追加：`baseShare.allowCopy === true` 时追加 `record|copy` 权限
+
+#### 2.5.3 权限判定的优先级与边界
+
+```
+请求携带 X-Tea-Base-Share: shrxxx Header
+    │
+    ▼
+PermissionGuard.tryBaseSharePermissionCheck() 被触发
+    │
+    ▼
+permissionService.validBaseSharePermissions(shareId, resourceId, permissions)
+    │
+    ├─ getBaseSharePermissions(shareId, resourceId)
+    │   ├─ 校验 share 是否存在且 enabled
+    │   ├─ nodeId 存在时校验资源归属（失败 → 硬拒绝）
+    │   └─ 归属校验通过后 → 权限降级判定
+    │       ├─ allowEdit && 已登录 → Editor - 排除权限
+    │       └─ 其他情况 → TemplatePermissions + 可选 record|copy
+    │
+    └─ 校验所需 permissions 是否在返回的权限集合内
+        ├─ 全部满足 → 权限写入 cls.permissions，请求继续
+        └─ 任一不满足 → 抛出 RESTRICTED_RESOURCE 异常
+```
+
+> **关键边界**：分享链接的权限是"天花板"，即使已登录用户原本拥有更高权限（如 Owner），通过分享链接访问时也只能获得分享配置的权限级别。这在 `PermissionGuard.permissionCheckWithPublicFallback()` 中通过优先检查 share header 实现。
 
 ---
 
@@ -119,22 +263,58 @@ async getPermissions(resourceId: string, accessTokenId?: string) {
 
 ### 3.2 视图级分享令牌发放流程
 
-**第一步：密码认证（如有）**
+**口令校验与令牌签发的真实职责划分**：
 
-`ShareAuthLocalGuard`（`share/guard/share-auth-local.guard.ts:11-26`）处理密码校验：
+口令校验与令牌签发是**分离**的两个步骤，由不同组件负责：
+
+| 组件 | 职责 | 代码位置 |
+|------|------|---------|
+| `ShareAuthLocalGuard` | 仅校验密码正确性，不签发 Token | `share/guard/share-auth-local.guard.ts:11-26` |
+| `ShareController.auth()` | 调用 authToken 签发 JWT，**负责写入 Cookie** | `share/share.controller.ts:79-91` |
+
+**第一步：密码认证（Guard 仅做校验）**
+
+`ShareAuthLocalGuard` 只校验密码，校验通过后将 `shareId` 和 `password` 挂载到 `req` 对象上：
 ```typescript
+// share/guard/share-auth-local.guard.ts:11-26
 async canActivate(context: ExecutionContext) {
   const req = context.switchToHttp().getRequest();
   const shareId = req.params.shareId;
   const password = req.body.password;
+  // 仅做密码校验
   const authShareId = await this.shareAuthService.authShareView(shareId, password);
-  // 校验成功后签发 JWT
-  const token = await this.shareAuthService.authToken({ shareId, password });
-  res.cookie(shareId, token, { httpOnly: true, maxAge: 7 * 24h });
+  // 校验通过后将结果挂载到 req，供后续 Controller 使用
+  req.shareId = authShareId;
+  req.password = password;
+  if (!authShareId) {
+    throw new CustomHttpException('Incorrect password.', ...);
+  }
+  return true;
 }
 ```
 
-**第二步：令牌验证与用户注入**
+**第二步：签发 Token 与写入 Cookie（Controller 负责）**
+
+`ShareController.auth()` 方法是真正签发 Token 并写入 Cookie 的地方：
+```typescript
+// share/share.controller.ts:79-91
+@HttpCode(200)
+@UseGuards(ShareAuthLocalGuard)
+@Post('/:shareId/view/auth')
+async auth(@Request() req: any, @Res({ passthrough: true }) res: Response) {
+  const shareId = req.shareId;        // 从 Guard 挂载的结果中获取
+  const password = req.password;      // 从 Guard 挂载的结果中获取
+  const token = await this.shareAuthService.authToken({ shareId, password });
+  // Controller 负责写入 Cookie
+  res.cookie(shareId, token, {
+    httpOnly: true,
+    maxAge: 1000 * 60 * 60 * 24 * 7,  // 7 天有效期
+  });
+  return { token };
+}
+```
+
+**第三步：令牌验证与用户注入**
 
 `ShareAuthGuard`（`share/guard/auth.guard.ts:27-70`）是核心守卫：
 ```typescript
@@ -171,6 +351,38 @@ async validate(payload: IJwtShareInfo) {
 ```
 
 ### 3.3 基表级分享令牌流程
+
+基表级分享的口令校验与 Cookie 写入职责划分与视图级完全一致：
+
+| 组件 | 职责 | 代码位置 |
+|------|------|---------|
+| `BaseShareAuthLocalGuard` | 仅校验密码正确性 | `base-share/guard/base-share-auth-local.guard.ts:11-26` |
+| `BaseShareOpenController.auth()` | 签发 JWT 并写入 Cookie | `base-share/base-share-open.controller.ts:36-54` |
+
+基表级 Cookie 写入的完整代码：
+```typescript
+// base-share-open.controller.ts:36-54
+@HttpCode(200)
+@Public()
+@UseGuards(BaseShareAuthLocalGuard)
+@Post('/:shareId/base/auth')
+async auth(
+  @Request() req: Express.Request & { shareId: string; password: string },
+  @Res({ passthrough: true }) res: Response
+): Promise<IBaseShareAuthVo> {
+  const shareId = req.shareId;
+  const password = req.password;
+  const token = await this.baseShareAuthService.authToken({ shareId, password });
+  // Controller 负责写入 Cookie，生产环境额外增加 secure 和 sameSite 配置
+  res.cookie(shareId, token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
+  });
+  return { token };
+}
+```
 
 `BaseShareAuthGuard`（`base-share/guard/base-share-auth.guard.ts:20-52`）与视图级类似，但：
 - 保留已登录用户身份（用于复制操作溯源）
@@ -370,11 +582,31 @@ shareId 以 'fld' 开头 → ShareAuthGuard 识别为链接视图
 → 仅返回 lookupFieldId 对应的值作为 title
 ```
 
-**场景 3：基表分享 + allowEdit = true**
+**场景 3：基表分享 + allowEdit = true + 匿名用户**
 ```
-用户已登录 → getBaseSharePermissions() 返回 Editor 权限
-→ 排除 SHARE_EXCLUDED_PERMISSIONS（禁止分享、邀请等）
-→ 可编辑记录，但无法修改分享配置或邀请协作者
+匿名用户访问 allowEdit=true 的分享链接
+→ getBaseSharePermissions() 检测到 isAnonymous() = true
+→ 权限收敛为 TemplatePermissions（只读）
+→ 即使 allowEdit=true，匿名用户也无法编辑
+→ 只能查看，allowCopy=true 时可复制记录
+```
+
+**场景 4：基表分享 + allowEdit = true + 已登录用户**
+```
+已登录用户访问 allowEdit=true 的分享链接
+→ getBaseSharePermissions() 检测到 allowEdit=true 且 !isAnonymous()
+→ 返回 Editor 权限，但排除 SHARE_EXCLUDED_PERMISSIONS
+→ 可编辑记录，但无法分享视图、邀请协作者、读取用户邮箱
+→ 用户原本的 Owner 权限被分享链接权限覆盖（收敛）
+```
+
+**场景 5：节点级分享 + 访问节点外资源**
+```
+用户访问节点级分享链接，但请求节点外的表数据
+→ checkResourceBelongsToShare() 返回 false
+→ 硬拒绝：抛出 RESTRICTED_RESOURCE 异常
+→ 不存在权限降级，请求直接终止
+→ 即使该用户是基表 Owner，通过分享链接也无法访问节点外资源
 ```
 
 ---
@@ -397,3 +629,7 @@ shareId 以 'fld' 开头 → ShareAuthGuard 识别为链接视图
 | 元数据定义 | `packages/core/src/models/view/view.schema.ts` | `IShareViewMeta` 类型定义 |
 | JWT 策略 | `src/features/share/strategies/jwt.strategy.ts` | 视图分享 JWT 验证 |
 | JWT 策略 | `src/features/base-share/strategies/jwt.strategy.ts` | 基表分享 JWT 验证 |
+| 权限守卫 | `src/features/auth/guard/permission.guard.ts` | 基表分享权限校验入口 |
+| 基表分享 OpenAPI | `src/features/base-share/base-share-open.controller.ts` | 基表分享公开接口（认证、查询、复制） |
+| 基表分享管理 | `src/features/base-share/base-share.controller.ts` | 基表分享 CRUD 管理接口 |
+| 模板角色定义 | `packages/core/src/auth/role/template.ts` | TemplatePermissions 权限集定义 |

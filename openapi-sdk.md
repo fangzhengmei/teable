@@ -2,7 +2,7 @@
 
 ## 概述
 
-Teable 项目正在经历从 v1 到 v2 的架构演进。两个版本都采用了**以 Zod Schema 为单一数据源**的 API 定义与客户端生成机制，但在具体实现路径、责任归属和技术选型上有显著差异。本文档深入分析两个版本的接口契约、文档生成、客户端封装的接力方式，以及运行时切换机制。
+Teable 项目正在经历从 v1 到 v2 的架构演进。两个版本都采用了**以 Zod Schema 为单一数据源**的 API 定义与客户端生成机制，但在具体实现路径、责任归属和技术选型上有显著差异。本文档深入分析两个版本的接口契约、文档生成、客户端封装的接力方式，以及运行时切换机制，并修正关键实现细节。
 
 ## 版本架构总览
 
@@ -32,7 +32,7 @@ Teable 项目正在经历从 v1 到 v2 的架构演进。两个版本都采用�
 │  @teable/v2-contract-http (packages/v2/contract-http)                   │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │  @orpc/contract 定义 (oc.route + Zod Schema)                      │  │
-│  │  路径风格: /tables/createRecord (动作式 RPC)                       │  │
+│  │  路径风格: /tables/listRecords (动作式 RPC)                         │  │
 │  │  统一响应格式: { ok: true, data: T } | { ok: false, error: E }    │  │
 │  └───────────────────────────────────┬───────────────────────────────┘  │
 │                                      │                                  │
@@ -75,64 +75,61 @@ packages/openapi/src/
     └── ...
 ```
 
-#### API 定义四要素（以 getRecord 为例）
+#### API 定义四要素（以 getRecords 为例）
 
-[packages/openapi/src/record/get.ts](packages/openapi/src/record/get.ts)
+[packages/openapi/src/record/get-list.ts](packages/openapi/src/record/get-list.ts)
 
 ```typescript
 // 1. Zod Schema 定义（请求参数）
-export const getRecordQuerySchema = z.object({
-  projection: z.union([z.string(), z.string().array()])
-    .transform((val) => typeof val === 'string' ? [val] : val)
-    .optional()
-    .meta({
-      type: 'array',
-      items: { type: 'string' },
-      description: '字段投影...'
-    }),
-  fieldKeyType: fieldKeyTypeRoSchema,
+export const getRecordsRoSchema = getRecordQuerySchema.extend(contentQueryBaseSchema.shape).extend({
+  take: z.string().or(z.number()).transform(Number)
+    .pipe(z.number().min(1).max(1000)).default(100).optional(),
+  skip: z.string().or(z.number()).transform(Number)
+    .pipe(z.number().min(0)).default(0).optional(),
 });
 
-export type IGetRecordQuery = z.infer<typeof getRecordQuerySchema>;
+export type IGetRecordsRo = z.infer<typeof getRecordsRoSchema>;
 
 // 2. URL 常量 (RESTful 风格)
-export const GET_RECORD_URL = '/table/{tableId}/record/{recordId}';
+export const GET_RECORDS_URL = '/table/{tableId}/record';
 
 // 3. RouteConfig 注册（用于 OpenAPI 文档生成）
-export const GetRecordRoute: RouteConfig = registerRoute({
+export const GetRecordsRoute: RouteConfig = registerRoute({
   method: 'get',
-  path: GET_RECORD_URL,
-  summary: 'Get record',
-  description: 'Retrieve a single record...',
+  path: GET_RECORDS_URL,
+  summary: 'List records',
+  description: 'Retrieve a list of records...',
   request: {
-    params: z.object({
-      tableId: z.string(),
-      recordId: z.string(),
-    }),
-    query: getRecordQuerySchema,
+    params: z.object({ tableId: z.string() }),
+    query: getRecordsRoSchema,
   },
   responses: {
     200: {
-      description: 'Success',
+      description: 'List of records',
       content: {
-        'application/json': {
-          schema: recordSchema,
-        },
+        'application/json': { schema: recordsVoSchema },
       },
     },
   },
   tags: ['record'],
+  // ❌ 注意：这里没有指定 security，但生成时会被强制添加
 });
 
 // 4. Axios 客户端函数（手动编写）
-export async function getRecord(
+export async function getRecords(
   tableId: string,
-  recordId: string,
-  query?: IGetRecordQuery
-): Promise<AxiosResponse<IRecord>> {
-  return axios.get<IRecord>(
-    urlBuilder(GET_RECORD_URL, { tableId, recordId }), 
-    { params: query }
+  query?: IGetRecordsRo
+): Promise<AxiosResponse<IRecordsVo>> {
+  // 手动序列化复杂参数
+  const serializedQuery = {
+    ...query,
+    filter: query?.filter ? JSON.stringify(query.filter) : undefined,
+    orderBy: query?.orderBy ? JSON.stringify(query.orderBy) : undefined,
+  };
+
+  return axios.get<IRecordsVo>(
+    urlBuilder(GET_RECORDS_URL, { tableId }), 
+    { params: serializedQuery }
   );
 }
 ```
@@ -142,39 +139,44 @@ export async function getRecord(
 - ✅ 路由元数据: `@teable/openapi`
 - ✅ 客户端函数: `@teable/openapi` (手动编写)
 - ❌ 服务端路由: 不负责，由 NestJS Controller 手动定义
+- ❌ 鉴权声明: RouteConfig 中不定义，由生成器统一添加
 
 ### 1.2 文档生成
 
 [packages/openapi/src/generate.schema.ts](packages/openapi/src/generate.schema.ts)
 
 ```typescript
-import { OpenAPIRegistry, OpenApiGeneratorV3 } from '@asteasolutions/zod-to-openapi';
-import { getRoutes } from './utils';
-
-export async function getOpenApiDocumentation(config: {
-  origin?: string;
-  snippet?: boolean;
-}): Promise<OpenAPIObject> {
+function registerRoutes(filters?: { tags?: string[]; paths?: string[]; methods?: string[] }) {
   const registry = new OpenAPIRegistry();
   const routeObjList: RouteConfig[] = getRoutes();
 
-  // 注册所有路由到 OpenAPI 注册表
-  for (const routeObj of routeObjList) {
+  // 过滤路由...
+
+  for (const routeObj of filteredRoutes) {
     const bearerAuth = registry.registerComponent('securitySchemes', 'bearerAuth', {
       type: 'http',
       scheme: 'bearer',
     });
-    registry.registerPath({ ...routeObj, security: [{ [bearerAuth.name]: [] }] });
-  }
 
-  // 生成 OpenAPI 3.0 文档
+    // ⚠️  关键：所有路由被强制添加鉴权声明
+    // 无论 RouteConfig 中是否定义 security，都会被覆盖
+    registry.registerPath({ 
+      ...routeObj, 
+      security: [{ [bearerAuth.name]: [] }]  // 强制添加
+    });
+  }
+  return registry;
+}
+
+export async function getOpenApiDocumentation(config: {...}) {
+  const registry = registerRoutes({ tags, paths, methods });
   const generator = new OpenApiGeneratorV3(registry.definitions);
+  
   return generator.generateDocument({
     openapi: '3.0.0',
     info: {
       version: '1.0.0',
       title: 'Teable App',
-      description: 'Manage Data as easy as drink a cup of tea',
     },
     servers: [{ url: origin + '/api' }],
   });
@@ -201,7 +203,94 @@ export async function setupSwagger(app: INestApplication, publicOrigin: string, 
 }
 ```
 
-### 1.3 客户端类型/调用封装
+#### ⚠️  文档与运行时行为的不一致
+
+**1. 鉴权声明不一致**：
+- **文档中**：所有路由都被强制标记为需要 `bearerAuth` 鉴权
+- **运行时**：部分 Controller 使用 `@AllowAnonymous()` 装饰器，实际不需要鉴权
+
+```typescript
+// apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts
+@AllowAnonymous()  // 实际允许匿名访问
+@Controller('api/table/:tableId/record')
+export class RecordOpenApiController {
+  // 但文档中该接口仍被标记为需要 Authorization header
+}
+```
+
+**受影响的接口包括**：
+- 共享视图接口 (`/share/{shareId}/view/records`)
+- 记录相关接口 (`/table/{tableId}/record`)
+- 其他使用 `@AllowAnonymous()` 或 `@Public()` 的接口
+
+**2. 状态码不一致**：
+- **文档中**：RouteConfig 定义的响应状态码（如 200, 201）
+- **运行时**：实际可能返回 400, 401, 403, 404, 500 等错误状态码，但文档中未完整声明
+
+### 1.3 路由收集的副作用与覆盖风险
+
+[packages/openapi/src/utils.ts](packages/openapi/src/utils.ts)
+
+```typescript
+const routes: RouteConfig[] = [];
+
+export const registerRoute = (route: RouteConfig) => {
+  // ⚠️  关键：没有去重检查，直接 push
+  routes.push(route);
+  return route;
+};
+
+export const getRoutes = () => routes;
+```
+
+#### 覆盖风险分析
+
+**1. 模块加载顺序决定路由顺序**
+
+路由数组的填充依赖于模块的 `import` 顺序。在 `packages/openapi/src/index.ts` 中：
+
+```typescript
+export * from './zod';
+export * from './axios';
+export * from './generate.schema';
+export * from './record';     // 先加载 record 模块
+export * from './field';      // 后加载 field 模块
+export * from './view';       // 后加载 view 模块
+// ... 更多模块
+```
+
+每个被 `export *` 的模块会执行其顶级代码，包括 `registerRoute()` 调用。
+
+**2. 相同 path + method 的后注册者覆盖**
+
+当生成 OpenAPI 文档时：
+
+```typescript
+// 假设 routes 数组中有两条相同 path + method 的路由
+// [
+//   { path: '/table/{tableId}/record', method: 'get', ... },  // 先注册
+//   { path: '/table/{tableId}/record', method: 'get', ... },  // 后注册
+// ]
+
+// 在 generateDocument 时，OpenAPI 的 paths 是对象
+// paths['/table/{tableId}/record']['get'] = 后注册的路由定义
+// 先注册的被覆盖！
+```
+
+**3. 实际风险场景**
+
+目前代码中没有发现重复路径，但以下情况可能触发：
+- 不同模块意外定义了相同的 URL 路径
+- 重构时重命名文件但忘记删除旧文件
+- 条件加载导致某些模块被重复导入
+
+**4. 缓解措施**
+
+- 模块导出顺序固定（在 `index.ts` 中明确列出）
+- 代码审查时检查是否有重复的 URL 常量定义
+- 单元测试验证路由数量和路径唯一性
+
+### 1.4 客户端类型/调用封装
 
 #### Axios 实例配置
 
@@ -222,15 +311,6 @@ export const createAxios = () => {
   );
   return axios;
 };
-
-// 支持服务端 AsyncLocalStorage 的代理 axios
-const axios = new Proxy(defaultAxios, {
-  get(target, prop, receiver) {
-    const currentAxios = getAxios(); // 从 AsyncLocalStorage 获取或使用默认
-    const value = Reflect.get(currentAxios, prop, receiver);
-    return typeof value === 'function' ? value.bind(currentAxios) : value;
-  },
-}) as AxiosInstance;
 ```
 
 #### SDK 层封装
@@ -274,23 +354,16 @@ export const useRecordsQuery = (query?: IGetRecordsRo, enabled = true) => {
 - ✅ React Query 集成: `@teable/sdk` (手动封装)
 - ✅ 领域模型包装: `@teable/sdk` (手动编写)
 
-### 1.4 V1 后端接入
+### 1.5 V1 后端接入
 
 [apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts](apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts)
 
 ```typescript
-import { getRecordQuerySchema } from '@teable/openapi';
-import type { IGetRecordQuery, IRecord } from '@teable/openapi';
-import { ZodValidationPipe } from '../../../zod.validation.pipe';
-
+@UseGuards(V2FeatureGuard)
+@UseInterceptors(V2IndicatorInterceptor)
+@AllowAnonymous()  // 实际允许匿名访问
 @Controller('api/table/:tableId/record')
 export class RecordOpenApiController {
-  constructor(
-    private readonly recordService: RecordService,
-    private readonly recordOpenApiService: RecordOpenApiService,
-    private readonly recordOpenApiV2Service: RecordOpenApiV2Service  // v2 服务
-  ) {}
-
   @UseV2Feature('getRecords')
   @Permissions('record|read')
   @Get()
@@ -298,7 +371,6 @@ export class RecordOpenApiController {
     @Param('tableId') tableId: string,
     @Query(new ZodValidationPipe(getRecordsRoSchema), TqlPipe, FieldKeyPipe) query: IGetRecordsRo
   ): Promise<IRecordsVo> {
-    // 运行时决定使用 v1 还是 v2 实现
     if (this.cls.get('useV2')) {
       return this.recordOpenApiV2Service.getRecords(tableId, query);
     }
@@ -335,98 +407,183 @@ packages/v2/contract-http/src/
     ├── createRecord.ts
     ├── updateRecord.ts
     ├── deleteRecords.ts
+    ├── getRecordById.ts        // 单条记录查询
+    ├── listTableRecords.ts     // 列表查询
     ├── dto.ts
     ├── recordDto.ts
     └── ...
 ```
 
-#### API 定义方式（以 createRecord 为例）
+#### API 定义方式（以读取记录为例）
 
-**1. 输入 Schema 定义** (来自 `@teable/v2-core`)
+**1. 单条记录查询 (getRecord)**
 
-[packages/v2/core/src/commands/CreateRecordCommand.ts](packages/v2/core/src/commands/CreateRecordCommand.ts)
+**输入 Schema 定义** (来自 `@teable/v2-core`):
+
+[packages/v2/core/src/queries/GetRecordByIdQuery.ts](packages/v2/core/src/queries/GetRecordByIdQuery.ts)
 
 ```typescript
-import { z } from 'zod';
-
-export const createRecordInputSchema = z.object({
+export const getRecordByIdInputSchema = z.object({
   tableId: z.string(),
-  fields: z.record(z.string(), z.unknown()),
-  fieldKeyType: z.nativeEnum(FieldKeyType).optional(),
-  typecast: z.boolean().optional(),
-  order: z.object({
-    viewId: z.string().optional(),
-    anchorId: z.string().optional(),
-    position: z.enum(['before', 'after']).optional(),
-  }).optional(),
+  recordId: z.string(),
 });
 
-export type ICreateRecordCommandInput = z.infer<typeof createRecordInputSchema>;
+export type IGetRecordByIdQueryInput = z.input<typeof getRecordByIdInputSchema>;
+
+export class GetRecordByIdQuery {
+  static create(raw: unknown): Result<GetRecordByIdQuery, DomainError> {
+    const parsed = getRecordByIdInputSchema.safeParse(raw);
+    if (!parsed.success)
+      return err(domainError.validation({ message: 'Invalid GetRecordByIdQuery input' }));
+
+    return TableId.create(parsed.data.tableId).andThen((tableId) =>
+      RecordId.create(parsed.data.recordId).map(
+        (recordId) => new GetRecordByIdQuery(tableId, recordId)
+      )
+    );
+  }
+}
 ```
 
-**2. 响应 DTO 定义**
+**响应 DTO 定义**:
 
-[packages/v2/contract-http/src/table/createRecord.ts](packages/v2/contract-http/src/table/createRecord.ts)
+[packages/v2/contract-http/src/table/getRecordById.ts](packages/v2/contract-http/src/table/getRecordById.ts)
 
 ```typescript
-import { z } from 'zod';
-import { ok } from 'neverthrow';
-import { apiOkResponseDtoSchema, type IApiOkResponseDto } from '../shared/http';
-import { tableRecordDtoSchema, type ITableRecordDto } from './recordDto';
-
-export interface ICreateRecordResponseDataDto {
+export interface IGetRecordByIdResponseDataDto {
   record: ITableRecordDto;
-  events: Array<IDomainEventDto>;
 }
 
-export const createRecordResponseDataSchema = z.object({
+export const getRecordByIdResponseDataSchema = z.object({
   record: tableRecordDtoSchema,
-  events: z.array(domainEventDtoSchema),
 });
 
-export const createRecordOkResponseSchema = apiOkResponseDtoSchema(createRecordResponseDataSchema);
+export const getRecordByIdOkResponseSchema = apiOkResponseDtoSchema(
+  getRecordByIdResponseDataSchema
+);
 
-// Domain → DTO 转换
-export const mapCreateRecordResultToDto = (
-  result: CreateRecordResult
-): Result<ICreateRecordResponseDataDto, DomainError> => {
-  return ok({
-    record: {
-      id: result.record.id().toString(),
-      fields: Object.fromEntries(
-        result.record.fields().entries().map(([fieldId, value]) => 
-          [fieldId.toString(), value.toValue()]
-        )
-      ),
-    },
-    events: result.events.map(mapDomainEventToDto),
-  });
+export const mapGetRecordByIdResultToDto = (
+  result: GetRecordByIdResult
+): Result<IGetRecordByIdResponseDataDto, DomainError> => {
+  return mapTableRecordToDto(result.record).map((record) => ({ record }));
 };
 ```
 
-**3. 契约注册**
+**2. 记录列表查询 (listRecords)**
+
+**输入 Schema 定义**:
+
+[packages/v2/core/src/queries/ListTableRecordsQuery.ts](packages/v2/core/src/queries/ListTableRecordsQuery.ts)
+
+```typescript
+export const listTableRecordsInputSchema = z
+  .object({
+    tableId: z.string(),
+    filter: parseJsonInput(recordFilterSchema).optional(),
+    sort: parseJsonInput(z.array(recordSortSchema)).optional(),
+    groupBy: parseJsonInput(recordGroupBySchema).optional(),
+    search: parseJsonInput(recordSearchInputSchema).optional(),
+    viewId: z.string().min(1).optional(),
+    ignoreViewQuery: z.coerce.boolean().optional(),
+    limit: z.coerce.number().int().positive().max(MAX_RECORDS_LIMIT).optional(),
+    offset: z.coerce.number().int().nonnegative().optional(),
+    fieldKeyType: fieldKeyTypeSchema,
+  })
+  .superRefine((value, ctx) => {
+    if (value.filterLinkCellSelected && value.filterLinkCellCandidate) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'filterLinkCellSelected and filterLinkCellCandidate can not be set at the same time',
+        path: ['filterLinkCellSelected'],
+      });
+    }
+  });
+
+export type IListTableRecordsQueryInput = z.input<typeof listTableRecordsInputSchema>;
+```
+
+**响应 DTO 定义**:
+
+[packages/v2/contract-http/src/table/listTableRecords.ts](packages/v2/contract-http/src/table/listTableRecords.ts)
+
+```typescript
+export interface IListTableRecordsPaginationDto {
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+}
+
+export interface IListTableRecordsResponseDataDto {
+  records: ITableRecordDto[];
+  pagination: IListTableRecordsPaginationDto;
+}
+
+export const listTableRecordsOkResponseSchema = apiOkResponseDtoSchema(
+  z.object({
+    records: z.array(tableRecordDtoSchema),
+    pagination: z.object({
+      total: z.number().int().nonnegative(),
+      offset: z.number().int().nonnegative(),
+      limit: z.number().int().positive(),
+      hasMore: z.boolean(),
+    }),
+  })
+);
+
+export const mapListTableRecordsResultToDto = (
+  result: ListTableRecordsResult
+): Result<IListTableRecordsResponseDataDto, DomainError> => {
+  return sequenceResults(result.records.map(mapTableRecordToDto)).map((records) => ({
+    records: [...records],
+    pagination: {
+      total: result.total,
+      offset: result.offset,
+      limit: result.limit,
+      hasMore: result.offset + records.length < result.total,
+    },
+  }));
+};
+```
+
+**3. 契约注册**:
 
 [packages/v2/contract-http/src/contract.ts](packages/v2/contract-http/src/contract.ts)
 
 ```typescript
 import { oc } from '@orpc/contract';
-import { createRecordInputSchema } from '@teable/v2-core';
-import { createRecordOkResponseSchema } from './table/createRecord';
+import { getRecordByIdInputSchema, listTableRecordsInputSchema } from '@teable/v2-core';
+import { getRecordByIdOkResponseSchema, listTableRecordsOkResponseSchema } from './table';
 
-const TABLES_CREATE_RECORD_PATH = '/tables/createRecord';
+const TABLES_GET_RECORD_PATH = '/tables/getRecord';
+const TABLES_LIST_RECORDS_PATH = '/tables/listRecords';
 
 export const v2Contract = {
   tables: {
-    createRecord: oc
+    // ✅ 单条记录查询：GET 方法，参数通过 query string 传递
+    getRecord: oc
       .route({
-        method: 'POST',
-        path: TABLES_CREATE_RECORD_PATH,
-        successStatus: 201,
-        summary: 'Create record',
+        method: 'GET',
+        path: TABLES_GET_RECORD_PATH,
+        successStatus: 200,
+        summary: 'Get record by id',
         tags: ['tables'],
       })
-      .input(createRecordInputSchema)
-      .output(createRecordOkResponseSchema),
+      .input(getRecordByIdInputSchema)  // { tableId, recordId }
+      .output(getRecordByIdOkResponseSchema),
+
+    // ✅ 记录列表查询：GET 方法，参数通过 query string 传递
+    listRecords: oc
+      .route({
+        method: 'GET',
+        path: TABLES_LIST_RECORDS_PATH,
+        successStatus: 200,
+        summary: 'List table records',
+        tags: ['tables'],
+      })
+      .input(listTableRecordsInputSchema)  // { tableId, filter?, sort?, ... }
+      .output(listTableRecordsOkResponseSchema),
+
     // ... 更多路由
   },
 } as const satisfies AnyContractRouter;
@@ -456,10 +613,10 @@ export type IApiResponseDto<T> = IApiOkResponseDto<T> | IApiErrorResponseDto;
 ```
 
 **责任归属**:
-- ✅ Schema 定义: `@teable/v2-core` (领域层)
+- ✅ Schema 定义: `@teable/v2-core` (领域层，与传输无关)
 - ✅ 契约定义: `@teable/v2-contract-http`
 - ✅ DTO 转换: `@teable/v2-contract-http`
-- ✅ 服务端路由: 由适配器自动生成
+- ✅ 服务端路由: 由 @orpc/nest 自动绑定
 - ✅ 客户端类型: 由 `@orpc/client` 自动推导
 
 ### 2.2 文档生成
@@ -534,7 +691,6 @@ export const createV2HttpClient = (
     headers: options.headers,
     fetch: options.fetch,
     customErrorResponseBodyDecoder: (body, response) => {
-      // 自定义错误解码
       if (isORPCErrorJson(body)) {
         return createORPCErrorFromJson(body);
       }
@@ -560,7 +716,7 @@ export const createV2HttpClient = (
 };
 ```
 
-**使用示例**:
+**调用示例**：
 
 ```typescript
 import { createV2HttpClient } from '@teable/v2-contract-http-client';
@@ -570,18 +726,28 @@ const client = createV2HttpClient({
   headers: { Authorization: 'Bearer <token>' },
 });
 
-// 完全类型安全的调用
-const result = await client.tables.createRecord({
+// ✅ 单条记录查询：GET /tables/getRecord?tableId=tblxxx&recordId=recxxx
+const recordResult = await client.tables.getRecord({
   tableId: 'tblxxx',
-  fields: {
-    name: 'Hello',
-    age: 25,
-  },
-  fieldKeyType: 'name',
+  recordId: 'recxxx',
 });
+// 返回: { ok: true; data: { record: { id, fields } } }
 
-// result 类型: { ok: true; data: { record: ...; events: ... } }
-// 或抛出 ORPCError
+// ✅ 记录列表查询：GET /tables/listRecords?tableId=tblxxx&limit=100&offset=0
+const listResult = await client.tables.listRecords({
+  tableId: 'tblxxx',
+  limit: 100,
+  offset: 0,
+  fieldKeyType: 'name',
+  // 复杂参数会被自动序列化为 JSON 字符串
+  filter: {
+    conditions: [
+      { fieldId: 'fldxxx', operator: 'is', value: 'value' },
+    ],
+  },
+  sort: [{ fieldId: 'fldxxx', order: 'asc' }],
+});
+// 返回: { ok: true; data: { records: [...], pagination: {...} } }
 ```
 
 **责任归属**:
@@ -603,52 +769,49 @@ const result = await client.tables.createRecord({
 @teable/v2-core (命令总线 + 领域模型)
 ```
 
-**端点处理器示例**:
+**端点处理器示例** (listRecords):
 
-[packages/v2/contract-http-implementation/src/handlers/tables/createRecord.ts](packages/v2/contract-http-implementation/src/handlers/tables/createRecord.ts)
+[packages/v2/contract-http-implementation/src/handlers/tables/listTableRecords.ts](packages/v2/contract-http-implementation/src/handlers/tables/listTableRecords.ts)
 
 ```typescript
-import type { IExecutionContext, ICommandBus } from '@teable/v2-core';
-import { CreateRecordCommand } from '@teable/v2-core';
-import { mapCreateRecordResultToDto } from '@teable/v2-contract-http';
-
-export const executeCreateRecordEndpoint = async (
+export const executeListTableRecordsEndpoint = async (
   context: IExecutionContext,
-  input: ICreateRecordCommandInput,
-  commandBus: ICommandBus
-): Promise<ICreateRecordEndpointResult> => {
-  const commandResult = CreateRecordCommand.create(input);
-  
-  if (commandResult.isErr()) {
+  rawInput: unknown,
+  queryBus: IQueryBus
+): Promise<IListTableRecordsEndpointResult> => {
+  // 1. 原始输入 → 领域对象
+  const queryResult = ListTableRecordsQuery.create(rawInput);
+  if (queryResult.isErr()) {
     return {
-      status: mapDomainErrorToHttpStatus(commandResult.error),
-      body: {
-        ok: false,
-        error: mapDomainErrorToHttpError(commandResult.error),
-      },
+      status: mapDomainErrorToHttpStatus(queryResult.error),
+      body: { ok: false, error: mapDomainErrorToHttpError(queryResult.error) },
     };
   }
 
-  const result = await commandBus.execute<CreateRecordCommand, CreateRecordResult>(
+  // 2. 执行查询
+  const result = await queryBus.execute<ListTableRecordsQuery, ListTableRecordsResult>(
     context,
-    commandResult.value
+    queryResult.value
   );
-
   if (result.isErr()) {
     return {
       status: mapDomainErrorToHttpStatus(result.error),
-      body: {
-        ok: false,
-        error: mapDomainErrorToHttpError(result.error),
-      },
+      body: { ok: false, error: mapDomainErrorToHttpError(result.error) },
     };
   }
 
-  const dto = mapCreateRecordResultToDto(result.value);
+  // 3. 领域结果 → DTO
+  const mapped = mapListTableRecordsResultToDto(result.value);
+  if (mapped.isErr()) {
+    return {
+      status: mapDomainErrorToHttpStatus(mapped.error),
+      body: { ok: false, error: mapDomainErrorToHttpError(mapped.error) },
+    };
+  }
 
   return {
-    status: 201,
-    body: { ok: true, data: dto.value },
+    status: 200,
+    body: { ok: true, data: mapped.value },
   };
 };
 ```
@@ -658,24 +821,27 @@ export const executeCreateRecordEndpoint = async (
 [apps/nestjs-backend/src/features/v2/v2.controller.ts](apps/nestjs-backend/src/features/v2/v2.controller.ts)
 
 ```typescript
-import { Controller } from '@nestjs/common';
-import { Implement, implement, ORPCError } from '@orpc/nest';
-import { v2Contract } from '@teable/v2-contract-http';
-import { executeCreateRecordEndpoint } from '@teable/v2-contract-http-implementation/handlers';
-
 @Controller('api/v2')
 export class V2Controller {
   @Implement(v2Contract.tables)
   tables() {
     return {
-      createRecord: implement(v2Contract.tables.createRecord).handler(async ({ input }) => {
+      getRecord: implement(v2Contract.tables.getRecord).handler(async ({ input }) => {
         const container = await this.v2Container.getContainer();
-        const commandBus = container.resolve<ICommandBus>(v2CoreTokens.commandBus);
+        const queryBus = container.resolve<IQueryBus>(v2CoreTokens.queryBus);
         const context = await this.v2ContextFactory.createContext();
 
-        const result = await executeCreateRecordEndpoint(context, input, commandBus);
+        const result = await executeGetRecordByIdEndpoint(context, input, queryBus);
+        if (result.status === 200) return result.body;
+        throwOrpcErrorByStatus(result.status, result.body.error);
+      }),
+      listRecords: implement(v2Contract.tables.listRecords).handler(async ({ input }) => {
+        const container = await this.v2Container.getContainer();
+        const queryBus = container.resolve<IQueryBus>(v2CoreTokens.queryBus);
+        const context = await this.v2ContextFactory.createContext();
 
-        if (result.status === 201) return result.body;
+        const result = await executeListTableRecordsEndpoint(context, input, queryBus);
+        if (result.status === 200) return result.body;
         throwOrpcErrorByStatus(result.status, result.body.error);
       }),
       // ... 更多端点
@@ -691,16 +857,105 @@ export class V2Controller {
 | **Schema 定义** | `@teable/openapi` (与 HTTP 绑定) | `@teable/v2-core` (纯领域，与传输无关) |
 | **接口契约** | `@teable/openapi` RouteConfig | `@teable/v2-contract-http` @orpc/contract |
 | **文档生成** | `@teable/openapi` + `@asteasolutions/zod-to-openapi` | `@teable/v2-contract-http-openapi` + `@orpc/openapi` |
-| **服务端路由** | NestJS Controller 手动定义 | `@orpc/nest` 自动绑定 + 适配器 |
+| **鉴权声明** | 生成器统一强制添加 bearerAuth | 由 @orpc 契约定义 |
+| **服务端路由** | NestJS Controller 手动定义 | `@orpc/nest` 自动绑定 |
 | **服务端验证** | ZodValidationPipe 手动应用 | 由 @orpc 自动处理 |
 | **客户端函数** | `@teable/openapi` 手动编写 Axios 函数 | `@orpc/client` 自动生成类型安全客户端 |
 | **响应格式** | 自由格式 (直接返回数据) | 统一 `{ ok: true, data: T }` / `{ ok: false, error: E }` |
-| **路径风格** | RESTful `/table/{tableId}/record/{recordId}` | RPC 动作式 `/tables/createRecord` |
+| **路径风格** | RESTful `/table/{tableId}/record/{recordId}` | RPC 动作式 `/tables/listRecords` |
 | **错误处理** | HttpException 抛异常 | neverthrow Result + ORPCError |
 
-## 第四部分：运行时 V2 切换机制与文档对齐
+## 第四部分：文档-类型-调用 链路边界关系
 
-### 4.1 Canary 发布系统
+### 三条独立链路
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    文档生成链路 (OpenAPI JSON)                       │
+├─────────────────────────────────────────────────────────────────────┤
+│  Zod Schema                                                          │
+│      ↓ .meta() / .describe()                                        │
+│  RouteConfig (path, method, summary, tags, request, responses)       │
+│      ↓ registerRoute()                                               │
+│  全局 routes[] 数组                                                  │
+│      ↓ getOpenApiDocumentation()                                    │
+│  OpenAPIRegistry                                                    │
+│      ↓ OpenApiGeneratorV3                                           │
+│  OpenAPI 3.0 JSON                                                   │
+│      ↓                                                               │
+│  Swagger UI / Redoc                                                 │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    类型生成链路 (TypeScript)                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  Zod Schema                                                          │
+│      ↓ z.infer<typeof schema>                                       │
+│  TypeScript 类型 (IGetRecordsRo, IRecordsVo, 等)                    │
+│      ↓                                                               │
+│  导入到 Controller / Service / 前端组件                              │
+│      ↓                                                               │
+│  编译时类型检查                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    调用封装链路 (HTTP Client)                        │
+├─────────────────────────────────────────────────────────────────────┤
+│  V1: 手动编写                                                        │
+│    Axios 实例 → getRecords(tableId, query) → { data }              │
+│        ↓                                                             │
+│    @teable/sdk → useRecordsQuery() → React Query → UI               │
+│                                                                     │
+│  V2: 自动生成                                                        │
+│    v2Contract → @orpc/client → createV2HttpClient()                │
+│        ↓                                                             │
+│    client.tables.listRecords(input) → 类型安全调用                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 边界关系详解
+
+#### 1. 文档生成链路 vs 类型生成链路
+
+**共同点**：共享同一个 Zod Schema
+
+**不同点**：
+- 文档生成需要额外的元数据：`.meta({ type: 'string', description: '...' })`
+- 类型生成只需要 Schema 的结构，不需要元数据
+- 文档生成是运行时行为（启动时执行）
+- 类型生成是编译时行为（TypeScript 编译）
+
+**边界**：
+- 如果 Schema 缺少 `.meta()`，文档生成可能失败或显示不正确的类型
+- 但类型生成不受影响
+
+#### 2. 文档生成链路 vs 调用封装链路
+
+**V1 中完全独立**：
+- 文档生成：从 `routes[]` 数组读取 RouteConfig
+- 调用封装：手动编写的 Axios 函数
+- **没有自动同步机制**：RouteConfig 更新后，Axios 函数需要手动同步
+
+**V2 中通过契约关联**：
+- 文档生成：从 `v2Contract` 读取
+- 调用封装：`@orpc/client` 也从 `v2Contract` 生成
+- **自动同步**：契约修改后，文档和客户端同时更新
+
+#### 3. 类型生成链路 vs 调用封装链路
+
+**V1 中手动关联**：
+- 类型：`z.infer<typeof getRecordsRoSchema>` → `IGetRecordsRo`
+- 调用：`getRecords(tableId: string, query?: IGetRecordsRo)`
+- 开发者需要手动确保函数签名与类型匹配
+
+**V2 中自动关联**：
+- 类型：由 `v2Contract` 推导
+- 调用：`client.tables.listRecords(input)` 自动获得类型
+- 编译时自动检查一致性
+
+## 第五部分：运行时 V2 切换机制与文档对齐
+
+### 5.1 Canary 发布系统
 
 **核心组件**:
 
@@ -743,7 +998,7 @@ export class CanaryService {
 }
 ```
 
-### 4.2 V2FeatureGuard 工作流程
+### 5.2 V2FeatureGuard 工作流程
 
 [apps/nestjs-backend/src/features/canary/guards/v2-feature.guard.ts](apps/nestjs-backend/src/features/canary/guards/v2-feature.guard.ts)
 
@@ -780,171 +1035,190 @@ export class V2FeatureGuard implements CanActivate {
 }
 ```
 
-### 4.3 Controller 中的分支逻辑
+### 5.3 Controller 中的分支逻辑
 
 [apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts](apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts)
 
 ```typescript
 @UseGuards(V2FeatureGuard)
 @UseInterceptors(V2IndicatorInterceptor)
+@AllowAnonymous()
 @Controller('api/table/:tableId/record')
 export class RecordOpenApiController {
-  @UseV2Feature('createRecord')
-  @Permissions('record|create')
-  @Post()
-  async createRecords(
+  @UseV2Feature('getRecords')
+  @Permissions('record|read')
+  @Get()
+  async getRecords(
     @Param('tableId') tableId: string,
-    @Body(new ZodValidationPipe(createRecordsRoSchema)) createRecordsRo: ICreateRecordsRo,
-  ): Promise<ICreateRecordsVo> {
+    @Query(new ZodValidationPipe(getRecordsRoSchema), TqlPipe, FieldKeyPipe) query: IGetRecordsRo
+  ): Promise<IRecordsVo> {
     // 运行时分支
     if (this.cls.get('useV2')) {
-      return this.recordOpenApiV2Service.createRecords(tableId, createRecordsRo);
+      return this.recordOpenApiV2Service.getRecords(tableId, query);
     }
-    return this.recordOpenApiService.multipleCreateRecords(tableId, createRecordsRo);
+    return await this.recordService.getRecords(tableId, query, true);
   }
 }
 ```
 
-### 4.4 文档与实际行为的对齐情况
+### 5.4 文档与实际行为的对齐情况
 
 #### ✅ 对齐的部分
 
-1. **V1 文档与 V1 行为**: 完全对齐
+1. **V1 文档与 V1 行为**: 完全对齐（除鉴权声明外）
    - 文档从 `@teable/openapi` 生成
    - 后端 Controller 路径与 RouteConfig 定义一致
    - 请求/响应格式匹配
 
 2. **V2 独立文档与 V2 行为**: 完全对齐
    - `/api/v2/openapi.json` 从 `v2Contract` 生成
-   - 路径 `/api/v2/tables/createRecord` 与契约定义一致
+   - 路径 `/api/v2/tables/listRecords` 与契约定义一致
    - 统一响应格式 `{ ok: true, data: T }`
 
 #### ⚠️ 不完全对齐的部分
 
-1. **V1 文档中的 V2 行为**: 文档显示 V1 格式，但实际可能返回 V2 数据
+1. **V1 文档中的鉴权声明过度覆盖**:
+   - 文档中所有路由都被标记为需要 Bearer Token
+   - 但实际 `@AllowAnonymous()` 接口不需要鉴权
+   - 影响：Swagger UI 测试时需要填写不必要的 Authorization header
+
+2. **V1 文档中的 V2 行为**:
    - 当 `useV2=true` 时，`GET /api/table/{tableId}/record` 实际调用 V2 服务
    - 但 Swagger 文档 (`/docs`) 仍然显示 V1 的响应 schema
    - **注意**: V2Service 会进行数据格式转换以保持 V1 兼容性
 
-2. **V1 路径与 V2 路径并存**:
+3. **V1 路径与 V2 路径并存**:
    - V1: `GET /api/table/{tableId}/record/{recordId}`
-   - V2: `POST /api/v2/tables/getRecord` (body: { tableId, recordId })
-   - 两者功能相同但调用方式不同
+   - V2: `GET /api/v2/tables/getRecord?tableId=xxx&recordId=xxx`
+   - 两者功能相同但调用方式不同（URL 路径 vs Query 参数）
 
-3. **v2Indicator 响应头**:
+4. **v2Indicator 响应头**:
    - `V2IndicatorInterceptor` 会在响应头中添加 `x-teable-v2: true` 当使用 V2 实现时
    - 可用于调试和监控
 
-### 4.5 V2 服务中的格式适配
+### 5.5 V2 服务中的格式适配
 
 [apps/nestjs-backend/src/features/record/open-api/record-open-api-v2.service.ts](apps/nestjs-backend/src/features/record/open-api/record-open-api-v2.service.ts)
 
 ```typescript
 @Injectable()
 export class RecordOpenApiV2Service {
-  async createRecords(
+  async getRecords(
     tableId: string,
-    createRecordsRo: ICreateRecordsRo,  // V1 输入格式
-  ): Promise<ICreateRecordsVo> {       // V1 输出格式
+    query: IGetRecordsRo,  // V1 输入格式
+  ): Promise<IRecordsVo> {   // V1 输出格式
     const container = await this.v2ContainerService.getContainer();
-    const commandBus = container.resolve<ICommandBus>(v2CoreTokens.commandBus);
-    const context = await this.v2ContextFactory.createContext();
+    const queryBus = container.resolve<IQueryBus>(v2CoreTokens.queryBus);
+    const context = await this.createV2ReadContext(tableId, query);
 
     // 调用 V2 端点处理器
-    const result = await executeCreateRecordsEndpoint(
-      context,
+    const pageResult = await this.executeListRecordsEndpoint(
       {
         tableId,
-        records: createRecordsRo.records,
-        typecast: createRecordsRo.typecast ?? false,
-        fieldKeyType: createRecordsRo.fieldKeyType,
-        order: createRecordsRo.order,
+        fieldKeyType: FieldKeyType.Id,
+        limit: query.take,
+        offset: query.skip,
+        filter: normalizedFilter,
+        sort: normalizedSort,
+        groupBy: normalizedGroupBy,
+        search: query.search,
+        viewId: query.viewId,
       },
-      commandBus
+      context,
+      queryBus
     );
 
-    if (result.status === 201 && result.body.ok) {
-      // V2 → V1 格式转换
-      return {
-        records: result.body.data.records as IRecord[],
-      };
-    }
-
-    this.throwV2Error(result.body.error, result.status);
+    // V2 → V1 格式转换
+    // V2: { records: [...], pagination: { total, offset, limit, hasMore } }
+    // V1: { records: [...], extra?: { groupPoints, ... } }
+    const records = await this.recordService.getSnapshotBulkWithPermission(...);
+    
+    return queryExtra
+      ? { records: normalizedRecords, extra: queryExtra }
+      : { records: normalizedRecords };
   }
 }
 ```
 
-## 第五部分：完整数据流对比
+## 第六部分：完整数据流对比
 
 ### V1 数据流
 
 ```
 1. API 定义 (开发时)
-   @teable/openapi/src/record/get.ts
-   ├─ Zod Schema: getRecordQuerySchema
-   ├─ URL: GET_RECORD_URL = '/table/{tableId}/record/{recordId}'
-   ├─ RouteConfig: GetRecordRoute (注册到全局数组)
-   └─ Axios 函数: getRecord()
+   @teable/openapi/src/record/get-list.ts
+   ├─ Zod Schema: getRecordsRoSchema
+   ├─ URL: GET_RECORDS_URL = '/table/{tableId}/record'
+   ├─ RouteConfig: GetRecordsRoute (注册到全局数组)
+   └─ Axios 函数: getRecords(tableId, query)
 
-2. 文档生成 (启动时)
+2. 类型生成 (编译时)
+   z.infer<typeof getRecordsRoSchema> → IGetRecordsRo
+   z.infer<typeof recordsVoSchema> → IRecordsVo
+
+3. 文档生成 (启动时)
    setupSwagger()
    └─ getOpenApiDocumentation()
       ├─ getRoutes() → 所有已注册的 RouteConfig
+      ├─ 强制添加 security: bearerAuth 到所有路由
       └─ @asteasolutions/zod-to-openapi → openapi.json
          └─ 挂载到 /docs, /redocs
 
-3. 请求处理 (运行时)
-   HTTP GET /api/table/tblxxx/record/recxxx
-   ├─ NestJS 路由匹配 → RecordOpenApiController.getRecord()
-   ├─ ZodValidationPipe(getRecordQuerySchema) 验证 query
+4. 请求处理 (运行时)
+   HTTP GET /api/table/tblxxx/record?limit=100
+   ├─ NestJS 路由匹配 → RecordOpenApiController.getRecords()
+   ├─ ZodValidationPipe(getRecordsRoSchema) 验证 query
    ├─ V2FeatureGuard 决策 useV2
-   ├─ 分支: useV2 ? v2Service.getRecord() : v1Service.getRecord()
-   └─ 返回 IRecord (V1 格式)
+   ├─ 分支: useV2 ? v2Service.getRecords() : v1Service.getRecords()
+   └─ 返回 IRecordsVo (V1 格式)
 
-4. 前端调用
+5. 前端调用
    @teable/sdk useRecordsQuery()
-   └─ @teable/openapi getRecords()
-      └─ axios.get('/api/table/tblxxx/record/recxxx')
+   └─ @teable/openapi getRecords(tableId, query)
+      └─ axios.get('/api/table/tblxxx/record?limit=100')
 ```
 
 ### V2 数据流
 
 ```
 1. API 定义 (开发时)
-   @teable/v2-core/src/commands/CreateRecordCommand.ts
-   └─ Zod Schema: createRecordInputSchema
+   @teable/v2-core/src/queries/ListTableRecordsQuery.ts
+   └─ Zod Schema: listTableRecordsInputSchema
    
    @teable/v2-contract-http/src/contract.ts
-   └─ oc.route({ path: '/tables/createRecord', method: 'POST' })
-         .input(createRecordInputSchema)
-         .output(createRecordOkResponseSchema)
+   └─ oc.route({ path: '/tables/listRecords', method: 'GET' })
+         .input(listTableRecordsInputSchema)
+         .output(listTableRecordsOkResponseSchema)
 
-2. 文档生成 (启动时)
+2. 类型生成 (编译时)
+   @orpc/contract 自动推导输入输出类型
+   无需手动 z.infer
+
+3. 文档生成 (启动时)
    V2OpenApiController.openapi()
    └─ generateV2OpenApiDocument()
       ├─ @orpc/openapi OpenAPIGenerator
       └─ v2Contract → openapi.json
          └─ 挂载到 /api/v2/docs (Scalar UI)
 
-3. 请求处理 (运行时)
-   HTTP POST /api/v2/tables/createRecord
+4. 请求处理 (运行时)
+   HTTP GET /api/v2/tables/listRecords?tableId=tblxxx&limit=100
    ├─ @orpc/nest 自动路由匹配
    ├─ @orpc 自动验证输入 schema
-   ├─ V2Controller.tables.createRecord handler
-   ├─ executeCreateRecordEndpoint(context, input, commandBus)
-   │  ├─ CreateRecordCommand.create(input) → 领域验证
-   │  ├─ commandBus.execute() → 领域处理
-   │  └─ mapCreateRecordResultToDto() → DTO 转换
-   └─ 返回 { ok: true, data: { record, events } }
+   ├─ V2Controller.tables.listRecords handler
+   ├─ executeListTableRecordsEndpoint(context, input, queryBus)
+   │  ├─ ListTableRecordsQuery.create(input) → 领域验证
+   │  ├─ queryBus.execute() → 领域处理
+   │  └─ mapListTableRecordsResultToDto() → DTO 转换
+   └─ 返回 { ok: true, data: { records, pagination } }
 
-4. 前端调用
+5. 前端调用
    @teable/v2-contract-http-client createV2HttpClient()
-   └─ client.tables.createRecord({ tableId, fields })
+   └─ client.tables.listRecords({ tableId, limit: 100 })
       └─ @orpc/client 自动序列化请求 + 解析响应
 ```
 
-## 第六部分：设计优势与演进方向
+## 第七部分：设计优势与演进方向
 
 ### V1 优势
 - ✅ 简单直接，易于理解
@@ -953,21 +1227,24 @@ export class RecordOpenApiV2Service {
 
 ### V1 问题
 - ❌ 契约与传输层绑定，无法复用
-- ❌ 客户端函数需手动编写，易出错
+- ❌ 客户端函数需手动编写，易出错且与文档可能不一致
 - ❌ 响应格式不统一，错误处理不一致
 - ❌ 服务端路由需手动定义，与契约可能不一致
+- ❌ 鉴权声明在文档中过度覆盖，与实际行为不符
+- ❌ 路由收集无去重，存在模块加载顺序依赖和覆盖风险
 
 ### V2 优势
 - ✅ 契约与实现分离，可支持多传输协议 (HTTP, WebSocket, 等)
-- ✅ 客户端自动生成，零样板代码
+- ✅ 客户端自动生成，零样板代码，与文档自动同步
 - ✅ 统一响应格式，错误处理标准化
 - ✅ 服务端路由自动绑定，确保与契约一致
 - ✅ 领域模型与 HTTP 传输解耦，更清晰的架构分层
+- ✅ Schema 定义在纯领域层，可被复用
 
 ### V2 当前限制
 - ⚠️ 部分 V1 API 尚未迁移到 V2
-- ⚠️ 双轨运行增加了维护成本
-- ⚠️ 需要格式转换以保持向后兼容
+- ⚠️ 双轨运行增加了维护成本（V2Service 需要格式转换）
+- ⚠️ V1 路径和 V2 路径并存，增加了理解成本
 
 ## 总结
 
@@ -976,17 +1253,22 @@ Teable 的 OpenAPI 与 SDK 对齐机制经历了从 **v1 手动契约** 到 **v2
 | 维度 | v1 方式 | v2 方式 |
 |------|---------|---------|
 | **契约定义** | 手动 RouteConfig + Axios 函数 | @orpc/contract 声明式 |
-| **文档生成** | zod-to-openapi | @orpc/openapi |
+| **文档生成** | zod-to-openapi（强制鉴权） | @orpc/openapi |
 | **服务端** | NestJS Controller 手动绑定 | @orpc/nest 自动实现 |
 | **客户端** | 手动编写 Axios 函数 | @orpc/client 自动生成 |
 | **类型安全** | 依赖人工维护 | 编译时自动推导 |
 | **错误处理** | HttpException | neverthrow + ORPCError |
 
 **文档对齐现状**:
-- V1 文档与 V1 行为完全对齐
+- V1 文档与 V1 行为基本对齐，但鉴权声明存在过度覆盖
 - V2 文档与 V2 行为完全对齐
 - 运行时 V2 切换通过 V2FeatureGuard + CLS 实现
 - V1 API 路径在使用 V2 实现时会进行格式转换以保持向后兼容
 - 通过 `x-teable-v2` 响应头标识实际使用的实现版本
+
+**三条独立链路的边界**:
+1. **文档生成链路**: Zod Schema → RouteConfig → OpenAPI JSON，依赖 `.meta()` 元数据
+2. **类型生成链路**: Zod Schema → z.infer → TypeScript 类型，纯编译时行为
+3. **调用封装链路**: V1 手动编写 / V2 自动生成，与文档链路在 V2 中通过契约自动同步
 
 这种渐进式演进策略确保了系统在重构过程中的稳定性，同时为最终全面迁移到 v2 架构奠定了基础。

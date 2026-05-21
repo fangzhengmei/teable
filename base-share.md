@@ -317,9 +317,64 @@ private async tryBaseSharePermissionCheck(
 
 ---
 
-### 2.7 Guard 职责分工与执行顺序
+### 2.7 view-share 与 base-share 两条鉴权链路的本质区别
 
-#### 2.7.1 BaseShareAuthGuard vs PermissionGuard 职责划分
+在分析 Guard 职责之前，必须先明确系统中**两条独立的分享鉴权链路**，它们在"是否受分享上限约束"的判定上标准完全不同：
+
+| 维度 | view-share 链路 | base-share 链路 |
+|------|---------------|----------------|
+| 控制器 | `share.controller.ts` | `base-share-open.controller.ts` |
+| 路由前缀 | `api/share` | `api/share` |
+| 类级别装饰器 | `@Controller('api/share')` + `@Public()` | `@Controller('api/share')`（无类级别 `@Public()`） |
+| 核心守卫 | 仅 `ShareAuthGuard` | `BaseShareAuthGuard` ± `PermissionGuard` |
+| `@Permissions` | ❌ 无 | ✅ 部分接口有 |
+| `@ResourceMeta` | ❌ 无 | ✅ 部分接口有 |
+| 分享标识传递 | URL 参数 `:shareId` | URL 参数 + `X-Tea-Base-Share` Header |
+| 是否经过 PermissionGuard | ❌ 从不经过 | ✅ 部分接口经过 |
+| "受分享上限约束"概念 | ❌ 不存在 | ✅ 仅存在于使用 `PermissionGuard` 的接口 |
+
+**代码证据**：
+```typescript
+// share.controller.ts:70-72 —— 类级别 @Public()，所有接口都是公开的
+@Controller('api/share')
+@Public()
+export class ShareController {
+  // 所有接口仅使用 ShareAuthGuard，无 PermissionGuard
+  @UseGuards(ShareAuthGuard)
+  @Get('/:shareId/view/records')
+  async getViewRecords() { ... }
+}
+
+// base-share-open.controller.ts:27-28 —— 无类级别 @Public()
+@Controller('api/share')
+export class BaseShareOpenController {
+  // 部分接口仅认证
+  @Public()
+  @UseGuards(BaseShareAuthGuard)
+  @Get('/:shareId/base')
+  async getBaseShare() { ... }
+  
+  // 部分接口认证+权限检查
+  @UseGuards(BaseShareAuthGuard, PermissionGuard)
+  @Permissions('base|create')
+  @ResourceMeta('spaceId', 'body')
+  @Post('/:shareId/base/copy')
+  async copyBaseShare() { ... }
+}
+```
+
+> **关键结论**："受分享上限约束"的判断逻辑**仅存在于 `PermissionGuard.tryBaseSharePermissionCheck()`**，因此只有同时满足以下条件的接口才会触发该判断：
+> 1. 属于 **base-share 链路**
+> 2. 使用了 **`PermissionGuard`**
+> 3. 携带 **`X-Tea-Base-Share` Header**
+> 
+> view-share 链路由于从不经过 PermissionGuard，因此不存在"受/不受分享上限约束"的概念，其权限控制完全在 `ShareAuthGuard` 和 `ShareService` 内部完成。
+
+---
+
+### 2.8 Guard 职责分工与执行顺序
+
+#### 2.8.1 BaseShareAuthGuard vs PermissionGuard 职责划分
 
 | Guard | 核心职责 | 执行阶段 | 判定结果 |
 |-------|---------|---------|---------|
@@ -355,7 +410,7 @@ async validate(context: ExecutionContext, shareId: string) {
 | 仅认证 | `@UseGuards(BaseShareAuthGuard)`<br>`@AllowAnonymous()` | 查询分享元数据（`GET /:shareId/base`） | 不做权限检查，仅认证分享有效性 |
 | 认证+权限 | `@UseGuards(BaseShareAuthGuard, PermissionGuard)`<br>`@Permissions(...)`<br>`@ResourceMeta(...)` | 复制分享、查询分享内资源 | 先认证，再通过 PermissionGuard 做分享权限校验 |
 
-#### 2.7.2 完整执行顺序
+#### 2.8.2 完整执行顺序
 
 `PermissionGuard.canActivate()` → `permissionCheckWithPublicFallback()` 的完整判定链：
 
@@ -425,53 +480,82 @@ async validate(context: ExecutionContext, shareId: string) {
 
 ---
 
-### 2.8 受分享上限约束 / 不受约束的接口判定标准
+### 2.9 受分享上限约束 / 不受约束的接口判定标准
 
-#### 2.8.1 判定标准
+> **前置说明**：本节内容**仅适用于 base-share 链路**。view-share 链路由于从不经过 `PermissionGuard`，不存在"受/不受分享上限约束"的概念。
+
+#### 2.9.1 判定标准
 
 | 维度 | 受分享上限约束 | 不受分享上限约束 |
 |------|--------------|----------------|
+| **链路类型** | ✅ base-share 链路 | ❌ view-share 链路，或非分享链路 |
+| **使用 PermissionGuard** | ✅ 是 | ❌ 否（仅使用 `BaseShareAuthGuard`） |
 | **@Permissions** | ✅ 有标记（非空数组） | ❌ 无标记或空数组 |
 | **资源类型** | ✅ Base/Table/View/Field/Record 级 | ❌ Space 级（`spc` 前缀） |
-| **允许匿名类型** | ✅ `RESOURCE` / `PUBLIC` | ❌ 无 `@AllowAnonymous` 或 `USER` |
 | **Header** | ✅ 携带 `X-Tea-Base-Share` | ❌ 不携带，或解析不出 shareId |
 
 **判定逻辑表达式**：
 ```
-受约束 = (X-Tea-Base-Share 存在且可解析)
+受约束 = (链路类型 = base-share)
+        AND (使用 PermissionGuard)
+        AND (X-Tea-Base-Share 存在且可解析)
         AND (@Permissions 非空)
         AND (resourceId 非空且不以 spc 开头)
 ```
 
-#### 2.8.2 受约束接口示例
+#### 2.9.2 base-share 链路三个接口的实际情况
 
-**示例1：查询分享内表记录**
+`base-share-open.controller.ts` 中共有 3 个接口，它们的约束情况如下：
+
+| 接口 | 装饰器配置 | 是否受约束 | 原因 |
+|------|-----------|-----------|------|
+| `POST /:shareId/base/auth` | `@Public()`<br>`@UseGuards(BaseShareAuthLocalGuard)` | ❌ 不受约束 | 无 `PermissionGuard`，无 `@Permissions` |
+| `GET /:shareId/base` | `@Public()`<br>`@UseGuards(BaseShareAuthGuard)`<br>`@AllowAnonymous()` | ❌ 不受约束 | 无 `PermissionGuard`，无 `@Permissions` |
+| `POST /:shareId/base/copy` | `@UseGuards(BaseShareAuthGuard, PermissionGuard)`<br>`@Permissions('base|create')`<br>`@ResourceMeta('spaceId', 'body')` | ❌ 不受约束 | 有 `PermissionGuard` 和 `@Permissions`，但资源是 Space 级 → 触发跳过条件2 |
+
+> **重要发现**：在当前代码中，`base-share-open.controller.ts` 的三个接口**实际上都不受分享上限约束**！
+> - 前两个接口没有 `PermissionGuard`
+> - 第三个接口虽然有 `PermissionGuard`，但 `@ResourceMeta('spaceId', 'body')` 导致 resourceId 是 Space 级（`spc` 前缀），触发跳过条件2
+
+**代码证据 - 跳过条件2触发时的日志**：
 ```typescript
-// 接口路径（通过 share 路由）
-@UseGuards(BaseShareAuthGuard, PermissionGuard)
-@Permissions('record|read')
-@ResourceMeta('tableId', 'params')
-@Get('/:shareId/table/:tableId/record')
+// permission.guard.ts:313-318
+// e.g. space-level endpoints (GET /space, POST /share/:id/base/copy with spaceId in body)
+// should use the user's own permissions, not the share's.
+const resourceId = this.getResourceId(context) || this.defaultResourceId(context);
+if (!resourceId || resourceId.startsWith(IdPrefix.Space)) {
+  return undefined;  // 跳过分享权限检查
+}
 ```
-- ✅ 有 `@Permissions('record|read')`
-- ✅ 资源是 Table（`tbl` 前缀）
-- ✅ 携带分享 Header
-- **结论**：受分享上限约束，匿名用户可能降级为只读
 
-**示例2：复制分享到用户空间**
+#### 2.9.3 不受约束接口示例
+
+**示例1：获取分享元数据（base-share 链路）**
 ```typescript
+// base-share-open.controller.ts:56-80
+@Public()
+@UseGuards(BaseShareAuthGuard)  // 仅 BaseShareAuthGuard，无 PermissionGuard
+@AllowAnonymous()
+@Get('/:shareId/base')
+async getBaseShare() { ... }
+```
+- ❌ 无 `PermissionGuard` 参与，无 `@Permissions` 检查
+- **结论**：不受分享上限约束，仅做分享有效性认证
+
+**示例2：复制分享到用户空间（base-share 链路）**
+```typescript
+// base-share-open.controller.ts:150-220
 @UseGuards(BaseShareAuthGuard, PermissionGuard)
 @Permissions('base|create')
-@ResourceMeta('spaceId', 'body')  // ⚠️ 注意这里是 spaceId
+@ResourceMeta('spaceId', 'body')  // ⚠️ 资源是 Space 级
 @Post('/:shareId/base/copy')
+async copyBaseShare() { ... }
 ```
-- ✅ 有 `@Permissions('base|create')`
+- ✅ 有 `PermissionGuard` 和 `@Permissions('base|create')`
 - ❌ 资源是 Space（`spc` 前缀）→ 触发跳过条件2
 - **结论**：不受分享上限约束，走用户自身权限检查（即使携带分享 Header）
 
-#### 2.8.3 不受约束接口示例
-
-**示例1：获取当前用户信息**
+**示例3：获取当前用户信息（非分享链路）**
 ```typescript
 // 无 @Permissions 装饰器
 @Get('/user/me')
@@ -480,7 +564,7 @@ async getMe() { ... }
 - ❌ 无 `@Permissions` → 触发跳过条件1
 - **结论**：不受分享上限约束，仅需登录
 
-**示例2：获取空间列表**
+**示例4：获取空间列表（非分享链路）**
 ```typescript
 @Permissions('space|read')
 @Get('/space')
@@ -490,16 +574,38 @@ async getSpaceList() { ... }
 - ❌ 资源是 Space（`spc` 前缀）→ 触发跳过条件2
 - **结论**：不受分享上限约束，即使携带分享 Header 也走用户空间权限
 
-**示例3：获取分享元数据**
+**示例5：查询视图记录（view-share 链路）**
 ```typescript
-@Public()
-@UseGuards(BaseShareAuthGuard)  // 仅 BaseShareAuthGuard，无 PermissionGuard
+// share.controller.ts:126-137
+@ShareLinkView()
+@UseGuards(ShareAuthGuard)  // 仅 ShareAuthGuard，无 PermissionGuard
 @AllowAnonymous()
-@Get('/:shareId/base')
-async getBaseShare() { ... }
+@Get('/:shareId/view/records')
+async getViewRecords() { ... }
 ```
-- ❌ 无 `PermissionGuard` 参与，无 `@Permissions` 检查
-- **结论**：不受分享上限约束，仅做分享有效性认证
+- ❌ 属于 view-share 链路，不经过 PermissionGuard
+- **结论**：不存在"受分享上限约束"的概念，权限控制在 ShareService 内部完成
+
+#### 2.9.4 理论上的受约束场景（代码中暂无实际接口）
+
+虽然当前代码中没有实际的"受分享上限约束"接口，但如果未来添加如下配置的接口，则会触发约束：
+
+```typescript
+// 假设的接口（当前代码中不存在）
+@UseGuards(BaseShareAuthGuard, PermissionGuard)
+@Permissions('base|read')
+@ResourceMeta('baseId', 'params')  // ✅ 资源是 Base 级（bse 前缀）
+@Get('/:shareId/base/info')
+async getBaseInfo() { ... }
+```
+
+此时判定过程：
+1. ✅ 属于 base-share 链路
+2. ✅ 使用 `PermissionGuard`
+3. ✅ 有 `@Permissions('base|read')`
+4. ✅ 资源是 Base 级（`bse` 前缀，非 `spc`）
+5. ✅ 携带 `X-Tea-Base-Share` Header
+6. **结论**：受分享上限约束，匿名用户权限降级为 TemplatePermissions
 
 ---
 
@@ -865,6 +971,19 @@ shareId 以 'fld' 开头 → ShareAuthGuard 识别为链接视图
 → 即使该用户是基表 Owner，通过分享链接也无法访问节点外资源
 ```
 
+**场景 6：复制分享接口（POST /:shareId/base/copy）的权限判定**
+```
+已登录用户携带 X-Tea-Base-Share Header 请求复制分享
+→ BaseShareAuthGuard 认证通过，挂载 req.baseShareInfo
+→ PermissionGuard.tryBaseSharePermissionCheck() 被触发
+→ 解析 @ResourceMeta('spaceId', 'body') → resourceId 是 spc 前缀
+→ 触发跳过条件2（resourceId.startsWith(IdPrefix.Space)）
+→ 返回 undefined，跳过分享权限检查
+→ 执行 permissionCheck() 校验用户在该 spaceId 上的 base|create 权限
+→ 权限不足 → 抛出异常；权限足够 → 继续执行复制逻辑
+→ 💡 关键点：即使携带分享 Header，也走用户自身权限，不受分享上限约束
+```
+
 ---
 
 ## 六、核心代码文件索引
@@ -886,11 +1005,11 @@ shareId 以 'fld' 开头 → ShareAuthGuard 识别为链接视图
 | JWT 策略 | `src/features/share/strategies/jwt.strategy.ts` | 视图分享 JWT 验证 |
 | JWT 策略 | `src/features/base-share/strategies/jwt.strategy.ts` | 基表分享 JWT 验证 |
 | 权限守卫 | `src/features/auth/guard/permission.guard.ts` | 基表分享权限校验入口、跳过逻辑、fallback 机制 |
-| 基表分享 OpenAPI | `src/features/base-share/base-share-open.controller.ts` | 基表分享公开接口（认证、查询、复制） |
 | 基表分享管理 | `src/features/base-share/base-share.controller.ts` | 基表分享 CRUD 管理接口 |
 | 模板角色定义 | `packages/core/src/auth/role/template.ts` | TemplatePermissions 权限集定义 |
 | 允许匿名装饰器 | `src/features/auth/decorators/allow-anonymous.decorator.ts` | AllowAnonymousType 枚举定义 |
 | ID 前缀定义 | `packages/core/src/utils/id-generator.ts` | IdPrefix 枚举（Space/Base/Table 等前缀） |
 | 本地认证守卫 | `src/features/share/guard/share-auth-local.guard.ts` | 视图分享密码校验 |
 | 本地认证守卫 | `src/features/base-share/guard/base-share-auth-local.guard.ts` | 基表分享密码校验 |
-| 视图分享控制器 | `src/features/share/share.controller.ts` | 视图分享 Cookie 写入 |
+| 视图分享控制器 | `src/features/share/share.controller.ts` | 视图分享完整路由（类级别 `@Public()`）、Cookie 写入、所有 view-share 接口入口 |
+| 基表分享 OpenAPI | `src/features/base-share/base-share-open.controller.ts` | 基表分享公开接口（认证、查询、复制），三种不同的守卫组合模式 |

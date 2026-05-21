@@ -523,6 +523,17 @@ t('common:actions.upgradeToLevel', { level: 'Pro' })
 | 页面配置 | `apps/nextjs-app/src/features/i18n/*.config.ts` | 各页面命名空间声明 |
 | 插件 Provider | `plugins/src/components/I18nProvider.tsx` | 插件独立 i18n 实例 |
 | Zod i18n | `plugins/src/hooks/useInitializationZodI18n.ts` | 校验错误国际化 |
+| **SSR 注入结构** | `apps/nextjs-app/src/pages/_error.tsx` | `_nextI18Next` 对象结构示例 |
+| **语言检测** | `apps/nextjs-app/src/lib/i18n/getLocale.ts` | 服务端语言检测优先级 |
+| **静态加载** | `apps/nextjs-app/src/lib/i18n/staticPageLocale.ts` | 404 等静态页面动态加载 |
+| **Accept 解析** | `apps/nextjs-app/src/lib/i18n/acceptHeader.ts` | Accept-Language 头解析算法 |
+| **SDK 汇流** | `apps/nextjs-app/src/features/app/hooks/useSdkLocale.ts` | 主应用向 SDK 传递语言数据 |
+| **SDK Provider** | `packages/sdk/src/context/app/AppProvider.tsx` | SDK 语言包深度合并逻辑 |
+| **SDK 取词** | `packages/sdk/src/context/app/i18n/useTranslation.ts` | SDK 独立取词实现 |
+| **SDK 默认值** | `packages/sdk/src/context/app/i18n/const.ts` | SDK 默认英文语言包 |
+| **插件类型** | `plugins/src/types.d/i18next.d.ts` | 插件独立 i18next 类型定义 |
+| **插件资源** | `plugins/src/app/sheet-form-view/page.tsx` | 插件 resources 构建示例 |
+| **语言切换** | `apps/nextjs-app/src/features/app/components/LanguagePicker.tsx` | 用户语言选择 UI 与逻辑 |
 
 ---
 
@@ -536,10 +547,561 @@ t('common:actions.upgradeToLevel', { level: 'Pro' })
 4. **多场景兼容**: 路径 fallback 机制适配开发、测试、生产等多种部署场景
 5. **独立插件实例**: 插件系统拥有独立 i18n 实例，避免与主应用冲突
 
-### ⚠️ 散乱点与改进建议
+---
 
-1. **两套独立初始化逻辑**: 前端 `next-i18next` 与插件 `I18nProvider` 初始化逻辑不统一，建议提取共享初始化函数
-2. **插值格式不一致**: 后端 formatter 将 `{{var}}` 转为 `{$var}`，前端直接使用 `{{var}}`，存在隐式转换，建议统一格式
-3. **多路径解析重复**: 前后端 `getI18nPath()` 逻辑几乎相同，可提取到 `@teable/common-i18n` 共享
-4. **命名空间配置分散**: 14 个页面配置文件散落在 `features/i18n/`，缺乏统一的命名空间依赖关系图
-5. **错误键无降级**: `t('non.existent.key')` 直接返回键名字符串，建议增加开发环境警告
+## 七、三条运行时链路的汇流机制详解
+
+### 7.1 三条链路全景图
+
+```
+                              ┌─────────────────────────┐
+                              │  @teable/common-i18n    │
+                              │  (共享语言包 JSON 源)   │
+                              └───────────┬─────────────┘
+                                          │
+                    ┌─────────────────────┼─────────────────────┐
+                    │                     │                     │
+          ┌─────────▼─────────┐ ┌─────────▼─────────┐ ┌─────────▼─────────┐
+          │  Web 主应用链路   │ │  插件实例链路     │ │  后端 Resolver 链路│
+          │  next-i18next     │ │  独立 i18n 实例   │ │  nestjs-i18n      │
+          └─────────┬─────────┘ └─────────┬─────────┘ └─────────┬─────────┘
+                    │                     │                     │
+                    └─────────────────────┼─────────────────────┘
+                                          │
+                              ┌───────────▼─────────────┐
+                              │  汇流点: 运行时 t() 调用 │
+                              │  (各自独立，无共享状态)  │
+                              └─────────────────────────┘
+```
+
+**关键结论**: 三条链路**完全独立**，各自维护 i18n 实例状态，仅共享同一套 JSON 语言包源文件。
+
+---
+
+### 7.2 链路一: Web 主应用运行时全流程
+
+#### 7.2.1 服务端渲染阶段 (SSR)
+
+**文件**: `apps/nextjs-app/src/lib/i18n/getServerSideTranslations.ts`
+
+```typescript
+// 调用链
+getServerSideProps(context)
+    ↓
+getTranslationsProps(context, ['common', 'auth', ...])
+    ↓
+getServerSideTranslations(locale, namespaces)
+    ↓
+next-i18next serverSideTranslations()
+    ↓
+1. 读取 next-i18next.config.js 的 localePath
+2. 按 locale + 命名空间加载 JSON 文件
+3. 构建 _nextI18Next 对象注入页面 Props
+```
+
+**_nextI18Next 注入结构** (`apps/nextjs-app/src/pages/_error.tsx:107-116`):
+```typescript
+{
+  _nextI18Next: {
+    initialI18nStore: {
+      [locale]: {
+        common: resources,      // common.json 内容
+        auth: authResources,   // auth.json 内容
+        // ... 其他命名空间
+      },
+    },
+    initialLocale: locale,
+    ns: ['common', 'auth', ...],
+    userConfig: null,
+  },
+}
+```
+
+#### 7.2.2 客户端水合阶段 (Hydration)
+
+**文件**: `apps/nextjs-app/src/pages/_app.tsx:115`
+
+```typescript
+export default appWithTranslation(MyApp, {
+  ...nextI18nextConfig,
+});
+```
+
+**appWithTranslation 工作原理**:
+1. 从 `pageProps._nextI18Next` 提取 `initialI18nStore` 和 `initialLocale`
+2. 调用 `i18next.init()` 初始化实例，将 SSR 加载的翻译数据注入 store
+3. 通过 `I18nextProvider` 将 i18n 实例传递给子组件
+4. 客户端后续请求缺失的命名空间时，通过 HTTP 后端动态加载
+
+#### 7.2.3 语言检测与切换优先级
+
+**服务端语言检测** (`apps/nextjs-app/src/lib/i18n/getLocale.ts:36-46`):
+```typescript
+function detectLocale({ i18n, req, preferredLocale }) {
+  // 优先级: Cookie > Accept-Language > defaultLocale
+  return getLocaleFromCookie(req, i18n.locales) 
+      || preferredLocale      // 来自 Accept-Language
+      || i18n.defaultLocale;
+}
+```
+
+**Cookie 语言设置** (`apps/nextjs-app/src/features/app/components/LanguagePicker.tsx:27-33`):
+```typescript
+const setCookie = (locale?: string) => {
+  if (!locale) {
+    document.cookie = `NEXT_LOCALE=; max-age=0; path=/`;  // 清除
+  } else {
+    document.cookie = `NEXT_LOCALE=${locale}; max-age=31536000; path=/`;  // 设置
+  }
+};
+```
+
+**语言切换流程**:
+1. 用户选择语言 → `setCookie(locale)` 写入 Cookie
+2. 调用 `i18n.changeLanguage(locale)` 更新当前实例
+3. `window.location.reload()` 刷新页面，触发 SSR 重新检测语言
+4. 服务端读取 `NEXT_LOCALE` Cookie，加载对应语言包
+
+#### 7.2.4 静态页面动态加载 (404 等)
+
+**文件**: `apps/nextjs-app/src/lib/i18n/staticPageLocale.ts`
+
+```typescript
+// 静态生成页面无法使用 getServerSideProps，需动态加载
+export const commonLocaleLoaders: Record<string, LocaleLoader> = {
+  en: () => import('@teable/common-i18n/src/locales/en/common.json'),
+  zh: () => import('@teable/common-i18n/src/locales/zh/common.json'),
+  // ... 其他语言
+};
+
+export const loadCommonTranslations = async (locale: string) => {
+  try {
+    const loader = commonLocaleLoaders[locale] ?? commonLocaleLoaders.en;  // fallback
+    return (await loader()).default;
+  } catch {
+    return (await commonLocaleLoaders.en()).default;  // 双重 fallback
+  }
+};
+```
+
+**404 页面动态加载流程** (`apps/nextjs-app/src/pages/404.tsx:25-47`):
+```typescript
+useEffect(() => {
+  const detectedLocale = detectStaticLocale(document.cookie);  // Cookie > Browser
+  const validLocale = commonLocaleLoaders[detectedLocale] ? detectedLocale : 'en';
+
+  if (validLocale === i18n.language) {
+    setIsReady(true);
+    return;
+  }
+
+  // 动态加载翻译包并注入运行时 i18n 实例
+  loadCommonTranslations(validLocale)
+    .then((translations) => {
+      i18n.addResourceBundle(validLocale, 'common', translations, true, true);
+      return i18n.changeLanguage(validLocale);
+    })
+    .finally(() => setIsReady(true));
+}, [i18n]);
+```
+
+#### 7.2.5 主应用 → SDK 汇流点
+
+**文件**: `apps/nextjs-app/src/features/app/hooks/useSdkLocale.ts`
+
+```typescript
+// 从主应用 i18n 实例提取 SDK 命名空间的翻译数据
+export const useSdkLocale = () => {
+  const { i18n } = useTranslation();
+  return i18n.getDataByLanguage(i18n.language)?.sdk;
+};
+```
+
+**AppProvider 合并逻辑** (`packages/sdk/src/context/app/AppProvider.tsx:38-47`):
+```typescript
+import { merge } from 'lodash';
+import { defaultLocale } from './i18n';  // 英文 sdk.json 作为默认值
+
+const value = useMemo(
+  () => ({
+    lang,
+    // 深度合并: 用户传入 locale 覆盖 defaultLocale
+    locale: isObject(locale) ? merge(defaultLocale, locale) : defaultLocale,
+    // ...
+  }),
+  [lang, locale, ...]
+);
+```
+
+**SDK 独立取词** (`packages/sdk/src/context/app/i18n/useTranslation.ts:6-25`):
+```typescript
+export const useTranslation = () => {
+  const { locale, lang } = useContext(AppContext);
+  const t = useCallback(
+    (key, options) => {
+      // 直接从 locale 对象查找，不经过 i18next
+      const translation = get(locale, key) as unknown as TValue;
+      if (!translation) {
+        console.warn(`Translation for '${key}' not found.`);  // 仅警告，无 fallback
+      }
+      if (options) {
+        const compiled = template(translation, { interpolate: /\{\{([\s\S]+?)\}\}/g });
+        return compiled(options);
+      }
+      return translation;
+    },
+    [locale]
+  );
+  return { t, lang };
+};
+```
+
+**主应用 → SDK 汇流链**:
+```
+主应用 next-i18next 实例
+    ↓
+useSdkLocale() → i18n.getDataByLanguage(lang).sdk
+    ↓
+AppProvider locale={sdkLocale}
+    ↓
+merge(defaultLocale, locale)  // defaultLocale 是 en/sdk.json
+    ↓
+AppContext 存储合并后的 locale
+    ↓
+SDK useTranslation() 从 AppContext 取词 (不经过 i18next)
+```
+
+---
+
+### 7.3 链路二: 插件实例独立链路
+
+#### 7.3.1 Resources 构建与注入
+
+**文件**: `plugins/src/app/sheet-form-view/page.tsx`
+
+```typescript
+// 插件页面直接 import 语言包 JSON，构建 resources 对象
+import enSDkJson from '@teable/common-i18n/src/locales/en/sdk.json';
+import enZodJson from '@teable/common-i18n/src/locales/en/zod.json';
+import zhSDkJson from '@teable/common-i18n/src/locales/zh/sdk.json';
+import zhZodJson from '@teable/common-i18n/src/locales/zh/zod.json';
+import enCommonJson from '../../locales/sheet-form-view/en.json';  // 插件私有
+import zhCommonJson from '../../locales/sheet-form-view/zh.json';  // 插件私有
+
+// 手动合并共享包 + 插件私有包
+const resources = {
+  en: { sdk: enSDkJson, common: enCommonJson, zod: enZodJson },
+  zh: { sdk: zhSDkJson, common: zhCommonJson, zod: zhZodJson },
+};
+
+// 作为 props 传入 I18nProvider
+<I18nProvider
+  lang={props.searchParams.lang}  // 从 URL ?lang=zh 获取
+  resources={resources}
+  defaultNS="common"
+  pageType={PageType.View}
+>
+```
+
+#### 7.3.2 独立 i18n 实例初始化
+
+**文件**: `plugins/src/components/I18nProvider.tsx`
+
+```typescript
+const globalI18nMap: Partial<Record<PageType, i18n | null>> = {};
+
+const initTranslation = (pageType: PageType, options) => {
+  const globalI18n = globalI18nMap[pageType];
+  const i18nOptions = {
+    fallbackLng: 'en',
+    defaultNS: 'common',
+    interpolation: { escapeValue: false },
+    lng: options.lang,
+    defaultNS: options.defaultNS,
+    resources: JSON.parse(JSON.stringify(options.resources)),  // 深拷贝隔离
+    initImmediate: false,
+  };
+  
+  if (globalI18n) {
+    return globalI18n.cloneInstance(i18nOptions);  // 同页面类型复用实例
+  }
+  
+  const i18nInstance = createInstance();
+  i18nInstance.use(initReactI18next).init(i18nOptions);
+  globalI18nMap[pageType] = i18nInstance;
+  return i18nInstance;
+};
+```
+
+**关键隔离机制**:
+1. **独立实例**: 使用 `createInstance()` 创建全新 i18n 实例，与主应用完全隔离
+2. **深拷贝资源**: `JSON.parse(JSON.stringify(resources))` 防止外部修改影响实例
+3. **按页面类型缓存**: `globalI18nMap[pageType]` 实现同类型页面复用
+4. **语言来源**: 仅从 URL `?lang=` 参数获取，不读取 Cookie 或 Accept-Language
+
+#### 7.3.3 插件与主应用的隔离边界
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Web 主应用 (next-i18next)                                    │
+│  - 语言来源: Cookie > Accept-Language > default               │
+│  - 命名空间: 14 个完整命名空间                                │
+│  - 共享: 通过 useSdkLocale 向 SDK 传递 sdk 命名空间           │
+└──────────────────────────────────┬───────────────────────────┘
+                                   │ 完全隔离，无状态共享
+┌──────────────────────────────────▼───────────────────────────┐
+│  插件实例 (独立 createInstance)                               │
+│  - 语言来源: URL ?lang= 参数                                 │
+│  - 命名空间: 仅 sdk + zod + 插件私有 common                  │
+│  - 资源: 构建时静态 import，无动态加载                        │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**插件类型定义** (`plugins/src/types.d/i18next.d.ts`):
+```typescript
+declare module 'i18next' {
+  interface CustomTypeOptions {
+    defaultNS: 'common';
+    resources: {
+      chart: typeof enCommonJson;        // 插件特有
+      excelFormView: typeof enExcelJson; // 插件特有
+      sdk: typeof enSDkJson;             // 共享
+    };
+  }
+}
+```
+
+---
+
+### 7.4 链路三: 后端 Resolver 链路
+
+#### 7.4.1 Resolver 执行顺序与优先级
+
+**文件**: `apps/nestjs-backend/src/global/global.module.ts:220-225`
+
+```typescript
+resolvers: [
+  { use: QueryResolver, options: ['lang'] },           // 优先级 1: ?lang=zh
+  { use: CookieResolver, options: ['NEXT_LOCALE'] },  // 优先级 2: Cookie
+  AcceptLanguageResolver,                              // 优先级 3: Accept-Language
+  new HeaderResolver(['x-lang']),                      // 优先级 4: x-lang header
+],
+```
+
+**nestjs-i18n Resolver 工作原理**:
+1. 按数组顺序依次调用每个 resolver 的 `resolve()` 方法
+2. 第一个返回非 `undefined` 值的 resolver 胜出，终止后续解析
+3. 所有 resolver 都返回 `undefined` 时，使用 `fallbackLanguage: 'en'`
+
+**Resolver 源码逻辑**:
+```typescript
+// 伪代码: nestjs-i18n 内部解析流程
+function resolveLanguage(req, resolvers) {
+  for (const resolver of resolvers) {
+    const lang = resolver.resolve(req);
+    if (lang !== undefined) {
+      // 验证语言是否在支持列表中
+      if (supportedLanguages.includes(lang)) {
+        return lang;
+      }
+    }
+  }
+  return fallbackLanguage;  // 'en'
+}
+```
+
+#### 7.4.2 各 Resolver 详细行为
+
+| Resolver | 触发条件 | 提取来源 | 验证逻辑 |
+|----------|----------|----------|----------|
+| `QueryResolver` | URL 包含 `?lang=` | `req.query.lang` | 检查是否在支持语言列表 |
+| `CookieResolver` | Cookie 存在 `NEXT_LOCALE` | `req.cookies['NEXT_LOCALE']` | 同上 |
+| `AcceptLanguageResolver` | Header 存在 `Accept-Language` | `req.headers['accept-language']` | 解析质量因子 q，匹配最优语言 |
+| `HeaderResolver` | Header 存在 `x-lang` | `req.headers['x-lang']` | 检查是否在支持语言列表 |
+
+**Accept-Language 解析算法** (`apps/nextjs-app/src/lib/i18n/acceptHeader.ts`):
+```typescript
+// 1. 解析 Accept-Language: zh-CN,zh;q=0.9,en;q=0.8
+// 2. 按 q 值降序排序
+// 3. 支持前缀匹配: 'zh-CN' 可匹配 'zh'
+// 4. 返回第一个匹配的支持语言
+function acceptLanguage(header = '', preferences?: string[]) {
+  return parse(header, preferences, {
+    type: 'accept-language',
+    prefixMatch: true,  // 启用前缀匹配
+  })[0] || '';
+}
+```
+
+#### 7.4.3 I18nContext 存储与传递
+
+**文件**: `apps/nestjs-backend/src/global/global.module.ts`
+
+nestjs-i18n 中间件在请求处理流程中的位置:
+```
+HTTP 请求到达
+    ↓
+NestMiddleware 执行
+    ↓
+I18nMiddleware (nestjs-i18n 内部)
+    ↓
+1. 按顺序调用 resolvers 解析语言
+2. 将解析结果存储到 AsyncLocalStorage
+3. 调用 next() 进入业务处理
+    ↓
+业务服务
+    ↓
+I18nContext.current() 从 AsyncLocalStorage 读取
+```
+
+**后端取词 fallback 链**:
+```typescript
+// apps/nestjs-backend/src/features/notification/notification.service.ts:80-87
+getMessage(text: string | ILocalization<I18nPath>, lang?: string) {
+  return typeof text === 'string'
+    ? text  // 纯文本直接返回，不翻译
+    : (this.i18n.t(text.i18nKey, {
+        args: text.context,
+        // 语言优先级: 传入 lang > I18nContext > 'en'
+        lang: lang ?? I18nContext.current()?.lang ?? 'en',
+      }) as string);
+}
+```
+
+#### 7.4.4 后端插值格式转换
+
+**文件**: `apps/nestjs-backend/src/global/global.module.ts:212-217`
+
+```typescript
+formatter: (template: string, ...args) => {
+  // 前后端插值格式不兼容，需转换
+  // 前端: {{field}}    后端 nestjs-i18n: {$field}
+  const normalized = template.replace(/\{\{\s*(\w+)\s*\}\}/g, '{$1}');
+  const options = I18nModule['sanitizeI18nOptions']();
+  return options.formatter(normalized, ...args);
+},
+```
+
+**不兼容根源**:
+- 语言包 JSON 使用 `{{var}}` 格式 (i18next 标准)
+- nestjs-i18n 默认使用 `{$var}` 格式 (messageformat 风格)
+- 通过自定义 formatter 做桥接转换，增加了运行时开销
+
+---
+
+### 7.5 三条链路的汇流点对比表
+
+| 维度 | Web 主应用 | 插件实例 | 后端 Resolver |
+|------|-----------|----------|---------------|
+| **i18n 库** | next-i18next + react-i18next | 原生 i18next + react-i18next | nestjs-i18n |
+| **实例隔离** | 单例共享 | 按 pageType 独立实例 | 请求级 AsyncLocalStorage |
+| **语言来源** | Cookie > Accept-Language > default | URL ?lang= 参数 | Query > Cookie > Accept-Language > x-lang > 'en' |
+| **资源加载** | SSR 预加载 + 客户端动态加载 | 构建时静态 import | 启动时全量加载 + watch (开发环境) |
+| **共享语言包** | ✅ 14 个命名空间 | ✅ 仅 sdk + zod + 私有 | ✅ 14 个命名空间 |
+| **类型安全** | ✅ 模块增强 | ✅ 独立模块增强 | ✅ 自动生成类型 |
+| **与主应用共享** | - | ❌ 完全隔离 | ❌ 独立进程 |
+| **t() fallback** | 返回 key 字符串 | 返回 key 字符串 | 返回 key 字符串 |
+| **插值格式** | `{{var}}` | `{{var}}` | `{{var}}` → `{$var}` 转换 |
+
+---
+
+### 7.6 冲突处理与边界案例
+
+#### 7.6.1 语言代码不匹配问题
+
+**场景**: 主应用使用 `'zh'`，Zod i18n 使用 `'zh-CN'`
+
+**文件**: `plugins/src/hooks/useInitializationZodI18n.ts:6-11`
+```typescript
+const localeErrorMaps = {
+  'zh-CN': zhCN().localeError,
+  en: en().localeError,
+  'en-US': en().localeError,
+};
+
+// 映射逻辑: i18n.language (如 'zh') 可能不在 key 中，fallback 到 en
+const errorMap =
+  localeErrorMaps[language as keyof typeof localeErrorMaps] || localeErrorMaps.en;
+```
+
+**潜在问题**:
+- i18next 返回 `'zh'`，但 Zod locale key 是 `'zh-CN'`
+- 导致中文用户 fallback 到英文错误信息
+- 需增加 `'zh' → 'zh-CN'` 的映射逻辑
+
+#### 7.6.2 命名空间缺失 fallback
+
+**Web 主应用**:
+```typescript
+// 未加载的命名空间，t() 返回 key 字符串
+// 例如: 页面仅加载 ['common', 'auth']，调用 t('table:xxx')
+t('table.toolbar.share.label')  
+// → 返回 'table.toolbar.share.label' (无警告，saveMissing: false)
+```
+
+**SDK**:
+```typescript
+// 仅警告，不 fallback
+const translation = get(locale, key);
+if (!translation) {
+  console.warn(`Translation for '${key}' not found.`);
+}
+```
+
+**后端**:
+```typescript
+// 同样返回 key 字符串，无警告
+i18n.t('non.existent.key')  // → 'non.existent.key'
+```
+
+#### 7.6.3 资源合并冲突
+
+**SDK AppProvider 使用 lodash merge** (`packages/sdk/src/context/app/AppProvider.tsx:41`):
+```typescript
+locale: isObject(locale) ? merge(defaultLocale, locale) : defaultLocale
+```
+
+**merge 行为**:
+- 深度合并，`locale` 覆盖 `defaultLocale` 的同名字段
+- `locale` 缺失的字段保留 `defaultLocale` 的值
+- 数组字段直接替换，而非合并
+
+**冲突风险**:
+- 主应用 `sdk.json` 与 SDK 内置 `en/sdk.json` 结构不一致时
+- 新增键在主应用语言包中缺失时，fallback 到英文
+- 可能导致部分文案显示英文，部分显示中文
+
+---
+
+### 7.7 Fallback 触发条件汇总
+
+| 层级 | 触发条件 | Fallback 行为 | 代码位置 |
+|------|----------|--------------|----------|
+| **语言检测** | 所有 resolver 都返回 undefined | 使用 `fallbackLanguage: 'en'` | `global.module.ts:206` |
+| **语言验证** | 解析出的语言不在支持列表中 | 继续下一个 resolver，最终 'en' | nestjs-i18n 内部 |
+| **资源加载** | 指定语言的 JSON 文件不存在 | 加载 `fallbackLng: 'en'` | `I18nProvider.tsx:14` |
+| **命名空间** | 命名空间未加载/不存在 | 返回 key 字符串，无警告 | i18next 默认 |
+| **键查找** | 键在当前语言中不存在 | 查找 fallback 语言，仍不存在返回 key | i18next 默认 |
+| **SDK 取词** | 键在合并后的 locale 中不存在 | `console.warn` + 返回 undefined | `useTranslation.ts:11-12` |
+| **静态加载** | 动态 import 失败 | fallback 到 `commonLocaleLoaders.en` | `staticPageLocale.ts:27-28` |
+| **Zod i18n** | language 不在 localeErrorMaps 中 | fallback 到 `localeErrorMaps.en` | `useInitializationZodI18n.ts:20-21` |
+
+---
+
+### ⚠️ 散乱点与改进建议 (补充)
+
+1. **三套独立初始化逻辑**: Web 主应用、插件、后端各有一套 i18n 初始化逻辑，配置项重复分散，建议提取共享配置模块
+
+2. **语言代码映射缺失**: i18next 使用 `'zh'`，Zod 使用 `'zh-CN'`，导致中文 Zod 错误信息 fallback 到英文，需增加映射表
+
+3. **插值格式隐式转换**: 后端 formatter 将 `{{var}}` 转为 `{$var}`，增加运行时开销，建议统一为 `{{var}}` 格式
+
+4. **多路径解析代码重复**: 前后端 `getI18nPath()` 逻辑几乎相同，可提取到 `@teable/common-i18n` 包共享
+
+5. **命名空间配置分散**: 14 个页面配置文件散落在 `features/i18n/`，缺乏统一的命名空间依赖关系可视化
+
+6. **缺失键无开发环境警告**: `t('non.existent.key')` 静默返回 key 字符串，建议开发环境下增加明显警告或抛出错误
+
+7. **插件语言来源受限**: 插件仅从 URL `?lang=` 获取语言，未继承主应用的 Cookie 或浏览器语言设置，用户体验不一致
+
+8. **SDK 与主应用实例隔离**: SDK 通过 `merge(defaultLocale, locale)` 深度拷贝传递数据，而非共享 i18n 实例，存在数据冗余和同步问题

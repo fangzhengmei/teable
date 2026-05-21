@@ -609,6 +609,216 @@ async getBaseInfo() { ... }
 
 ---
 
+### 2.10 init-axios 注入 Header 后进入 PermissionGuard 的实际路径
+
+#### 2.10.1 init-axios 的 Header 注入逻辑
+
+`init-axios.ts` 是前端注入分享 Header 的核心入口，它在请求拦截器中决定是否携带 `X-Tea-Base-Share`：
+
+```typescript
+// init-axios.ts:21-24, 56-58
+const USER_SCOPED_PREFIXES = ['/space'];
+
+const isUserScopedUrl = (url?: string) =>
+  url != null && USER_SCOPED_PREFIXES.some((prefix) => url.startsWith(prefix));
+
+// 在请求拦截器中
+if (shareId && !isUserScopedUrl(config.url)) {
+  config.headers[BASE_SHARE_ID_HEADER] = shareId;  // BASE_SHARE_ID_HEADER = 'X-Tea-Base-Share'
+}
+```
+
+**调用时机**：`ShareBaseLayout.tsx:54-57` 在分享页面初始化时调用：
+```typescript
+// ShareBaseLayout.tsx:54-57
+const isShare = !!shareId;
+if (isShare) {
+  initAxios({ shareId });  // 注入配置，后续所有 axios 请求都会携带 Header
+}
+```
+
+**WebSocket 连接的参数传递**：
+```typescript
+// ShareBaseLayout.tsx:59-64
+const wsPath = useMemo(() => {
+  if (typeof window === 'object' && shareId) {
+    return addQueryParamsToWebSocketUrl(getWsPath(), { baseShareId: shareId });
+  }
+  return undefined;
+}, [shareId]);
+```
+
+#### 2.10.2 注入 Header 后的请求路径
+
+前端注入 `X-Tea-Base-Share` 后，请求到达后端的完整路径：
+
+```
+前端 axios 请求（携带 X-Tea-Base-Share: shrxxx）
+    │
+    ▼
+NestJS 全局中间件 → PermissionGuard.canActivate()
+    │
+    ▼
+@Public() 检查 → 无 @Public() 标记，继续
+    │
+    ▼
+@DisabledPermission() 检查 → 无，继续
+    │
+    ▼
+permissionCheckWithPublicFallback()
+    ├─ 3.1 @AllowAnonymous(RESOURCE) 检查 → 通常是 RESOURCE，尝试资源级认证
+    ├─ 3.2 检测到 baseShareHeader → tryBaseSharePermissionCheck()
+    │   ├─ 解析 shareId ✓
+    │   ├─ 检查 @Permissions ✓
+    │   ├─ 解析 resourceId（defaultResourceId 优先取 params.baseId）
+    │   ├─ 检查 resourceId 前缀 →
+    │   │   ├─ spc 前缀 → 返回 undefined（跳过，走用户权限）
+    │   │   └─ bse/tbl/viw/fld/rec → baseSharePermissionCheck()
+    │   │       ├─ 校验分享有效性 ✓
+    │   │       ├─ 资源归属校验 ✓
+    │   │       ├─ 权限降级判定 ✓
+    │   │       └─ 权限写入 cls.permissions
+    │   └─ 返回 true/false
+    ├─ 3.3 匿名用户处理（如跳过则走到这里）
+    ├─ 3.4 已登录用户正常权限检查（如跳过则走到这里）
+    └─ 3.5 PUBLIC fallback（如权限不足且标记为 PUBLIC）
+```
+
+#### 2.10.3 `api/base/:baseId/table` 路由的实际判定
+
+`TableController`（`table-open-api.controller.ts:56-60`）配置：
+```typescript
+@UseGuards(V2FeatureGuard)
+@UseInterceptors(V2IndicatorInterceptor)
+@Controller('api/base/:baseId/table')
+@AllowAnonymous()  // 类级别 @AllowAnonymous，默认 RESOURCE
+export class TableController {
+  @Permissions('table|read')
+  @Get(':tableId')
+  async getTable(@Param('baseId') baseId: string, @Param('tableId') tableId: string) { ... }
+}
+```
+
+**关键代码**：`PermissionGuard.defaultResourceId()`（`permission.guard.ts:31-35`）
+```typescript
+protected defaultResourceId(context: ExecutionContext): string | undefined {
+  const req = context.switchToHttp().getRequest();
+  // before check baseId, as users can be individually invited into the base.
+  return req.params.baseId || req.params.spaceId || req.params.tableId;
+}
+```
+
+对于 `GET /api/base/bsexxx/table/tblyyy`：
+1. `defaultResourceId()` 返回 `bsexxx`（`baseId`，`bse` 前缀）
+2. 资源不是 Space 级 → 不触发跳过条件2
+3. 有 `@Permissions('table|read')` → 不触发跳过条件1
+4. **结论**：**触发分享上限校验**
+
+#### 2.10.4 socket 路由的实际判定
+
+Socket 连接的权限校验分为两步：
+
+**第一步：WebSocket 连接建立**（`share-db/auth.middleware.ts:23-56`）
+```typescript
+// connect 阶段
+shareDB.use('connect', async (context, callback) => {
+  // 从 URL query 参数中提取
+  const baseShareIdParam = newUrl.searchParams.get('baseShareId');
+  context.agent.custom.baseShareId = baseShareIdParam || null;
+});
+```
+
+**第二步：ShareDB 查询时转发到 HTTP 接口**（`field-readonly.service.ts:22-39`）
+```typescript
+getDocIdsByQuery(tableId: string, query: IGetFieldsQuery = {}) {
+  const shareId = this.cls.get('shareViewId');
+  const baseShareId = this.cls.get('baseShareId');
+  const useShareViewEndpoint = shareId && !baseShareId;
+  
+  const url = useShareViewEndpoint
+    ? `/share/${shareId}/socket/field/doc-ids`
+    : `/table/${tableId}/field/socket/doc-ids`;  // ✅ 走这个路径，base-share 场景
+  
+  return this.axios.get(url, {
+    headers: {
+      cookie: this.cls.get('cookie'),
+      [BASE_SHARE_ID_HEADER]: baseShareId,  // ✅ 重新注入 Header
+    },
+    params: query,
+  });
+}
+```
+
+**结论**：
+- base-share 场景下，socket 查询会转发到 `/table/${tableId}/field/socket/doc-ids`
+- 该接口有 `@Permissions` 装饰器，`defaultResourceId()` 返回 `tableId`（`tbl` 前缀）
+- **触发分享上限校验**
+
+---
+
+### 2.11 触发分享上限校验 vs 回落到用户权限的场景汇总
+
+#### 2.11.1 触发分享上限校验的场景（满足所有条件）
+
+| 场景 | 接口示例 | resourceId 前缀 | @Permissions | 携带 Header | 结果 |
+|------|---------|----------------|--------------|------------|------|
+| 查询表信息 | `GET /api/base/:baseId/table/:tableId` | `bse` | `table|read` | ✅ | ✅ 触发校验，权限降级 |
+| 查询表列表 | `GET /api/base/:baseId/table` | `bse` | `table|read` | ✅ | ✅ 触发校验，权限降级 |
+| 查询记录 | `GET /api/table/:tableId/record` | `tbl` | `record|read` | ✅ | ✅ 触发校验，权限降级 |
+| 查询字段 | `GET /api/table/:tableId/field` | `tbl` | `field|read` | ✅ | ✅ 触发校验，权限降级 |
+| Socket 查询字段 | `GET /table/:tableId/field/socket/doc-ids` | `tbl` | `field|read` | ✅ | ✅ 触发校验，权限降级 |
+| Socket 查询记录 | `GET /table/:tableId/record/socket/doc-ids` | `tbl` | `record|read` | ✅ | ✅ 触发校验，权限降级 |
+
+#### 2.11.2 回落到用户权限的场景（满足任一条件）
+
+| 场景 | 接口示例 | 触发原因 | 结果 |
+|------|---------|---------|------|
+| 获取空间列表 | `GET /api/space` | 前端 `USER_SCOPED_PREFIXES` 拦截，不注入 Header | ❌ 不触发，走用户权限 |
+| 创建空间 | `POST /api/space` | 前端 `USER_SCOPED_PREFIXES` 拦截，不注入 Header | ❌ 不触发，走用户权限 |
+| 复制分享到空间 | `POST /api/share/:shareId/base/copy` | `@ResourceMeta('spaceId', 'body')` → `spc` 前缀 | ❌ 跳过条件2，走用户权限 |
+| 获取当前用户 | `GET /api/user/me` | 无 `@Permissions` 装饰器 | ❌ 跳过条件1，走用户权限 |
+| 登录接口 | `POST /api/auth/login` | `@Public()` 标记 | ❌ 提前放行，不经过分享检查 |
+| 视图分享接口 | `GET /api/share/:shareId/view/records` | 属于 view-share 链路，不经过 `PermissionGuard` | ❌ 不存在此概念，ShareService 内部处理 |
+
+#### 2.11.3 init-axios 前端侧的提前拦截
+
+**`USER_SCOPED_PREFIXES = ['/space']`** 的含义：
+- 所有以 `/space` 开头的 URL，前端**不会**注入 `X-Tea-Base-Share` Header
+- 即使 `shareId` 存在，这些请求也不会触发分享上限校验
+- 这是**前端第一道防线**，从源头避免空间级操作被分享权限干扰
+
+**代码证据**：
+```typescript
+// init-axios.ts:21-24
+const USER_SCOPED_PREFIXES = ['/space'];
+const isUserScopedUrl = (url?: string) =>
+  url != null && USER_SCOPED_PREFIXES.some((prefix) => url.startsWith(prefix));
+```
+
+#### 2.11.4 完整的判定流程图
+
+```
+前端发起请求
+    │
+    ├─ 检查 URL 是否以 /space 开头
+    │   ├─ 是 → 不注入 X-Tea-Base-Share → ❌ 不会触发分享校验
+    │   └─ 否 → 注入 X-Tea-Base-Share → 继续
+    │
+    ▼
+后端 PermissionGuard
+    │
+    ├─ @Public() → ✅ 直接放行
+    ├─ @DisabledPermission() → ✅ 直接放行
+    │
+    └─ tryBaseSharePermissionCheck()
+        ├─ 无 X-Tea-Base-Share → ❌ 跳过，走用户权限
+        ├─ 无 @Permissions → ❌ 跳过条件1，走用户权限
+        ├─ resourceId 以 spc 开头 → ❌ 跳过条件2，走用户权限
+        └─ 其他情况 → ✅ 触发分享上限校验，权限降级
+```
+
+---
+
 ## 三、分享令牌发放机制
 
 ### 3.1 两种分享模式

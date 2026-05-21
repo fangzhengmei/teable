@@ -714,7 +714,7 @@ export default appWithTranslation(MyApp, {
 1. 从 `pageProps._nextI18Next` 提取 `initialI18nStore` 和 `initialLocale`
 2. 调用 `i18next.init()` 初始化实例，将 SSR 加载的翻译数据注入 store
 3. 通过 `I18nextProvider` 将 i18n 实例传递给子组件
-4. 客户端后续请求缺失的命名空间时，通过 HTTP 后端动态加载
+4. **不会**通过 HTTP 后端动态加载缺失的命名空间（详见 7.2.7 节分析）
 
 #### 7.2.3 语言检测与切换优先级
 
@@ -914,41 +914,97 @@ locale: isObject(locale) ? merge(cloneDeep(defaultLocale), locale) : cloneDeep(d
 
 #### 7.2.7 命名空间缺失与 HTTP 动态加载核实
 
-**配置分析** (`apps/nextjs-app/next-i18next.config.js`):
+**✅ 唯一结论: 命名空间缺失时不会触发 HTTP 动态加载**
+
+---
+
+**现有配置分析** (`apps/nextjs-app/next-i18next.config.js`):
 ```javascript
 module.exports = {
   saveMissing: false,  // 不保存缺失的键
   reloadOnPrerender: process?.env?.NODE_ENV === 'development',
-  localePath,
-  // 没有配置 backend，也没有配置 i18next-http-backend
+  localePath,           // 文件系统路径，仅用于 SSR
+  // ❌ 没有配置 use: [HttpBackend]
+  // ❌ 没有配置 backend.loadPath
+  // ❌ 没有配置 i18next-http-backend 插件
 };
 ```
 
-**核实结论**: **命名空间缺失时不会触发 HTTP 动态加载**
+---
 
-**原因分析**:
-1. **无 HTTP Backend 配置**: next-i18next 默认只加载 SSR 时预加载的命名空间，不配置 `i18next-http-backend` 就不会发起 HTTP 请求
-2. **localePath 是文件系统路径**: 配置指向本地文件系统路径，仅用于 SSR 时读取 JSON 文件
-3. **saveMissing: false**: 不记录缺失的键，也不会尝试补全
+**不会触发 HTTP 动态加载的原因** (三重保障):
 
-**命名空间缺失时的实际行为**:
+| 原因 | 说明 |
+|------|------|
+| **无 HTTP Backend 插件** | `next-i18next.config.js` 未配置 `use: [HttpBackend]`，i18next 实例不会注册 HTTP 后端 |
+| **localePath 是文件系统路径** | `localePath` 指向本地磁盘路径（如 `packages/common-i18n/src/locales`），仅用于 Node.js 服务端读取，不用于浏览器 HTTP 请求 |
+| **saveMissing: false** | 不记录缺失键，即使配置了 backend 也不会尝试补全 |
+
+---
+
+**命名空间缺失时的实际表现**:
+
 ```
-场景: 页面仅加载 ['common', 'auth']，组件调用 t('table:xxx')
+场景: 页面 SSR 仅加载 ['common', 'auth']，组件调用 t('table:xxx')
 
-1. i18next 查找 table 命名空间 → 未加载
-2. 无 HTTP backend 可请求，不发起网络请求
-3. fallback 到 return key 字符串: 'table:xxx'
-4. 无警告、无错误（saveMissing: false）
+执行流程:
+1. i18next.t('table:xxx') 被调用
+2. i18next 查找 'table' 命名空间 → 未在 initialI18nStore 中
+3. 无 HTTP backend 可用 → 不发起网络请求
+4. fallback 机制触发 → 返回 key 字符串 'table:xxx'
+5. 无警告、无错误（saveMissing: false 不记录）
+
+用户可见效果: 界面显示 'table:xxx' 而非翻译文本
 ```
 
-**next-i18next 的命名空间加载策略**:
-- SSR 阶段: 只加载页面 `getServerSideProps` 中指定的命名空间
-- 客户端水合: 仅使用 SSR 传入的 `initialI18nStore`
-- 后续动态加载: 需要显式配置 `backend` + `loadPath` 才能触发 HTTP 请求
+---
 
-**与静态页面的对比**:
-- 404 等静态页面通过 `addResourceBundle()` 手动注入翻译包
-- 这是主动行为，不是 i18next 自动加载
+**若要支持客户端 HTTP 动态加载，需补充以下配置**:
+
+```javascript
+// next-i18next.config.js
+module.exports = {
+  // ... 现有配置
+  use: [require('i18next-http-backend')],  // 注册 HTTP backend 插件
+  backend: {
+    loadPath: '/locales/{{lng}}/{{ns}}.json',  // 公共目录下的翻译文件路径
+    // 可选: 跨域请求配置
+    // crossDomain: true,
+    // withCredentials: true,
+  },
+  // 确保 locale 资源文件可被 HTTP 访问
+  // 例如: 将 JSON 文件放入 public/locales/ 目录
+};
+```
+
+**动态加载的触发条件** (配置完成后):
+1. 组件调用 `useTranslation(['missing-namespace'])` 
+2. 或调用 `i18n.loadNamespaces(['missing-namespace'])`
+3. 或 `t('missing-namespace:key')` 触发自动加载（需 `partialBundledLanguages: true`）
+
+---
+
+**next-i18next 命名空间加载策略总结**:
+
+| 阶段 | 加载方式 | 是否需要 HTTP | 说明 |
+|------|----------|---------------|------|
+| SSR 阶段 | `serverSideTranslations(locale, namespaces)` | ❌ 否 | 从文件系统读取 JSON，注入 `_nextI18Next` |
+| 客户端水合 | 从 `_nextI18Next.initialI18nStore` 恢复 | ❌ 否 | 直接使用 SSR 预加载的数据 |
+| 运行时缺失 | **无** | ❌ 否 | 返回 key 字符串，不发起请求 |
+| 静态页面 (404) | `addResourceBundle()` | ❌ 否 | 手动动态 import 后注入 |
+
+---
+
+**⚠️ 常见误解澄清**:
+
+- **误解**: "next-i18next 会自动通过 HTTP 加载缺失的命名空间"
+  - **事实**: 只有显式配置 `i18next-http-backend` 插件后才会发生 HTTP 加载
+  
+- **误解**: "localePath 配置的路径会被浏览器请求"
+  - **事实**: `localePath` 是 Node.js 文件系统路径，仅用于 SSR 阶段，浏览器无法访问
+
+- **误解**: "saveMissing: true 会自动下载缺失翻译"
+  - **事实**: `saveMissing` 仅记录缺失键到后端日志/存储，不触发下载
 
 ---
 
@@ -1194,7 +1250,7 @@ formatter: (template: string, ...args) => {
 | **i18n 库** | next-i18next + react-i18next | 原生 i18next + react-i18next | nestjs-i18n |
 | **实例隔离** | 单例共享 | 按 pageType 独立实例 | 请求级 AsyncLocalStorage |
 | **语言来源** | Cookie > Accept-Language > default | URL ?lang= 参数 | Query > Cookie > Accept-Language > x-lang > 'en' |
-| **资源加载** | SSR 预加载 + 客户端动态加载 | 构建时静态 import | 启动时全量加载 + watch (开发环境) |
+| **资源加载** | SSR 预加载（无客户端动态加载） | 构建时静态 import | 启动时全量加载 + watch (开发环境) |
 | **共享语言包** | ✅ 14 个命名空间 | ✅ 仅 sdk + zod + 私有 | ✅ 14 个命名空间 |
 | **类型安全** | ✅ 模块增强 | ✅ 独立模块增强 | ✅ 自动生成类型 |
 | **与主应用共享** | - | ❌ 完全隔离 | ❌ 独立进程 |

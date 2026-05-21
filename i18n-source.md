@@ -534,6 +534,10 @@ t('common:actions.upgradeToLevel', { level: 'Pro' })
 | **插件类型** | `plugins/src/types.d/i18next.d.ts` | 插件独立 i18next 类型定义 |
 | **插件资源** | `plugins/src/app/sheet-form-view/page.tsx` | 插件 resources 构建示例 |
 | **语言切换** | `apps/nextjs-app/src/features/app/components/LanguagePicker.tsx` | 用户语言选择 UI 与逻辑 |
+| **Proxy Middleware** | `apps/nextjs-app/src/proxy.ts` | Proxy 计算语言并写入 X-Server-Locale |
+| **SSR 读取 Locale** | `apps/nextjs-app/src/lib/i18n/getTranslationsProps.ts` | SSR 读取 X-Server-Locale 加载语言包 |
+| **语言 Helper** | `apps/nextjs-app/src/lib/i18n/helper.ts` | Cookie/Accept-Language/Browser 语言获取 |
+| **鉴权 SSR** | `apps/nextjs-app/src/lib/withAuthSSR.ts` | 认证页面统一 SSR 包装器 |
 
 ---
 
@@ -579,6 +583,85 @@ t('common:actions.upgradeToLevel', { level: 'Pro' })
 ---
 
 ### 7.2 链路一: Web 主应用运行时全流程
+
+#### 7.2.0 Proxy 语言计算与 X-Server-Locale 传递
+
+**文件**: `apps/nextjs-app/src/proxy.ts`
+
+这是 Web 主应用 i18n 的**第一个汇流点**，在所有页面请求到达 SSR 之前执行：
+
+```typescript
+// Next.js Edge Runtime (Middleware)
+export function proxy(request: NextRequest) {
+  // 1. 调用 getLocaleDetection 计算用户语言
+  const locale = getLocaleDetection({
+    req: request,
+    i18n: {
+      defaultLocale: 'en',
+      locales: ['en', 'it', 'de', 'zh', 'fr', 'ja', 'ru', 'uk', 'tr', 'es'],
+    },
+  });
+
+  // 2. 将计算结果写入 response header，传递给后续的 SSR
+  const response = NextResponse.next();
+  response.headers.set('X-Server-Locale', locale);
+  return response;
+}
+
+export const config = {
+  // 匹配所有页面请求，排除 API、静态资源、WebSocket
+  matcher: '/((?!api|_next/static|_next/image|favicon.ico|socket).*)',
+};
+```
+
+**Proxy 语言计算流程** (`apps/nextjs-app/src/lib/i18n/getLocale.ts:48-61`):
+```
+HTTP 请求到达
+    ↓
+Middleware proxy() 执行 (Edge Runtime)
+    ↓
+getLocaleDetection({ req, i18n })
+    ↓
+1. 读取 NEXT_LOCALE Cookie → getLocaleFromCookie(req, locales)
+   └─→ 验证 Cookie 值是否在支持语言列表中
+    ↓
+2. 读取 Accept-Language Header → getAcceptPreferredLocale(i18n, headers)
+   └─→ acceptLanguage(header, locales)
+   └─→ 解析质量因子 q，支持前缀匹配 ('zh-CN' → 'zh')
+    ↓
+3. 返回: cookieLocale || preferredLocale || defaultLocale ('en')
+    ↓
+4. 转换为小写: detectedLocale.toLowerCase()
+    ↓
+写入 response.header['X-Server-Locale'] = locale
+    ↓
+继续执行 SSR (context.res.getHeader('X-Server-Locale'))
+```
+
+**关键设计要点**:
+- Middleware 在 Edge Runtime 执行，不阻塞 SSR 处理
+- 语言计算结果通过 response header 而非 request header 传递
+- 支持前缀匹配: `Accept-Language: zh-CN` 可匹配 `zh`
+- 语言代码统一转换为小写，避免大小写敏感问题
+
+**Proxy → SSR 衔接** (`apps/nextjs-app/src/lib/i18n/getTranslationsProps.ts:6-14`):
+```typescript
+export const CookieLocaleKey = 'X-Server-Locale';
+
+export const getTranslationsProps = (
+  context: GetServerSidePropsContext,
+  i18nNamespaces: I18nNamespace[] | I18nNamespace | undefined,
+  configOverride?: UserConfig | null
+) => {
+  // SSR 从 response header 读取 Proxy 计算的语言结果
+  const locale = context.res.getHeader(CookieLocaleKey) as string | undefined;
+  return getServerSideTranslations(locale || 'en', i18nNamespaces, configOverride);
+};
+```
+
+**⚠️ 潜在问题**: 
+- `context.res.getHeader()` 返回类型是 `string | string[] | undefined`，直接 `as string` 可能丢失多值
+- 如果 middleware 未执行（如静态文件路径匹配），`locale` 为 `undefined`，fallback 到 `'en'`
 
 #### 7.2.1 服务端渲染阶段 (SSR)
 
@@ -771,6 +854,102 @@ AppContext 存储合并后的 locale
 SDK useTranslation() 从 AppContext 取词 (不经过 i18next)
 ```
 
+#### 7.2.6 SDK merge(defaultLocale, locale) 状态污染风险评估
+
+**风险源** (`packages/sdk/src/context/app/AppProvider.tsx:41`):
+```typescript
+locale: isObject(locale) ? merge(defaultLocale, locale) : defaultLocale
+```
+
+**lodash merge 的关键行为**:
+1. **深度递归合并**: 嵌套对象逐层合并，而非整体替换
+2. **数组直接替换**: 数组类型字段直接用新值替换，不合并
+3. **源对象修改**: `merge` 会修改第一个参数（`defaultLocale`），返回修改后的对象
+
+**状态污染风险分析**:
+
+```typescript
+// 假设 defaultLocale = { a: { b: 1, c: 2 }, d: [1, 2, 3] }
+// 传入 locale = { a: { b: 10 } }
+
+const result = merge(defaultLocale, locale);
+// result = { a: { b: 10, c: 2 }, d: [1, 2, 3] }
+// ⚠️ defaultLocale 也被修改为 { a: { b: 10, c: 2 }, d: [1, 2, 3] }
+
+// 第二次调用传入 locale = { a: { e: 20 } }
+const result2 = merge(defaultLocale, locale);
+// result2 = { a: { b: 10, c: 2, e: 20 }, d: [1, 2, 3] }
+// ⚠️ 上一次的修改被保留，状态累积污染
+```
+
+**风险场景**:
+
+| 场景 | 风险等级 | 影响 |
+|------|----------|------|
+| 首次加载中文 sdk.json | 🟢 低 | merge 正常工作 |
+| 切换语言到英文 | 🟡 中 | 中文缺失的键保留，英文覆盖已有键 |
+| 多次切换语言 | 🔴 高 | defaultLocale 被累积修改，可能出现中英文混杂 |
+| 热更新/SSR | 🟡 中 | 模块缓存可能保留修改后的 defaultLocale |
+
+**defaultLocale 的定义** (`packages/sdk/src/context/app/i18n/const.ts`):
+```typescript
+import defaultLocale from '@teable/common-i18n/src/locales/en/sdk.json';
+export { defaultLocale };
+```
+
+**⚠️ 关键问题**: 
+- `defaultLocale` 是模块级别的常量，被 `merge` 修改后**全局持久化**
+- 所有 `AppProvider` 实例共享同一个被污染的 `defaultLocale`
+- 多次渲染或多语言切换后，`defaultLocale` 可能包含所有语言的残留键
+
+**建议修复方案**:
+```typescript
+// 方案一: 使用 spread 运算符创建浅拷贝（仅适用于扁平结构）
+locale: isObject(locale) ? merge({}, defaultLocale, locale) : defaultLocale
+
+// 方案二: 使用 lodash.cloneDeep 深拷贝后再 merge
+import { cloneDeep, merge } from 'lodash';
+locale: isObject(locale) ? merge(cloneDeep(defaultLocale), locale) : cloneDeep(defaultLocale)
+```
+
+#### 7.2.7 命名空间缺失与 HTTP 动态加载核实
+
+**配置分析** (`apps/nextjs-app/next-i18next.config.js`):
+```javascript
+module.exports = {
+  saveMissing: false,  // 不保存缺失的键
+  reloadOnPrerender: process?.env?.NODE_ENV === 'development',
+  localePath,
+  // 没有配置 backend，也没有配置 i18next-http-backend
+};
+```
+
+**核实结论**: **命名空间缺失时不会触发 HTTP 动态加载**
+
+**原因分析**:
+1. **无 HTTP Backend 配置**: next-i18next 默认只加载 SSR 时预加载的命名空间，不配置 `i18next-http-backend` 就不会发起 HTTP 请求
+2. **localePath 是文件系统路径**: 配置指向本地文件系统路径，仅用于 SSR 时读取 JSON 文件
+3. **saveMissing: false**: 不记录缺失的键，也不会尝试补全
+
+**命名空间缺失时的实际行为**:
+```
+场景: 页面仅加载 ['common', 'auth']，组件调用 t('table:xxx')
+
+1. i18next 查找 table 命名空间 → 未加载
+2. 无 HTTP backend 可请求，不发起网络请求
+3. fallback 到 return key 字符串: 'table:xxx'
+4. 无警告、无错误（saveMissing: false）
+```
+
+**next-i18next 的命名空间加载策略**:
+- SSR 阶段: 只加载页面 `getServerSideProps` 中指定的命名空间
+- 客户端水合: 仅使用 SSR 传入的 `initialI18nStore`
+- 后续动态加载: 需要显式配置 `backend` + `loadPath` 才能触发 HTTP 请求
+
+**与静态页面的对比**:
+- 404 等静态页面通过 `addResourceBundle()` 手动注入翻译包
+- 这是主动行为，不是 i18next 自动加载
+
 ---
 
 ### 7.3 链路二: 插件实例独立链路
@@ -919,19 +1098,38 @@ function resolveLanguage(req, resolvers) {
 | `AcceptLanguageResolver` | Header 存在 `Accept-Language` | `req.headers['accept-language']` | 解析质量因子 q，匹配最优语言 |
 | `HeaderResolver` | Header 存在 `x-lang` | `req.headers['x-lang']` | 检查是否在支持语言列表 |
 
-**Accept-Language 解析算法** (`apps/nextjs-app/src/lib/i18n/acceptHeader.ts`):
+**Accept-Language 解析的两套实现** (重要区分):
+
+项目中存在**两套独立的 Accept-Language 解析实现**，分别服务于不同链路：
+
+**实现一: 前端 Proxy Helper** (`apps/nextjs-app/src/lib/i18n/acceptHeader.ts`)
+- 来源: 从 Next.js 源码复制，使用 `parse()` 函数手动解析
+- 服务对象: Web 主应用 Middleware (`proxy.ts`) 
+- 特点: 支持前缀匹配 (`prefixMatch: true`)，返回第一个匹配项
 ```typescript
-// 1. 解析 Accept-Language: zh-CN,zh;q=0.9,en;q=0.8
-// 2. 按 q 值降序排序
-// 3. 支持前缀匹配: 'zh-CN' 可匹配 'zh'
-// 4. 返回第一个匹配的支持语言
-function acceptLanguage(header = '', preferences?: string[]) {
+export function acceptLanguage(header = '', preferences?: string[]) {
   return parse(header, preferences, {
     type: 'accept-language',
-    prefixMatch: true,  // 启用前缀匹配
+    prefixMatch: true,  // 启用前缀匹配: 'zh-CN' → 'zh'
   })[0] || '';
 }
 ```
+
+**实现二: 后端框架 Resolver** (`nestjs-i18n` 内置 `AcceptLanguageResolver`)
+- 来源: nestjs-i18n 框架内置，使用 `negotiator` 库解析
+- 服务对象: 后端 NestJS 应用
+- 特点: 同样支持前缀匹配，解析质量因子 q
+- 与前端实现**算法逻辑相同但实现代码完全独立**
+
+**两套实现的一致性**:
+- 都支持 `Accept-Language: zh-CN,zh;q=0.9,en;q=0.8` 格式
+- 都按质量因子 q 值降序排序
+- 都支持前缀匹配（`zh-CN` 可匹配 `zh`）
+- 都返回第一个匹配的支持语言
+
+**潜在风险**: 
+- 两套实现代码独立维护，如果某一方更新解析逻辑，可能导致前后端语言检测结果不一致
+- 建议提取共享的 Accept-Language 解析函数到 `@teable/common-i18n` 包
 
 #### 7.4.3 I18nContext 存储与传递
 
@@ -1105,3 +1303,11 @@ locale: isObject(locale) ? merge(defaultLocale, locale) : defaultLocale
 7. **插件语言来源受限**: 插件仅从 URL `?lang=` 获取语言，未继承主应用的 Cookie 或浏览器语言设置，用户体验不一致
 
 8. **SDK 与主应用实例隔离**: SDK 通过 `merge(defaultLocale, locale)` 深度拷贝传递数据，而非共享 i18n 实例，存在数据冗余和同步问题
+
+9. **🔴 SDK merge 状态污染**: `merge(defaultLocale, locale)` 会修改模块级别的 `defaultLocale` 常量，导致多次语言切换后状态累积污染，可能出现中英文混杂。建议使用 `merge({}, defaultLocale, locale)` 或 `cloneDeep` 保护源对象
+
+10. **命名空间缺失无动态加载**: next-i18next 未配置 `i18next-http-backend`，命名空间缺失时直接返回 key 字符串，不发起 HTTP 请求。如需动态加载，需显式配置 `backend` + `loadPath`
+
+11. **两套 Accept-Language 解析实现**: 前端 Proxy Helper (`acceptHeader.ts`) 与后端 Resolver (`nestjs-i18n`) 独立维护解析逻辑，存在不一致风险。建议提取共享解析函数
+
+12. **SSR Header 读取类型不安全**: `context.res.getHeader('X-Server-Locale') as string` 未处理 `string[]` 类型，可能丢失多值

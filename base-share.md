@@ -247,6 +247,262 @@ permissionService.validBaseSharePermissions(shareId, resourceId, permissions)
 
 ---
 
+### 2.6 接口边界异常处理 - 跳过分享权限检查的条件
+
+`PermissionGuard.tryBaseSharePermissionCheck()`（`permission.guard.ts:292-320`）在以下三种场景下会**直接跳过分享权限检查**，返回 `undefined` 让请求走正常用户权限路径：
+
+```typescript
+// permission.guard.ts:292-320
+private async tryBaseSharePermissionCheck(
+  context: ExecutionContext,
+  baseShareHeader: string | undefined
+): Promise<boolean | undefined> {
+  // ... 省略 header 解析 ...
+  
+  // 跳过条件1：接口缺少 @Permissions 装饰器标记
+  const permissions = this.reflector.getAllAndOverride<Action[] | undefined>(PERMISSIONS_KEY, ...);
+  if (!permissions?.length) {
+    return undefined;
+  }
+  
+  // 跳过条件2：资源ID为空或属于Space级别
+  const resourceId = this.getResourceId(context) || this.defaultResourceId(context);
+  if (!resourceId || resourceId.startsWith(IdPrefix.Space)) {
+    return undefined;
+  }
+  
+  return await this.baseSharePermissionCheck(context, shareId);
+}
+```
+
+#### 2.6.1 跳过场景1：缺少 @Permissions 装饰器
+
+**典型接口**：
+- `GET /api/user/me` - 获取当前用户信息（仅需登录）
+- `POST /api/auth/login` - 登录接口（@Public）
+- 其他通用用户级接口，仅标记 `@AllowAnonymous(USER)` 而无具体权限要求
+
+**代码注释说明**：
+> "Skip share path for endpoints without @Permissions (e.g. /user/me),
+> otherwise baseSharePermissionCheck throws ForbiddenException."
+
+#### 2.6.2 跳过场景2：资源属于 Space 级别（`spc` 前缀）
+
+**典型接口**：
+- `GET /api/space` - 获取空间列表
+- `POST /api/space` - 创建空间
+- `GET /api/space/:spaceId` - 获取空间详情
+- `PUT /api/space/:spaceId` - 更新空间信息
+- `POST /api/share/:shareId/base/copy` - 复制分享（`@ResourceMeta('spaceId', 'body')` 标记资源为 `spaceId`）
+
+**代码注释说明**：
+> "Skip share check when the target resource is outside the share scope.
+> e.g. space-level endpoints (GET /space, POST /share/:id/base/copy with spaceId in body)
+> should use the user's own permissions, not the share's."
+
+**ID 前缀规则**（`packages/core/src/utils/id-generator.ts:3-23`）：
+| 前缀 | 资源类型 | 是否跳过分享检查 |
+|------|---------|----------------|
+| `spc` | Space | 是 |
+| `bse` | Base | 否 |
+| `tbl` | Table | 否 |
+| `viw` | View | 否 |
+| `fld` | Field | 否 |
+| `rec` | Record | 否 |
+
+#### 2.6.3 跳过场景3：Header 中无有效分享标识
+
+- 未携带 `X-Tea-Base-Share` Header
+- Header 值无法解析出有效的 `shr` 前缀 shareId
+
+---
+
+### 2.7 Guard 职责分工与执行顺序
+
+#### 2.7.1 BaseShareAuthGuard vs PermissionGuard 职责划分
+
+| Guard | 核心职责 | 执行阶段 | 判定结果 |
+|-------|---------|---------|---------|
+| **BaseShareAuthGuard** | **认证门禁**：验证分享链接的有效性，处理密码保护，注入用户身份 | 第一道防线 | 分享不存在/禁用 → NOT_FOUND<br>需要密码未认证 → UNAUTHORIZED_SHARE<br>认证通过 → 挂载 `req.baseShareInfo` |
+| **PermissionGuard** | **权限判定**：根据分享配置动态计算权限，校验操作是否被允许 | 第二道防线 | 权限不足 → RESTRICTED_RESOURCE<br>权限满足 → 写入 `cls.permissions` |
+
+**BaseShareAuthGuard 认证流程**（`base-share-auth.guard.ts:20-58`）：
+```typescript
+async validate(context: ExecutionContext, shareId: string) {
+  // 1. 获取分享信息（校验存在性 + enabled）
+  const shareInfo = await this.baseShareAuthService.getBaseShareInfo(shareId);
+  req.baseShareInfo = shareInfo;
+  
+  // 2. 注入用户身份（保留已登录用户）
+  const currentUserId = this.cls.get('user.id');
+  if (!currentUserId) {
+    this.cls.set('user', { id: ANONYMOUS_USER_ID, ... });
+  }
+  
+  // 3. 密码保护检查
+  const hasPassword = await this.baseShareAuthService.hasPassword(shareId);
+  if (hasPassword) {
+    return (await super.canActivate(context)) as boolean;  // JWT 策略验证
+  }
+  return true;
+}
+```
+
+**BaseShareAuthGuard 的两种使用模式**：
+
+| 模式 | 装饰器配置 | 适用场景 | 权限来源 |
+|------|-----------|---------|---------|
+| 仅认证 | `@UseGuards(BaseShareAuthGuard)`<br>`@AllowAnonymous()` | 查询分享元数据（`GET /:shareId/base`） | 不做权限检查，仅认证分享有效性 |
+| 认证+权限 | `@UseGuards(BaseShareAuthGuard, PermissionGuard)`<br>`@Permissions(...)`<br>`@ResourceMeta(...)` | 复制分享、查询分享内资源 | 先认证，再通过 PermissionGuard 做分享权限校验 |
+
+#### 2.7.2 完整执行顺序
+
+`PermissionGuard.canActivate()` → `permissionCheckWithPublicFallback()` 的完整判定链：
+
+```
+请求到达 PermissionGuard
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│  1. @Public() 装饰器检查                      │
+│  → 标记为 public → 直接放行，不做任何校验       │
+└───────────────────┬───────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────┐
+│  2. @DisabledPermission() 装饰器检查           │
+│  → 标记为 disabled → 直接放行                  │
+└───────────────────┬───────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────┐
+│  3. permissionCheckWithPublicFallback()      │
+│  ┌────────────────────────────────────────┐  │
+│  │ 3.1 RESOURCE 模式检查                   │  │
+│  │ @AllowAnonymous(RESOURCE) → 优先使用      │  │
+│  │ base share / template 权限                │  │
+│  └─────────────┬────────────────────────────┘  │
+│                │                               │
+│                ▼                               │
+│  ┌────────────────────────────────────────┐  │
+│  │ 3.2 分享 Header 检查（分享上限约束）     │  │
+│  │ 携带 X-Tea-Base-Share →                 │  │
+│  │ tryBaseSharePermissionCheck()           │  │
+│  │ → 跳过条件检查（@Permissions、Space级）  │  │
+│  │ → baseSharePermissionCheck()            │  │
+│  └─────────────┬────────────────────────────┘  │
+│                │                               │
+│                ▼                               │
+│  ┌────────────────────────────────────────┐  │
+│  │ 3.3 匿名用户处理                        │  │
+│  │ @AllowAnonymous(PUBLIC) → template 检查 │  │
+│  │ @AllowAnonymous(USER) → 直接放行        │  │
+│  │ 其他 → 抛出 UnauthorizedException       │  │
+│  └─────────────┬────────────────────────────┘  │
+│                │                               │
+│                ▼                               │
+│  ┌────────────────────────────────────────┐  │
+│  │ 3.4 已登录用户正常权限检查               │  │
+│  │ permissionCheck() →                     │  │
+│  │ 校验用户在该资源上的实际权限              │  │
+│  └─────────────┬────────────────────────────┘  │
+│                │                               │
+│                ├─ 成功 → 放行                  │
+│                └─ 失败 → PUBLIC fallback       │
+│                   ┌─────────────────────────┐  │
+│                   │ 3.5 Public fallback    │  │
+│                   │ @AllowAnonymous(PUBLIC) │  │
+│                   │ → tryBaseShareFallback  │  │
+│                   │ → templatePermissionCheck ││
+│                   └─────────────────────────┘  │
+└─────────────────────────────────────────────┘
+```
+
+**执行优先级**：
+1. `@Public()` > 所有检查
+2. 资源级认证（`AllowAnonymousType.RESOURCE`）> 分享链接权限 > 匿名处理 > 正常用户权限
+3. 分享链接权限是"天花板"，已登录用户的权限也不能超过分享配置
+
+---
+
+### 2.8 受分享上限约束 / 不受约束的接口判定标准
+
+#### 2.8.1 判定标准
+
+| 维度 | 受分享上限约束 | 不受分享上限约束 |
+|------|--------------|----------------|
+| **@Permissions** | ✅ 有标记（非空数组） | ❌ 无标记或空数组 |
+| **资源类型** | ✅ Base/Table/View/Field/Record 级 | ❌ Space 级（`spc` 前缀） |
+| **允许匿名类型** | ✅ `RESOURCE` / `PUBLIC` | ❌ 无 `@AllowAnonymous` 或 `USER` |
+| **Header** | ✅ 携带 `X-Tea-Base-Share` | ❌ 不携带，或解析不出 shareId |
+
+**判定逻辑表达式**：
+```
+受约束 = (X-Tea-Base-Share 存在且可解析)
+        AND (@Permissions 非空)
+        AND (resourceId 非空且不以 spc 开头)
+```
+
+#### 2.8.2 受约束接口示例
+
+**示例1：查询分享内表记录**
+```typescript
+// 接口路径（通过 share 路由）
+@UseGuards(BaseShareAuthGuard, PermissionGuard)
+@Permissions('record|read')
+@ResourceMeta('tableId', 'params')
+@Get('/:shareId/table/:tableId/record')
+```
+- ✅ 有 `@Permissions('record|read')`
+- ✅ 资源是 Table（`tbl` 前缀）
+- ✅ 携带分享 Header
+- **结论**：受分享上限约束，匿名用户可能降级为只读
+
+**示例2：复制分享到用户空间**
+```typescript
+@UseGuards(BaseShareAuthGuard, PermissionGuard)
+@Permissions('base|create')
+@ResourceMeta('spaceId', 'body')  // ⚠️ 注意这里是 spaceId
+@Post('/:shareId/base/copy')
+```
+- ✅ 有 `@Permissions('base|create')`
+- ❌ 资源是 Space（`spc` 前缀）→ 触发跳过条件2
+- **结论**：不受分享上限约束，走用户自身权限检查（即使携带分享 Header）
+
+#### 2.8.3 不受约束接口示例
+
+**示例1：获取当前用户信息**
+```typescript
+// 无 @Permissions 装饰器
+@Get('/user/me')
+async getMe() { ... }
+```
+- ❌ 无 `@Permissions` → 触发跳过条件1
+- **结论**：不受分享上限约束，仅需登录
+
+**示例2：获取空间列表**
+```typescript
+@Permissions('space|read')
+@Get('/space')
+async getSpaceList() { ... }
+```
+- ✅ 有 `@Permissions`
+- ❌ 资源是 Space（`spc` 前缀）→ 触发跳过条件2
+- **结论**：不受分享上限约束，即使携带分享 Header 也走用户空间权限
+
+**示例3：获取分享元数据**
+```typescript
+@Public()
+@UseGuards(BaseShareAuthGuard)  // 仅 BaseShareAuthGuard，无 PermissionGuard
+@AllowAnonymous()
+@Get('/:shareId/base')
+async getBaseShare() { ... }
+```
+- ❌ 无 `PermissionGuard` 参与，无 `@Permissions` 检查
+- **结论**：不受分享上限约束，仅做分享有效性认证
+
+---
+
 ## 三、分享令牌发放机制
 
 ### 3.1 两种分享模式
@@ -629,7 +885,12 @@ shareId 以 'fld' 开头 → ShareAuthGuard 识别为链接视图
 | 元数据定义 | `packages/core/src/models/view/view.schema.ts` | `IShareViewMeta` 类型定义 |
 | JWT 策略 | `src/features/share/strategies/jwt.strategy.ts` | 视图分享 JWT 验证 |
 | JWT 策略 | `src/features/base-share/strategies/jwt.strategy.ts` | 基表分享 JWT 验证 |
-| 权限守卫 | `src/features/auth/guard/permission.guard.ts` | 基表分享权限校验入口 |
+| 权限守卫 | `src/features/auth/guard/permission.guard.ts` | 基表分享权限校验入口、跳过逻辑、fallback 机制 |
 | 基表分享 OpenAPI | `src/features/base-share/base-share-open.controller.ts` | 基表分享公开接口（认证、查询、复制） |
 | 基表分享管理 | `src/features/base-share/base-share.controller.ts` | 基表分享 CRUD 管理接口 |
 | 模板角色定义 | `packages/core/src/auth/role/template.ts` | TemplatePermissions 权限集定义 |
+| 允许匿名装饰器 | `src/features/auth/decorators/allow-anonymous.decorator.ts` | AllowAnonymousType 枚举定义 |
+| ID 前缀定义 | `packages/core/src/utils/id-generator.ts` | IdPrefix 枚举（Space/Base/Table 等前缀） |
+| 本地认证守卫 | `src/features/share/guard/share-auth-local.guard.ts` | 视图分享密码校验 |
+| 本地认证守卫 | `src/features/base-share/guard/base-share-auth-local.guard.ts` | 基表分享密码校验 |
+| 视图分享控制器 | `src/features/share/share.controller.ts` | 视图分享 Cookie 写入 |

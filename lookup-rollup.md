@@ -205,7 +205,34 @@ private getAdjacencyMaps(tableDomains: ReadonlyMap<string, TableDomain>, project
 
 **文件**: `apps/nestjs-backend/src/features/record/computed/services/link-cascade-resolver.ts:38-227`
 
-#### 4.2.1 BFS 遍历算法
+#### 4.2.1 ILinkEdge 动态列名接口
+
+**重要校正**：链接级联查询的列名**不是固定字段**，而是通过 `ILinkEdge` 接口动态拼装：
+
+```typescript
+// link-cascade-resolver.ts:8-14
+export interface ILinkEdge {
+  foreignTableId: string;
+  hostTableId: string;
+  fkTableName: string;        // 动态 junction table 名
+  selfKeyName: string;        // 动态主键列名（如 "fldxxxx"）
+  foreignKeyName: string;     // 动态外键列名（如 "fldyyyy"）
+}
+```
+
+**边的动态构建**（`computed-dependency-collector.service.ts:256-266`）：
+```typescript
+const opts = this.parseLinkOptions(field.options);
+edges.push({
+  foreignTableId: opts.foreignTableId,
+  hostTableId: tableId,
+  fkTableName: opts.fkHostTableName,    // 从链接字段配置读取
+  selfKeyName: opts.selfKeyName,        // 从链接字段配置读取
+  foreignKeyName: opts.foreignKeyName,  // 从链接字段配置读取
+});
+```
+
+#### 4.2.2 BFS 遍历算法（动态列名拼装）
 
 ```typescript
 async resolve(params: IResolveLinkCascadeParams): Promise<Array<{ tableId: string; recordId: string }>> {
@@ -224,7 +251,7 @@ async resolve(params: IResolveLinkCascadeParams): Promise<Array<{ tableId: strin
     const edgesFromTable = edgeBySrc.get(tableId);
     
     for (const edge of edgesFromTable) {
-      // 通过 junction table 查询关联记录
+      // 通过 junction table 查询关联记录（动态列名拼装）
       const rows = all
         ? await this.fetchEdgeTargetsFromAll(edge)      // 全表扫描
         : await this.fetchEdgeTargetsBatched(edge, frontierIds);  // 批量查询
@@ -246,19 +273,56 @@ async resolve(params: IResolveLinkCascadeParams): Promise<Array<{ tableId: strin
 }
 ```
 
-#### 4.2.2 Junction Table 查询
+#### 4.2.3 Junction Table 查询（动态列名）
 
-```sql
--- 多对多关系查询示例
-SELECT "__self_id"::text as record_id
-FROM "junction_table"
-WHERE "__foreign_id" IN (recordIds)
-  AND "__foreign_id" IS NOT NULL
-  AND "__self_id" IS NOT NULL
+**文件**: `link-cascade-resolver.ts:175-215`
+
+```typescript
+private async fetchEdgeTargets(
+  edge: ILinkEdge,
+  srcIds: string[]
+): Promise<Array<{ record_id?: string }>> {
+  const placeholders = srcIds.map((_, i) => `$${i + 1}`).join(', ');
+  const fkTableRef = this.formatQualifiedName(edge.fkTableName);
+  // 动态列名：edge.foreignKeyName 和 edge.selfKeyName 来自链接字段配置
+  const srcCol = this.quoteIdentifier(edge.foreignKeyName);
+  const dstCol = this.quoteIdentifier(edge.selfKeyName);
+  
+  const sql = `select ${dstCol}::text as record_id
+from ${fkTableRef}
+where ${srcCol} in (${placeholders})
+  and ${srcCol} is not null
+  and ${dstCol} is not null`;
+  
+  return await this.dataPrismaService
+    .txClient()
+    .$queryRawUnsafe<Array<{ record_id?: string }>>(sql, ...srcIds);
+}
 ```
 
+**全表扫描版本**（`fetchEdgeTargetsFromAll`）：
+```typescript
+private async fetchEdgeTargetsFromAll(edge: ILinkEdge): Promise<Array<{ record_id?: string }>> {
+  const fkTableRef = this.formatQualifiedName(edge.fkTableName);
+  // 同样使用动态列名
+  const srcCol = this.quoteIdentifier(edge.foreignKeyName);
+  const dstCol = this.quoteIdentifier(edge.selfKeyName);
+  
+  const sql = `select distinct ${dstCol}::text as record_id
+from ${fkTableRef}
+where ${srcCol} is not null
+  and ${dstCol} is not null`;
+  // ...
+}
+```
+
+**设计意图**：
+- 每个链接字段都有独立的 junction table 和独立的列名配置
+- 动态拼装避免硬编码，支持多租户、多数据库实例
+- 通过 `selfKeyName`/`foreignKeyName` 映射到实际的数据库列（通常为 `fld` 前缀的字段ID）
+
 **优化策略**:
-- 分批处理（每批 500 条）避免 IN 子句过长
+- 分批处理（每批 500 条，`IN_CHUNK = 500`）避免 IN 子句过长
 - `ALL_RECORDS` 标记避免全表 ID 物化
 - 去重机制防止循环依赖导致的无限传播
 
@@ -275,11 +339,13 @@ WHERE "__foreign_id" IN (recordIds)
 | `link-cascade-resolver.ts` | 32 | 链接级联解析器内部使用 |
 | `computed-dependency-collector.service.ts` | 71 | 依赖收集器内部使用 |
 
-### 5.2 条件汇总 ALL_RECORDS 八大触发条件
+### 5.2 条件汇总 ALL_RECORDS 完整触发条件（共 11 个）
 
-**文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-dependency-collector.service.ts:745-814`
+**文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-dependency-collector.service.ts:745-981`
 
-`getConditionalRollupImpactedRecordIds` 方法中有 **8 个明确的触发点**，按检查顺序排列：
+`getConditionalRollupImpactedRecordIds` 方法中共有 **11 个明确的触发点**，按检查顺序排列：
+
+#### 5.2.1 前半段：前置检查（8 个触发点）
 
 ```typescript
 private async getConditionalRollupImpactedRecordIds(
@@ -290,18 +356,95 @@ private async getConditionalRollupImpactedRecordIds(
 ): Promise<string[] | typeof ALL_RECORDS> {
 ```
 
-| 触发条件 | 代码位置 | 判定逻辑 |
-|---------|---------|---------|
-| **① 样本量超限** | 755-757 | `uniqueForeignIds.length > MAX_CONDITIONAL_ROLLUP_SAMPLE` (阈值 = 10,000) |
-| **② 无过滤器** | 762-765 | `!filter` 条件汇总未配置过滤条件 |
-| **③ 无主机字段引用** | 767-770 | `!hostFieldRefs.length` 过滤器不引用主机表任何字段 |
-| **④ 无外键字段引用** | 772-774 | `foreignFieldIds.size === 0` 过滤器不引用外表任何字段 |
-| **⑤ 跨表引用** | 776-778 | 过滤器引用了非主机表的字段 (`ref.tableId && ref.tableId !== edge.tableId`) |
-| **⑥ 主机字段加载失败** | 780-784 | `hostFieldMap.size !== uniqueHostFieldIds.length` |
-| **⑦ 外键字段加载失败** | 786-793 | `foreignFieldMap.size !== foreignFieldIds.size` |
-| **⑧ JSON 类型字段** | 804-814 | 外表过滤字段的 `dbFieldType === DbFieldType.Json` |
+| # | 触发条件 | 代码位置 | 判定逻辑 |
+|---|---------|---------|---------|
+| ① | 样本量超限 | 755-757 | `uniqueForeignIds.length > MAX_CONDITIONAL_ROLLUP_SAMPLE` (阈值 = 10,000) |
+| ② | 无过滤器 | 762-765 | `!filter` 条件汇总未配置过滤条件 |
+| ③ | 无主机字段引用 | 767-770 | `!hostFieldRefs.length` 过滤器不引用主机表任何字段 |
+| ④ | 无外键字段引用 | 772-774 | `foreignFieldIds.size === 0` 过滤器不引用外表任何字段 |
+| ⑤ | 跨表引用 | 776-778 | 过滤器引用了非主机表的字段 (`ref.tableId && ref.tableId !== edge.tableId`) |
+| ⑥ | 主机字段加载失败 | 780-784 | `hostFieldMap.size !== uniqueHostFieldIds.length` |
+| ⑦ | 外键字段加载失败 | 786-793 | `foreignFieldMap.size !== foreignFieldIds.size` |
+| ⑧ | JSON 类型字段 | 804-814 | 外表过滤字段的 `dbFieldType === DbFieldType.Json` |
 
 > **注意**：代码中第 ⑧ 项存在**重复检查**（804-808 行和 810-814 行），属于可优化的冗余代码。
+
+#### 5.2.2 后半段：变更前后双端过滤（新增 3 个触发点）
+
+当 `changeContextMap` 存在（记录变更场景）时，需要对变更前后的值都应用过滤器，取并集确保完整性。此阶段新增 **3 个 ALL_RECORDS 触发点**：
+
+| # | 触发条件 | 代码位置 | 判定逻辑 |
+|---|---------|---------|---------|
+| ⑨ | DB列名缺失 | 897-899 | `foreignDbFieldNamesOrdered.length !== foreignFieldIds.size`，无法获取字段的数据库列名 |
+| ⑩ | 字段值缺失 | 949-963 | 构造 `updatedRows` 时，字段不存在或 `dbFieldName` 不在 base 对象中 |
+| ⑪ | 矩阵值未定义 | 979-981 | `valuesMatrix.some((row) => row.some((value) => typeof value === 'undefined'))`，值矩阵包含 undefined |
+
+**触发点 ⑨ 详细分析**（889-899 行）：
+```typescript
+const foreignDbFieldNamesOrdered = Array.from(
+  new Set(
+    Array.from(foreignFieldIds)
+      .map((fid) => foreignFieldMap.get(fid)?.dbFieldName)
+      .filter((name): name is string => !!name)
+  )
+);
+
+if (foreignDbFieldNamesOrdered.length !== foreignFieldIds.size) {
+  return ALL_RECORDS;  // 某些字段没有 dbFieldName，无法构建查询
+}
+```
+
+**触发点 ⑩ 详细分析**（949-963 行）：
+```typescript
+let missing = false;
+for (const fieldId of foreignFieldIds) {
+  const field = foreignFieldMap.get(fieldId);
+  if (!field) { missing = true; break; }              // 字段不存在
+  if (!(field.dbFieldName in base)) { missing = true; break; }  // 值缺失
+}
+if (missing) {
+  return ALL_RECORDS;
+}
+```
+
+**触发点 ⑪ 详细分析**（979-981 行）：
+```typescript
+if (valuesMatrix.some((row) => row.some((value) => typeof value === 'undefined'))) {
+  return ALL_RECORDS;  // 值矩阵包含 undefined，无法安全绑定参数
+}
+```
+
+#### 5.2.3 双端过滤的完整流程（记录变更场景）
+
+当有 `changeContextMap` 时，执行两次 EXISTS 查询取并集：
+
+```
+1. 先查当前值：用数据库中的当前值构建 EXISTS 子查询 → 结果集 ids
+2. 再查变更后的值：
+   a. 查询变更记录的当前数据库值 → baseRows
+   b. 用 newValue 替换变更字段的值 → updatedRows
+   c. 将 updatedRows 转为 VALUES 子查询（CAST 到正确类型）
+   d. 用变更后的值构建 EXISTS 子查询 → postRows
+3. 合并结果：ids ∪ postRows → 返回 Array.from(ids)
+```
+
+**变更后值的类型转换**（986-1008 行）：
+```typescript
+const resolveColumnType = (column: string): string => {
+  if (column === '__id') return 'text';
+  const field = foreignFieldByDbName.get(column);
+  switch (field?.dbFieldType) {
+    case DbFieldType.Integer: return 'integer';
+    case DbFieldType.Real: return 'double precision';
+    case DbFieldType.Boolean: return 'boolean';
+    case DbFieldType.DateTime: return 'timestamp';
+    case DbFieldType.Blob: return 'bytea';
+    case DbFieldType.Json: return 'jsonb';
+    case DbFieldType.Text:
+    default: return 'text';
+  }
+};
+```
 
 ### 5.3 条件汇总 ALL_RECORDS 传播逻辑
 
@@ -438,11 +581,71 @@ for (const [tid, ids] of Object.entries(plannedForeignRecordIds)) {
 
 ## 七、条件边迭代收敛机制
 
-### 7.1 迭代收敛完整流程
+### 7.1 两条迭代路径对比
+
+计算编排器通过两个不同入口调用两种收集方法，虽然迭代算法结构相似，但在多个关键维度存在差异：
+
+| 对比维度 | 记录变更 (`collect`) | 字段变更 (`collectForFieldChanges`) |
+|---------|-------------------|----------------------------------|
+| **调用场景** | 记录数据增删改 | 字段定义增删改 |
+| **初始种子** | `explicitSeeds` 包含变更记录ID + 对称链接预播种ID | `explicitSeeds` 为空 |
+| **初始 ALL_RECORDS** | `tablesWithAllRecords` 初始为空 | `tablesWithAllRecords` 初始化为 `originTableIds` |
+| **上下文传递** | 有 `changeContextMap`（oldValue/newValue），用于变更前后双端过滤 | 无 `changeContextMap`，仅使用当前值过滤 |
+| **条件汇总查询** | 先查当前值 → 再查变更后的值 → 取并集 | 仅查当前值一次 |
+| **分页策略** | `preferAutoNumberPaging` 仅在 `ALL_RECORDS` 时设置 | 源表默认 `preferAutoNumberPaging = true` |
+| **历史兼容** | 无 `fallbackLookupIds` 处理 | 有 `fallbackLookupIds`，兼容 `lookupOptions.linkFieldId` 之前的历史数据 |
+| **自动编号字段** | 有 `autoNumberFieldIds` 处理 | 无 |
+| **plannedForeignRecordIds** | 有，用于对称链接预播种 | 无 |
+
+### 7.2 字段变更路径的历史兼容处理
+
+**文件**: `computed-dependency-collector.service.ts:1203-1232`
+
+字段变更场景额外处理了历史兼容性问题：
+
+```typescript
+const fallbackLookupIds = new Set<string>();
+if (relatedLinkIds.length) {
+  const byTable = await this.findLookupsByLinkIds(relatedLinkIds);
+  for (const [tid, fset] of Object.entries(byTable)) {
+    const group = (impact[tid] ||= {
+      fieldIds: new Set<string>(),
+      recordIds: new Set<string>(),
+    });
+    fset.forEach((fid) => {
+      if (!group.fieldIds.has(fid)) {
+        group.fieldIds.add(fid);
+        fallbackLookupIds.add(fid);
+      }
+    });
+  }
+}
+
+if (fallbackLookupIds.size) {
+  // Legacy compatibility: pre-link reference rows created before lookupOptions.linkFieldId
+  // existed do not include the link→lookup edge. We need to synthesize those missing
+  // dependencies so downstream lookups/formulas still recompute.
+  const extraDeps = await this.collectDependentFieldsByTable(Array.from(fallbackLookupIds));
+  // ... 补充额外的依赖字段
+}
+```
+
+### 7.3 记录变更路径的 autoNumber 处理
+
+**文件**: `computed-dependency-collector.service.ts:1608-1609`
+
+```typescript
+const autoNumberFieldIds = this.getAutoNumberFieldIds(entryDomain, excludeFieldIds);
+this.addContextFreeFormulasToImpact(impact, tableId, autoNumberFieldIds);
+```
+
+**设计意图**：自动编号字段不依赖其他字段，每次记录创建时都会变化，需要单独加入受影响集合。
+
+### 7.4 迭代收敛完整流程
 
 **文件**: `computed-dependency-collector.service.ts:1257-1395`（字段变更场景）和 `1637-1778`（记录变更场景）
 
-两个场景的迭代算法**完全一致**，以下以记录变更场景为例：
+两个场景的**迭代算法结构完全一致**，以下以记录变更场景为例：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -479,7 +682,7 @@ for (const [tid, ids] of Object.entries(plannedForeignRecordIds)) {
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 记录集增长检测 (findRecordSetGrowth)
+### 7.5 记录集增长检测 (findRecordSetGrowth)
 
 **文件**: `computed-dependency-collector.service.ts:332-375`
 
@@ -518,7 +721,7 @@ private findRecordSetGrowth(
 }
 ```
 
-### 7.3 去重入队机制
+### 7.6 去重入队机制
 
 **文件**: `computed-dependency-collector.service.ts:1267-1278`
 
@@ -538,7 +741,7 @@ const enqueueLinkDependents = (tableId: string) => {
 };
 ```
 
-### 7.4 收敛判定
+### 7.7 收敛判定
 
 迭代收敛发生在：
 1. `queue.length === 0` —— 没有新的表需要处理
@@ -711,7 +914,7 @@ await strategy.run(paginationContext, async (rows) => {
 
 ### 10.2 ALL_RECORDS 标记
 
-避免全表记录ID物化，当条件汇总样本量超过阈值（**10,000 条**，由 `MAX_CONDITIONAL_ROLLUP_SAMPLE` 定义）或其他 7 种条件触发时，直接标记为全表重算。
+避免全表记录ID物化，当条件汇总样本量超过阈值（**10,000 条**，由 `MAX_CONDITIONAL_ROLLUP_SAMPLE` 定义）或其他 10 种条件触发时，直接标记为全表重算。
 
 ### 10.3 对称链接双端预播种
 
@@ -728,6 +931,10 @@ await strategy.run(paginationContext, async (rows) => {
 ### 10.6 基于 SQL 的批量更新
 
 相比逐行更新，`UPDATE FROM SELECT` 性能提升显著，且保证原子性。
+
+### 10.7 动态列名拼装
+
+链接级联查询的列名通过 `ILinkEdge` 接口的 `selfKeyName`、`foreignKeyName`、`fkTableName` 动态读取自链接字段配置，而非硬编码，支持多租户和灵活的数据库架构。
 
 ---
 
@@ -762,6 +969,14 @@ if (
 
 `ALL_RECORDS` 在 `link-cascade-resolver.ts:32` 和 `computed-dependency-collector.service.ts:71` 分别定义，可考虑提取为共享常量。
 
+### 潜在问题 4: computeLinkClosure 参数不一致
+
+`computeLinkClosure` 方法在两个调用场景中参数不完全一致：
+- 字段变更场景：无 `tableDomains` 参数（`computeLinkClosure.ts:385` 内部会 fallback 加载）
+- 记录变更场景：传入 `tableDomains` 参数
+
+可考虑统一参数传递，避免重复加载 TableDomain。
+
 ---
 
 ## 十二、总结
@@ -772,11 +987,18 @@ Teable 的查找与汇总字段的值传播链路是一个**精心设计的分�
 2. **性能**: BFS 级联 + 批量 SQL 更新 + 分页策略，兼顾效率与内存
 3. **正确性**: 拓扑排序 + 版本号乐观锁 + 行级锁，保证并发安全
 4. **实时性**: ShareDB 实时推送，确保前端缓存及时失效
-5. **健壮性**: 8 种 ALL_RECORDS 兜底条件 + 对称链接预播种 + 条件边迭代收敛，确保极端场景下的正确性
+5. **健壮性**: 11 种 ALL_RECORDS 兜底条件 + 对称链接预播种 + 条件边迭代收敛，确保极端场景下的正确性
 
 **三大核心机制的协同作用**：
-- **ALL_RECORDS 触发**：在样本量过大、过滤器复杂或字段类型特殊时，优雅降级为全表重算，避免内存溢出和 SQL 错误
+- **ALL_RECORDS 触发**：在样本量过大、过滤器复杂、字段类型特殊或变更值不完整时，优雅降级为全表重算，避免内存溢出和 SQL 错误
 - **对称链接预播种**：通过 oldValue/newValue 双端提取，确保链接关系变更的两端都能被正确处理
 - **条件边迭代收敛**：通过单调增长的记录集和队列去重机制，确保条件汇总的跨表影响被完整传播
+
+**动态列名设计**：
+链接级联查询的列名通过 `ILinkEdge` 接口动态拼装，每个链接字段有独立的 junction table 和列名配置，避免硬编码，支持多租户架构。
+
+**两条路径的差异化设计**：
+- **记录变更**：侧重精确性，通过 `changeContextMap` 实现变更前后双端过滤，最小化重算范围
+- **字段变更**：侧重完整性，初始全表标记 + 历史兼容处理，确保字段定义变更不遗漏任何记录
 
 该架构成功解决了多维表格中跨表引用、派生字段重算、缓存一致性等核心难题，为复杂数据模型提供了可靠的计算基础设施。

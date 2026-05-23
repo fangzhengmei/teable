@@ -207,14 +207,14 @@ private getAdjacencyMaps(tableDomains: ReadonlyMap<string, TableDomain>, project
 
 #### 4.2.1 ILinkEdge 动态列名接口
 
-**重要校正**：链接级联查询的列名**不是固定字段**，而是通过 `ILinkEdge` 接口动态拼装：
+**重要校正**：链接级联查询的列名**不是固定字段**，而是通过 `ILinkEdge` 接口动态拼装。其中 `fkTableName` 来源于链接字段配置的 `fkHostTableName`。
 
 ```typescript
 // link-cascade-resolver.ts:8-14
 export interface ILinkEdge {
   foreignTableId: string;
   hostTableId: string;
-  fkTableName: string;        // 动态 junction table 名
+  fkTableName: string;        // junction table 的限定名（格式：baseDbName.tableDbName）
   selfKeyName: string;        // 动态主键列名（如 "fldxxxx"）
   foreignKeyName: string;     // 动态外键列名（如 "fldyyyy"）
 }
@@ -226,10 +226,25 @@ const opts = this.parseLinkOptions(field.options);
 edges.push({
   foreignTableId: opts.foreignTableId,
   hostTableId: tableId,
-  fkTableName: opts.fkHostTableName,    // 从链接字段配置读取
+  fkTableName: opts.fkHostTableName,    // 从链接字段配置读取，格式：baseDbName.tableDbName
   selfKeyName: opts.selfKeyName,        // 从链接字段配置读取
   foreignKeyName: opts.foreignKeyName,  // 从链接字段配置读取
 });
+```
+
+**fkHostTableName 与 junction table 的关系**：
+- `fkHostTableName` 是 junction table 的**限定名**，格式为 `baseDbName.tableDbName`（例如 `bse000000000000000000.tbl000000000000000000`）
+- `formatQualifiedName` 方法将其按 `.` 分割，分别用双引号包裹，形成真正的 SQL 引用：`"baseDbName"."tableDbName"`
+- 每个链接字段有独立的 junction table，用于存储多对多关系
+
+**限定名拼装**（`link-cascade-resolver.ts:221-226`）：
+```typescript
+private formatQualifiedName(qualified: string): string {
+  return qualified
+    .split('.')
+    .map((part) => this.quoteIdentifier(part))  // '"' + part.replace(/"/g, '""') + '"'
+    .join('.');
+}
 ```
 
 #### 4.2.2 BFS 遍历算法（动态列名拼装）
@@ -283,6 +298,7 @@ private async fetchEdgeTargets(
   srcIds: string[]
 ): Promise<Array<{ record_id?: string }>> {
   const placeholders = srcIds.map((_, i) => `$${i + 1}`).join(', ');
+  // 将 baseDbName.tableDbName 转为 "baseDbName"."tableDbName"
   const fkTableRef = this.formatQualifiedName(edge.fkTableName);
   // 动态列名：edge.foreignKeyName 和 edge.selfKeyName 来自链接字段配置
   const srcCol = this.quoteIdentifier(edge.foreignKeyName);
@@ -339,13 +355,13 @@ where ${srcCol} is not null
 | `link-cascade-resolver.ts` | 32 | 链接级联解析器内部使用 |
 | `computed-dependency-collector.service.ts` | 71 | 依赖收集器内部使用 |
 
-### 5.2 条件汇总 ALL_RECORDS 完整触发条件（共 11 个）
+### 5.2 条件汇总 ALL_RECORDS 完整触发条件（去重后共 10 个）
 
 **文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-dependency-collector.service.ts:745-981`
 
-`getConditionalRollupImpactedRecordIds` 方法中共有 **11 个明确的触发点**，按检查顺序排列：
+`getConditionalRollupImpactedRecordIds` 方法中共有 **10 个独立的触发点**（去掉了重复的 JSON 类型检查），按检查顺序排列：
 
-#### 5.2.1 前半段：前置检查（8 个触发点）
+#### 5.2.1 前半段：前置检查（7 个触发点）
 
 ```typescript
 private async getConditionalRollupImpactedRecordIds(
@@ -365,9 +381,9 @@ private async getConditionalRollupImpactedRecordIds(
 | ⑤ | 跨表引用 | 776-778 | 过滤器引用了非主机表的字段 (`ref.tableId && ref.tableId !== edge.tableId`) |
 | ⑥ | 主机字段加载失败 | 780-784 | `hostFieldMap.size !== uniqueHostFieldIds.length` |
 | ⑦ | 外键字段加载失败 | 786-793 | `foreignFieldMap.size !== foreignFieldIds.size` |
-| ⑧ | JSON 类型字段 | 804-814 | 外表过滤字段的 `dbFieldType === DbFieldType.Json` |
+| ⑧ | JSON 类型字段 | 795-800 | 外表过滤字段的 `dbFieldType === DbFieldType.Json` |
 
-> **注意**：代码中第 ⑧ 项存在**重复检查**（804-808 行和 810-814 行），属于可优化的冗余代码。
+> **注意**：代码中原先第 ⑧ 项存在**重复检查**（795-800 行和 802-806 行），去重后计为 1 个触发条件。
 
 #### 5.2.2 后半段：变更前后双端过滤（新增 3 个触发点）
 
@@ -857,49 +873,109 @@ async updateFromSelect(tableId: string, qb: Knex.QueryBuilder, fields: IFieldIns
 
 ## 九、缓存失效机制
 
-### 9.1 版本号机制
+### 9.1 代码可证实事实
+
+以下内容有明确的代码证据支持：
+
+#### 9.1.1 版本号自增机制
+
+**文件**: `apps/nestjs-backend/src/features/record/computed/services/record-computed-update.service.ts:164-176`
 
 ```sql
 -- 每次更新自动递增版本号
 __version = __version + 1
 ```
 
-**文件**: `apps/nestjs-backend/src/features/record/computed/services/record-computed-update.service.ts:164-176`
+**证据**：`updateFromSelect` 方法将 `__version + 1` 包含在 UPDATE 语句的 SET 子句中，每次更新都会自增。
 
-### 9.2 ShareDB 实时发布
+#### 9.1.2 ShareDB Op 发布
 
-**文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-evaluator.service.ts:130-140`
+**文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-evaluator.service.ts:337-365`
 
 ```typescript
-await strategy.run(paginationContext, async (rows) => {
-  const evaluatedRows = this.buildEvaluatedRows(rows, fieldInstances);
-  totalOps += this.publishBatch(
-    tableId,
-    impactedFieldIds,
-    validFieldIdSet,
-    excludeFieldIds,
-    evaluatedRows
-  );
-});
+private publishBatch(
+  tableId: string,
+  impactedFieldIds: Set<string>,
+  validFieldIds: Set<string>,
+  excludeFieldIds: Set<string>,
+  evaluatedRows: Array<{ recordId: string; version: number; prevVersion?: number; fields: Record<string, unknown> }>
+): number {
+  const ops = evaluatedRows.flatMap(({ recordId, version, prevVersion, fields }) => {
+    return Array.from(impactedFieldIds)
+      .filter((fid) => validFieldIds.has(fid) && !excludeFieldIds.has(fid))
+      .map((fid) => {
+        const hasValue = Object.prototype.hasOwnProperty.call(fields, fid);
+        const newCellValue = hasValue ? fields[fid] : null;
+        return RecordOpBuilder.editor.setRecord.build({
+          fieldId: fid,
+          newCellValue,
+          oldCellValue: null,
+          recordId,
+          tableId,
+          extraData: { __version: version },
+        });
+      });
+  });
+  
+  this.opStreamHub.publish(ops);
+  return ops.length;
+}
 ```
 
-**发布内容**:
-- OpType: `setRecord`
-- 包含新的 cellValue 和 __version
-- 通过 WebSocket 推送到前端
-- 前端据此更新本地缓存
+**证据**：
+- `publishBatch` 方法构造 `setRecord` 类型的 ShareDB ops
+- 每个 op 包含 `fieldId`、`newCellValue`、`recordId`、`tableId` 和 `__version`
+- 通过 `opStreamHub.publish(ops)` 实时发布
 
-### 9.3 失效传播链
+#### 9.1.3 evaluatedRows 结构
 
+**文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-evaluator.service.ts:312-334`
+
+```typescript
+private buildEvaluatedRows(
+  rows: unknown[],
+  fieldInstances: Map<string, IFieldInstance>
+): Array<{
+  recordId: string;
+  version: number;
+  prevVersion?: number;
+  fields: Record<string, unknown>;
+}> {
+  return rows.map((row) => {
+    const recordId = row.__id;
+    const version = row.__version as number;
+    const prevVersion = row.__prev_version as number | undefined;
+    // ... 构建 fields 映射 ...
+  });
+}
 ```
-源记录更新 → 版本号+1 → ShareDB Op发布
-                         ↓
-                 前端缓存匹配版本号
-                         ↓
-                 失效本地缓存
-                         ↓
-                 触发重新查询/渲染
+
+**证据**：每个评估后的行包含 `__version`（新版本号）和 `__prev_version`（旧版本号）。
+
+### 9.2 推断（合理推测）
+
+以下内容基于代码架构和实现逻辑的合理推测，未找到直接代码证据：
+
+#### 9.2.1 前端缓存失效机制
+
+**推测**：前端接收到 ShareDB `setRecord` op 后，通过 `__version` 匹配失效本地缓存。
+
+**推理依据**：
+- Op 中携带了最新的 `__version`（来自数据库自增后的值）
+- 前端本地缓存通常按版本号管理，当收到更高版本号时，旧版本缓存失效
+- 这是 ShareDB/OT 系统的标准缓存失效模式
+
+#### 9.2.2 缓存失效传播链
+
+**推测**：完整的缓存失效链为：
 ```
+源记录更新 → 版本号+1 → ShareDB Op发布 → 前端缓存匹配版本号 → 失效本地缓存 → 触发重新查询/渲染
+```
+
+**推理依据**：
+- 后端通过 WebSocket 推送 ops 是实时协作系统的标准做法
+- 前端需要根据推送的变更更新本地状态，避免重新加载整个表格
+- 版本号机制可以确保不会应用过期的更新
 
 ---
 
@@ -914,7 +990,7 @@ await strategy.run(paginationContext, async (rows) => {
 
 ### 10.2 ALL_RECORDS 标记
 
-避免全表记录ID物化，当条件汇总样本量超过阈值（**10,000 条**，由 `MAX_CONDITIONAL_ROLLUP_SAMPLE` 定义）或其他 10 种条件触发时，直接标记为全表重算。
+避免全表记录ID物化，当条件汇总样本量超过阈值（**10,000 条**，由 `MAX_CONDITIONAL_ROLLUP_SAMPLE` 定义）或其他 9 种条件触发时，直接标记为全表重算。
 
 ### 10.3 对称链接双端预播种
 
@@ -934,7 +1010,10 @@ await strategy.run(paginationContext, async (rows) => {
 
 ### 10.7 动态列名拼装
 
-链接级联查询的列名通过 `ILinkEdge` 接口的 `selfKeyName`、`foreignKeyName`、`fkTableName` 动态读取自链接字段配置，而非硬编码，支持多租户和灵活的数据库架构。
+链接级联查询的列名通过 `ILinkEdge` 接口的 `selfKeyName`、`foreignKeyName`、`fkTableName` 动态读取自链接字段配置：
+- `fkHostTableName` 是 `baseDbName.tableDbName` 格式的限定名
+- 通过 `formatQualifiedName` 转为 `"baseDbName"."tableDbName"` 的 SQL 引用
+- 避免硬编码，支持多租户和灵活的数据库架构
 
 ---
 
@@ -942,7 +1021,7 @@ await strategy.run(paginationContext, async (rows) => {
 
 ### 潜在问题 1: 重复的 JSON 类型检查
 
-**文件**: `computed-dependency-collector.service.ts:804-814`
+**文件**: `computed-dependency-collector.service.ts:795-806`
 
 ```typescript
 // 重复检查两次，可合并为一次
@@ -961,18 +1040,14 @@ if (
 
 **优化**: 删除重复检查。
 
-### 潜在问题 2: 排序字段过滤的可复用性
-
-`buildSortFieldAccessor` 和 `applySortFieldFilter` 方法可提取为通用工具函数，供条件汇总和条件查找共享。
-
-### 潜在问题 3: ALL_RECORDS 符号重复定义
+### 潜在问题 2: ALL_RECORDS 符号重复定义
 
 `ALL_RECORDS` 在 `link-cascade-resolver.ts:32` 和 `computed-dependency-collector.service.ts:71` 分别定义，可考虑提取为共享常量。
 
-### 潜在问题 4: computeLinkClosure 参数不一致
+### 潜在问题 3: computeLinkClosure 参数不一致
 
 `computeLinkClosure` 方法在两个调用场景中参数不完全一致：
-- 字段变更场景：无 `tableDomains` 参数（`computeLinkClosure.ts:385` 内部会 fallback 加载）
+- 字段变更场景：无 `tableDomains` 参数（内部 fallback 加载）
 - 记录变更场景：传入 `tableDomains` 参数
 
 可考虑统一参数传递，避免重复加载 TableDomain。
@@ -987,7 +1062,7 @@ Teable 的查找与汇总字段的值传播链路是一个**精心设计的分�
 2. **性能**: BFS 级联 + 批量 SQL 更新 + 分页策略，兼顾效率与内存
 3. **正确性**: 拓扑排序 + 版本号乐观锁 + 行级锁，保证并发安全
 4. **实时性**: ShareDB 实时推送，确保前端缓存及时失效
-5. **健壮性**: 11 种 ALL_RECORDS 兜底条件 + 对称链接预播种 + 条件边迭代收敛，确保极端场景下的正确性
+5. **健壮性**: 10 种 ALL_RECORDS 兜底条件（去重后） + 对称链接预播种 + 条件边迭代收敛，确保极端场景下的正确性
 
 **三大核心机制的协同作用**：
 - **ALL_RECORDS 触发**：在样本量过大、过滤器复杂、字段类型特殊或变更值不完整时，优雅降级为全表重算，避免内存溢出和 SQL 错误
@@ -995,7 +1070,7 @@ Teable 的查找与汇总字段的值传播链路是一个**精心设计的分�
 - **条件边迭代收敛**：通过单调增长的记录集和队列去重机制，确保条件汇总的跨表影响被完整传播
 
 **动态列名设计**：
-链接级联查询的列名通过 `ILinkEdge` 接口动态拼装，每个链接字段有独立的 junction table 和列名配置，避免硬编码，支持多租户架构。
+链接级联查询的列名通过 `ILinkEdge` 接口动态拼装，`fkHostTableName` 是 `baseDbName.tableDbName` 格式的限定名，通过 `formatQualifiedName` 转为 SQL 引用，每个链接字段有独立的 junction table 和列名配置，避免硬编码，支持多租户架构。
 
 **两条路径的差异化设计**：
 - **记录变更**：侧重精确性，通过 `changeContextMap` 实现变更前后双端过滤，最小化重算范围

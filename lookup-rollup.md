@@ -118,6 +118,15 @@ const ctxs = await this.prismaService.$tx(async () => {
 - 记录删除 (`RecordDeleteService`)
 - 字段定义变更（增/删/改）
 
+### 3.2 计算编排器的双入口模式
+
+**文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-orchestrator.service.ts:44-359`
+
+| 入口方法 | 触发时机 | 调用的收集器方法 |
+|---------|---------|----------------|
+| `computeCellChangesForRecords` | 记录数据变更 | `collector.collect()` |
+| `computeCellChangesForFields` | 字段定义变更 | `collector.collectForFieldChanges()` |
+
 ---
 
 ## 四、依赖收集与链路穿透
@@ -255,9 +264,296 @@ WHERE "__foreign_id" IN (recordIds)
 
 ---
 
-## 五、派生字段重算流程
+## 五、ALL_RECORDS 触发条件深度分析
 
-### 5.1 计算编排器 (ComputedOrchestratorService)
+### 5.1 ALL_RECORDS 的独立定义
+
+**注意**：`ALL_RECORDS` 在两个文件中独立定义，值均为 `Symbol('ALL_RECORDS')`：
+
+| 文件 | 行号 | 用途 |
+|------|------|------|
+| `link-cascade-resolver.ts` | 32 | 链接级联解析器内部使用 |
+| `computed-dependency-collector.service.ts` | 71 | 依赖收集器内部使用 |
+
+### 5.2 条件汇总 ALL_RECORDS 八大触发条件
+
+**文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-dependency-collector.service.ts:745-814`
+
+`getConditionalRollupImpactedRecordIds` 方法中有 **8 个明确的触发点**，按检查顺序排列：
+
+```typescript
+private async getConditionalRollupImpactedRecordIds(
+  edge: IConditionalRollupAdjacencyEdge,
+  foreignRecordIds: string[],
+  changeContextMap?: Map<string, ICellContext[]>,
+  ctx?: ICollectorExecutionContext
+): Promise<string[] | typeof ALL_RECORDS> {
+```
+
+| 触发条件 | 代码位置 | 判定逻辑 |
+|---------|---------|---------|
+| **① 样本量超限** | 755-757 | `uniqueForeignIds.length > MAX_CONDITIONAL_ROLLUP_SAMPLE` (阈值 = 10,000) |
+| **② 无过滤器** | 762-765 | `!filter` 条件汇总未配置过滤条件 |
+| **③ 无主机字段引用** | 767-770 | `!hostFieldRefs.length` 过滤器不引用主机表任何字段 |
+| **④ 无外键字段引用** | 772-774 | `foreignFieldIds.size === 0` 过滤器不引用外表任何字段 |
+| **⑤ 跨表引用** | 776-778 | 过滤器引用了非主机表的字段 (`ref.tableId && ref.tableId !== edge.tableId`) |
+| **⑥ 主机字段加载失败** | 780-784 | `hostFieldMap.size !== uniqueHostFieldIds.length` |
+| **⑦ 外键字段加载失败** | 786-793 | `foreignFieldMap.size !== foreignFieldIds.size` |
+| **⑧ JSON 类型字段** | 804-814 | 外表过滤字段的 `dbFieldType === DbFieldType.Json` |
+
+> **注意**：代码中第 ⑧ 项存在**重复检查**（804-808 行和 810-814 行），属于可优化的冗余代码。
+
+### 5.3 条件汇总 ALL_RECORDS 传播逻辑
+
+**文件**: `computed-dependency-collector.service.ts:1322-1370`
+
+当 `getConditionalRollupImpactedRecordIds` 返回 `ALL_RECORDS` 时：
+
+```typescript
+if (matched === ALL_RECORDS) {
+  const updated = this.markAllSeed(tablesWithAllRecords, edge.tableId);
+  if (updated) {
+    targetGroup.preferAutoNumberPaging = true;  // 启用游标分页
+    dirty = true;                              // 标记需要重新计算
+    enqueueConditional(edge.tableId);          // 加入处理队列
+    enqueueLinkDependents(edge.tableId);       // 传播到链接依赖
+  }
+}
+```
+
+### 5.4 字段变更场景的 ALL_RECORDS
+
+**文件**: `computed-dependency-collector.service.ts:1247-1251`
+
+在 `collectForFieldChanges`（字段定义变更）场景中：
+
+```typescript
+// 字段变更影响该表的 ALL 记录
+const tablesWithAllRecords = new Set<string>(originTableIds);
+```
+
+此时**源表的所有记录**都被标记为需要重算，因为字段定义变更可能影响每一行。
+
+---
+
+## 六、对称链接预播种机制
+
+### 6.1 对称链接字段解析
+
+**文件**: `computed-dependency-collector.service.ts:582-612`
+
+```typescript
+private async resolveRelatedLinkFieldIds(
+  fieldIds: string[],
+  fieldToTableMap?: Map<string, string>,
+  ctx?: ICollectorExecutionContext
+): Promise<string[]> {
+  // 遍历变更字段，找出其中的链接字段
+  for (const [tableId, ids] of groupedByTable) {
+    const tableDomain = await this.getTableDomain(tableId, ctx);
+    for (const id of ids) {
+      const field = tableDomain.getField(id);
+      if (!field || field.type !== FieldType.Link || field.isLookup) continue;
+      
+      result.add(field.id);  // 加入链接字段自身
+      
+      // 关键：解析对称链接字段ID
+      const opts = this.parseOptionsLoose<{ symmetricFieldId?: string }>(field.options);
+      if (opts?.symmetricFieldId) result.add(opts.symmetricFieldId);
+    }
+  }
+  return Array.from(result);
+}
+```
+
+### 6.2 对称链接记录预播种
+
+**文件**: `computed-dependency-collector.service.ts:1561-1629`
+
+```typescript
+// 找出变更中的链接字段
+const linkFields = currentTableDomain.fieldList.filter(
+  (field) => changedFieldIdSet.has(field.id) && field.type === FieldType.Link && !field.isLookup
+);
+
+// 预播种容器：按外表分组的记录ID集合
+const plannedForeignRecordIds: Record<string, Set<string>> = {};
+
+for (const lf of linkFields) {
+  const optsLoose = this.parseOptionsLoose<ILinkOptionsWithSymmetric>(lf.options);
+  const foreignTableId = optsLoose?.foreignTableId;
+  const symmetricFieldId = optsLoose?.symmetricFieldId;
+
+  if (foreignTableId && symmetricFieldId) {
+    // ① 将对称字段加入受影响字段集合
+    (impact[foreignTableId] ||= {
+      fieldIds: new Set<string>(),
+      recordIds: new Set<string>(),
+    }).fieldIds.add(symmetricFieldId);
+
+    // ② 从 oldValue 和 newValue 双端提取记录ID，覆盖添加和删除场景
+    const targetIds = new Set<string>();
+    for (const ctx of ctxs) {
+      if (ctx.fieldId !== lf.id) continue;
+      const toIds = (v: unknown) => {
+        if (!v) return [] as string[];
+        const arr = Array.isArray(v) ? v : [v];
+        return arr
+          .map((x) => (x && typeof x === 'object' ? (x as { id?: string }).id : undefined))
+          .filter((id): id is string => !!id);
+      };
+      toIds(ctx.oldValue).forEach((id) => targetIds.add(id));  // 移除的链接
+      toIds(ctx.newValue).forEach((id) => targetIds.add(id));  // 新增的链接
+    }
+    
+    // ③ 存入预播种容器
+    if (targetIds.size) {
+      const set = (plannedForeignRecordIds[foreignTableId] ||= new Set<string>());
+      targetIds.forEach((id) => set.add(id));
+    }
+  }
+}
+```
+
+### 6.3 预播种注入链接级联
+
+**文件**: `computed-dependency-collector.service.ts:1624-1629`
+
+```typescript
+const explicitSeeds = new Map<string, Set<string>>();
+explicitSeeds.set(tableId, new Set(changedRecordIds));  // 源表变更记录
+
+// 注入对称链接预播种的记录ID
+for (const [tid, ids] of Object.entries(plannedForeignRecordIds)) {
+  if (!ids.size) continue;
+  explicitSeeds.set(tid, new Set(ids));  // 外表预播种记录
+}
+```
+
+**设计意图**：
+- 对称链接的两端记录都需要更新，通过预播种确保 BFS 一开始就包含两端
+- 从 `oldValue` 和 `newValue` 双端提取，确保链接**添加**和**删除**都能触发重算
+
+---
+
+## 七、条件边迭代收敛机制
+
+### 7.1 迭代收敛完整流程
+
+**文件**: `computed-dependency-collector.service.ts:1257-1395`（字段变更场景）和 `1637-1778`（记录变更场景）
+
+两个场景的迭代算法**完全一致**，以下以记录变更场景为例：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  初始状态                                                           │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  1. 初始 computeLinkClosure 计算链接边传播                    │  │
+│  │  2. findRecordSetGrowth({}, recordSets) 检测初始增长           │  │
+│  │  3. 将有增长的表加入队列 queue                                 │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                            ↓                                        │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  while (queue.length)                                        │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │  src = queue.shift()                                   │  │  │
+│  │  │  处理该表的所有条件边 referenceEdges                   │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  │                            ↓                                  │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │  对每条条件边：                                         │  │  │
+│  │  │  • ALL_RECORDS: markAllSeed + dirty = true              │  │  │
+│  │  │  • 记录ID集合: addExplicitSeed + dirty = true           │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  │                            ↓                                  │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │  if (dirty)                                             │  │  │
+│  │  │  • 重新 computeLinkClosure 计算链接传播                 │  │  │
+│  │  │  • findRecordSetGrowth 检测新增记录                     │  │  │
+│  │  │  • 将新增长的表重新入队                                 │  │  │
+│  │  │  • recordSets = nextRecordSets                          │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                            ↓                                        │
+│  收敛：queue 为空，没有新的记录需要处理                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 记录集增长检测 (findRecordSetGrowth)
+
+**文件**: `computed-dependency-collector.service.ts:332-375`
+
+```typescript
+private findRecordSetGrowth(
+  previous: Record<string, Set<string> | typeof ALL_RECORDS | undefined>,
+  next: Record<string, Set<string> | typeof ALL_RECORDS>
+): string[] {
+  for (const tableId of tableIds) {
+    const prevSet = previous[tableId];
+    const nextSet = next[tableId];
+    
+    // 新增表 → 有增长
+    if (!prevSet) { changed.push(tableId); continue; }
+    
+    // 从部分记录升级为全表 → 有增长
+    if (prevSet !== ALL_RECORDS && nextSet === ALL_RECORDS) {
+      changed.push(tableId); continue;
+    }
+    
+    // 从全表降级为部分记录 → 不应该发生，忽略
+    if (prevSet === ALL_RECORDS && nextSet !== ALL_RECORDS) {
+      continue;
+    }
+    
+    // 记录集合有新增 → 有增长
+    if (prevSet instanceof Set && nextSet instanceof Set) {
+      if (nextSet.size > prevSet.size) { changed.push(tableId); continue; }
+      for (const id of nextSet) {
+        if (!prevSet.has(id)) { hasNew = true; break; }
+      }
+      if (hasNew) changed.push(tableId);
+    }
+  }
+  return changed;
+}
+```
+
+### 7.3 去重入队机制
+
+**文件**: `computed-dependency-collector.service.ts:1267-1278`
+
+```typescript
+const queued = new Set<string>();  // 防重集合
+
+const enqueueConditional = (tableId: string) => {
+  if (!tableId || queued.has(tableId)) return;  // 已在队列中，跳过
+  queued.add(tableId);
+  queue.push(tableId);
+};
+
+const enqueueLinkDependents = (tableId: string) => {
+  const targets = linkAdj[tableId];
+  if (!targets) return;
+  targets.forEach((tid) => enqueueConditional(tid));  // 传播到链接依赖表
+};
+```
+
+### 7.4 收敛判定
+
+迭代收敛发生在：
+1. `queue.length === 0` —— 没有新的表需要处理
+2. 每次迭代中 `dirty === false` —— 没有新的记录ID被发现
+
+**收敛保证**：
+- 每次迭代只可能增加记录ID（单调增长）
+- 记录ID总数有限（不会超过表的总行数）
+- 因此迭代必定在有限步骤内收敛
+
+---
+
+## 八、派生字段重算流程
+
+### 8.1 计算编排器 (ComputedOrchestratorService)
 
 **文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-orchestrator.service.ts:23-528`
 
@@ -280,11 +576,11 @@ async computeCellChangesForRecords(...) {
 }
 ```
 
-### 5.2 计算评估器 (ComputedEvaluatorService)
+### 8.2 计算评估器 (ComputedEvaluatorService)
 
 **文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-evaluator.service.ts:28-200`
 
-#### 5.2.1 拓扑分层
+#### 8.2.1 拓扑分层
 
 ```typescript
 private async buildFieldLayers(entries: ...) {
@@ -302,7 +598,7 @@ private async buildFieldLayers(entries: ...) {
 }
 ```
 
-#### 5.2.2 分页执行策略
+#### 8.2.2 分页执行策略
 
 ```typescript
 // 策略选择
@@ -327,7 +623,7 @@ for (const layer of layers) {
 }
 ```
 
-### 5.3 SQL 更新执行 (RecordComputedUpdateService)
+### 8.3 SQL 更新执行 (RecordComputedUpdateService)
 
 **文件**: `apps/nestjs-backend/src/features/record/computed/services/record-computed-update.service.ts:18-243`
 
@@ -356,9 +652,9 @@ async updateFromSelect(tableId: string, qb: Knex.QueryBuilder, fields: IFieldIns
 
 ---
 
-## 六、缓存失效机制
+## 九、缓存失效机制
 
-### 6.1 版本号机制
+### 9.1 版本号机制
 
 ```sql
 -- 每次更新自动递增版本号
@@ -367,7 +663,7 @@ __version = __version + 1
 
 **文件**: `apps/nestjs-backend/src/features/record/computed/services/record-computed-update.service.ts:164-176`
 
-### 6.2 ShareDB 实时发布
+### 9.2 ShareDB 实时发布
 
 **文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-evaluator.service.ts:130-140`
 
@@ -390,7 +686,7 @@ await strategy.run(paginationContext, async (rows) => {
 - 通过 WebSocket 推送到前端
 - 前端据此更新本地缓存
 
-### 6.3 失效传播链
+### 9.3 失效传播链
 
 ```
 源记录更新 → 版本号+1 → ShareDB Op发布
@@ -404,64 +700,38 @@ await strategy.run(paginationContext, async (rows) => {
 
 ---
 
-## 七、条件汇总/条件查找的特殊处理
+## 十、关键设计决策
 
-### 7.1 条件汇总的受影响记录判定
-
-**文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-dependency-collector.service.ts:745-1058`
-
-```typescript
-private async getConditionalRollupImpactedRecordIds(
-  edge: IConditionalRollupAdjacencyEdge,
-  foreignRecordIds: string[],
-  changeContextMap?: Map<string, ICellContext[]>,
-  ctx?: ICollectorExecutionContext
-): Promise<string[] | typeof ALL_RECORDS> {
-  // 对变更前后的值都应用过滤器，取并集
-  // 1. 使用原始值查询哪些主机记录受影响
-  // 2. 使用更新后的值查询哪些主机记录受影响
-  // 3. 合并结果集
-  
-  // 如果过滤器引用了主机表字段，则需要 EXISTS 子查询
-  const existsSubquery = this.dataKnex
-    .select(this.dataKnex.raw('1'))
-    .from(foreignFrom())
-    .join(VALUES 子查询)
-    .where(filter);  // 应用条件汇总的过滤器
-  
-  const queryBuilder = this.dataKnex
-    .select(`"__host"."__id" as id`)
-    .from(`${hostTableName} as __host`)
-    .whereExists(existsSubquery);
-}
-```
-
----
-
-## 八、关键设计决策
-
-### 8.1 双重依赖追踪
+### 10.1 双重依赖追踪
 
 | 机制 | 优点 | 缺点 |
 |------|-----|-----|
 | reference 表 SQL CTE | 高效，支持任意深度递归 | 依赖数据完整性，历史数据可能缺失 |
 | lookup_options 查询 | 准确，直接匹配字段配置 | 仅支持一层 lookup，需要递归补充 |
 
-### 8.2 ALL_RECORDS 标记
+### 10.2 ALL_RECORDS 标记
 
-避免全表记录ID物化，当变更影响范围超过阈值（10000条）时，直接标记为全表重算。
+避免全表记录ID物化，当条件汇总样本量超过阈值（**10,000 条**，由 `MAX_CONDITIONAL_ROLLUP_SAMPLE` 定义）或其他 7 种条件触发时，直接标记为全表重算。
 
-### 8.3 拓扑分层执行
+### 10.3 对称链接双端预播种
+
+从 `oldValue` 和 `newValue` 两端提取记录ID，确保链接的**添加**和**删除**都能正确触发对称链接端的重算。
+
+### 10.4 条件边迭代收敛
+
+通过 `dirty` 标志 + `findRecordSetGrowth` 检测 + 重新 `computeLinkClosure` 的循环，确保条件汇总的跨表影响被完整传播，直到没有新记录发现为止。
+
+### 10.5 拓扑分层执行
 
 确保依赖字段按正确顺序计算，避免读取到过期值。
 
-### 8.4 基于 SQL 的批量更新
+### 10.6 基于 SQL 的批量更新
 
 相比逐行更新，`UPDATE FROM SELECT` 性能提升显著，且保证原子性。
 
 ---
 
-## 九、代码优化建议
+## 十一、代码优化建议
 
 ### 潜在问题 1: 重复的 JSON 类型检查
 
@@ -488,9 +758,13 @@ if (
 
 `buildSortFieldAccessor` 和 `applySortFieldFilter` 方法可提取为通用工具函数，供条件汇总和条件查找共享。
 
+### 潜在问题 3: ALL_RECORDS 符号重复定义
+
+`ALL_RECORDS` 在 `link-cascade-resolver.ts:32` 和 `computed-dependency-collector.service.ts:71` 分别定义，可考虑提取为共享常量。
+
 ---
 
-## 十、总结
+## 十二、总结
 
 Teable 的查找与汇总字段的值传播链路是一个**精心设计的分布式计算管道**，其核心优势在于：
 
@@ -498,5 +772,11 @@ Teable 的查找与汇总字段的值传播链路是一个**精心设计的分�
 2. **性能**: BFS 级联 + 批量 SQL 更新 + 分页策略，兼顾效率与内存
 3. **正确性**: 拓扑排序 + 版本号乐观锁 + 行级锁，保证并发安全
 4. **实时性**: ShareDB 实时推送，确保前端缓存及时失效
+5. **健壮性**: 8 种 ALL_RECORDS 兜底条件 + 对称链接预播种 + 条件边迭代收敛，确保极端场景下的正确性
+
+**三大核心机制的协同作用**：
+- **ALL_RECORDS 触发**：在样本量过大、过滤器复杂或字段类型特殊时，优雅降级为全表重算，避免内存溢出和 SQL 错误
+- **对称链接预播种**：通过 oldValue/newValue 双端提取，确保链接关系变更的两端都能被正确处理
+- **条件边迭代收敛**：通过单调增长的记录集和队列去重机制，确保条件汇总的跨表影响被完整传播
 
 该架构成功解决了多维表格中跨表引用、派生字段重算、缓存一致性等核心难题，为复杂数据模型提供了可靠的计算基础设施。

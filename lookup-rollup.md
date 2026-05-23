@@ -11,13 +11,14 @@ Teable 的查找(Lookup)与汇总(Rollup)字段的值传播采用**分层架构*
                                                           ↓
                                          计算评估器(ComputedEvaluator) → SQL更新
                                                           ↓
-                                         ShareDB实时发布 → 前端缓存失效
+                                         saveRawOps 存入 CLS → 事务提交发布 → 前端缓存失效
 ```
 
 **关键文件位置：**
 - 字段模型: `packages/core/src/models/field/derivate/`
 - 计算编排: `apps/nestjs-backend/src/features/record/computed/services/`
 - 引用图: `apps/nestjs-backend/src/features/calculation/reference.service.ts`
+- BatchService: `apps/nestjs-backend/src/features/calculation/batch.service.ts`
 
 ---
 
@@ -75,7 +76,43 @@ getRollupFields(tableDomain: TableDomain): FieldCore[] {
 }
 ```
 
-### 2.3 查找选项模式 (Lookup Options)
+### 2.3 链接关系类型 (LinkRelationship)
+
+**文件**: `packages/v2/field-dependency-core/src/types.ts:82`
+
+```typescript
+export type LinkRelationship = 'oneMany' | 'manyOne' | 'oneOne' | 'manyMany';
+```
+
+**重要修正**：链接字段支持**四种关系类型**，不只是 `manyMany`。不同关系类型的存储模型有本质区别，需要明确表述边界：
+
+| 关系类型 | 说明 | 存储模型 | fkHostTableName 指向 | selfKeyName | foreignKeyName |
+|---------|------|---------|-------------------|-------------|---------------|
+| `manyMany` | 多对多 | **独立 junction table** | junction table 限定名 | 对称字段ID | 当前字段ID |
+| `manyOne` | 多对一 | **当前表加外键列** | 当前表 dbTableName | `__id` | 外键列名 |
+| `oneOne` | 一对一 | **当前表加外键列** | 当前表 dbTableName | `__id` | 外键列名 |
+| `oneMany` (非单向) | 一对多（双向） | **外表加外键列** | 外表 foreignTableName | 外键列名 | `__id` |
+| `oneMany` (单向) | 一对多（单向） | **独立 junction table** | junction table 限定名 | 对称字段ID | 当前字段ID |
+
+**关键结论**：
+- ✅ `manyMany` 和 单向 `oneMany`：使用独立的 junction table
+- ❌ `manyOne`、`oneOne`、双向 `oneMany`：**不使用** junction table，而是在现有表上加外键列
+
+**链接选项配置**（`packages/v2/field-dependency-core/src/types.ts:101-109`）：
+```typescript
+export interface ParsedLinkOptions {
+  foreignTableId: string;
+  lookupFieldId: string;
+  isOneWay?: boolean;
+  symmetricFieldId?: string;
+  /** FK host table name (format: baseDbName.tableDbName) */
+  fkHostTableName?: string;
+  /** Link relationship type */
+  relationship?: LinkRelationship;
+}
+```
+
+### 2.4 查找选项模式 (Lookup Options)
 
 **文件**: `packages/core/src/models/field/lookup-options-base.schema.ts:7-235`
 
@@ -232,10 +269,12 @@ edges.push({
 });
 ```
 
-**fkHostTableName 与 junction table 的关系**：
-- `fkHostTableName` 是 junction table 的**限定名**，格式为 `baseDbName.tableDbName`（例如 `bse000000000000000000.tbl000000000000000000`）
+**fkHostTableName 与存储模型的关系**（表述边界修正）：
+- `fkHostTableName` 是**外键所在表的限定名**，格式为 `baseDbName.tableDbName`，**不一定是 junction table**
 - `formatQualifiedName` 方法将其按 `.` 分割，分别用双引号包裹，形成真正的 SQL 引用：`"baseDbName"."tableDbName"`
-- 每个链接字段有独立的 junction table，用于存储多对多关系
+- 仅当 `manyMany` 或 单向 `oneMany` 时，`fkHostTableName` 才指向独立的 junction table
+- 对于 `manyOne`、`oneOne`、双向 `oneMany`，`fkHostTableName` 指向**现有业务表**，通过外键列存储链接关系
+- 链接级联查询时，`fetchEdgeTargets` 通过动态的 `selfKeyName` 和 `foreignKeyName` 正确访问不同存储模型
 
 **限定名拼装**（`link-cascade-resolver.ts:221-226`）：
 ```typescript
@@ -842,7 +881,244 @@ for (const layer of layers) {
 }
 ```
 
-### 8.3 SQL 更新执行 (RecordComputedUpdateService)
+### 8.3 publishBatch 与 saveRawOps 调用链（真实字段结构）
+
+**重要修正**：`publishBatch` 不直接发布 ops，而是通过 `batchService.saveRawOps` 存入 CLS 上下文，在事务提交时才真正发布。
+
+**完整调用链与数据结构**：
+```
+computed-evaluator.service.ts:publishBatch()
+    │
+    ├─ 输入: evaluatedRows = [{ recordId, version, prevVersion, fields }]
+    │
+    ├─ 为每个字段构建 JSON0 Op: { p: ['fields', fid], oi: newValue, od: oldValue }
+    │
+    ├─ 组装 opDataList: [{ docId, version: prevVersion ?? version, data: ops[] }]
+    │
+    ↓
+batch.service.ts:saveRawOps(collectionId, RawOpType.Edit, IdPrefix.Record, dataList)
+    │
+    ├─ collection = `${docType}_${collectionId}`  // "rec_tbl000..."
+    │
+    ├─ 构建 rawOpMap: {
+    │     [collection]: {
+    │       [docId]: {
+    │         src: 'xxx',      // CLS 请求ID
+    │         seq: 1,
+    │         m: { ts: 123 }, // 时间戳
+    │         op: IOtOperation[],  // JSON0 操作数组
+    │         v: version     // 文档版本号
+    │       }
+    │     }
+    │   }
+    │
+    ↓
+存入 cls.get('tx.rawOpMaps') → 事务提交时从 CLS 取出批量发布
+```
+
+#### 8.3.1 publishBatch 完整实现（真实字段结构）
+
+**文件**: `computed-evaluator.service.ts:337-388`
+
+```typescript
+private publishBatch(
+  tableId: string,
+  impactedFieldIds: Set<string>,
+  validFieldIds: Set<string>,
+  excludeFieldIds: Set<string>,
+  evaluatedRows: Array<{
+    recordId: string;    // 记录ID
+    version: number;     // 更新后的新版本号（__version + 1）
+    prevVersion?: number;// 更新前的旧版本号（__version）
+    fields: Record<string, unknown>;  // 字段ID -> 新值
+  }>
+): number {
+  if (!evaluatedRows.length) return 0;
+
+  const targetFieldIds = Array.from(impactedFieldIds).filter(
+    (fid) => validFieldIds.has(fid) && !excludeFieldIds.has(fid)
+  );
+  if (!targetFieldIds.length) return 0;
+
+  const opDataList = evaluatedRows
+    .map(({ recordId, version, prevVersion, fields }) => {
+      const ops = targetFieldIds
+        .map((fid) => {
+          const hasValue = Object.prototype.hasOwnProperty.call(fields, fid);
+          const newCellValue = hasValue ? fields[fid] : null;
+          // 构建 JSON0 OT 操作，oldCellValue 固定为 null
+          return RecordOpBuilder.editor.setRecord.build({
+            fieldId: fid,
+            newCellValue,
+            oldCellValue: null,
+          });
+        })
+        .filter(Boolean) as IOtOperation[];
+
+      if (!ops.length) return null;
+
+      // 版本号优先级：prevVersion（更新前） > version（更新后）
+      const opVersion = prevVersion ?? version;
+
+      return { 
+        docId: recordId,    // 文档ID = 记录ID
+        version: opVersion, // ShareDB 操作的基线版本
+        data: ops,          // JSON0 操作数组
+        count: ops.length   // 操作计数
+      } as const;
+    })
+    .filter(Boolean) as { docId: string; version: number; data: IOtOperation[]; count: number }[];
+
+  if (!opDataList.length) return 0;
+
+  // 调用 saveRawOps 存入 CLS 上下文
+  this.batchService.saveRawOps(
+    tableId,
+    RawOpType.Edit,
+    IdPrefix.Record,
+    opDataList.map(({ docId, version, data }) => ({ docId, version, data }))
+  );
+
+  return opDataList.reduce((sum, current) => sum + current.count, 0);
+}
+```
+
+#### 8.3.2 SetRecordBuilder 构建 JSON0 Op（真实三种形式）
+
+**文件**: `packages/core/src/op-builder/record/set-record.ts:5-43`
+
+**Op 上下文接口**：
+```typescript
+export interface ISetRecordOpContext {
+  name: OpName.SetRecord;
+  fieldId: string;
+  newCellValue: unknown;
+  oldCellValue: unknown;
+}
+```
+
+**JSON0 Op 真实构建逻辑**（三种形式）：
+```typescript
+build(params: { fieldId: string; newCellValue: unknown; oldCellValue: unknown }): IOtOperation {
+  const { fieldId } = params;
+  let { newCellValue, oldCellValue } = params;
+  newCellValue = newCellValue ?? null;
+  oldCellValue = oldCellValue ?? null;
+
+  // 1. 新值为 null 或空数组 → 删除键（od + oi: null）
+  if (newCellValue == null || (Array.isArray(newCellValue) && newCellValue.length === 0)) {
+    return {
+      p: ['fields', fieldId],  // path: ["fields", "fldxxx"]
+      od: oldCellValue,        // old delete: 被删除的旧值
+      oi: null,                // old insert: 标记为删除
+    };
+  }
+
+  // 2. 旧值为 null → 插入键（仅 oi）
+  if (oldCellValue == null) {
+    return {
+      p: ['fields', fieldId],
+      oi: newCellValue,        // old insert: 插入的新值
+    };
+  }
+
+  // 3. 新旧值都存在 → 替换（od + oi）
+  return {
+    p: ['fields', fieldId],
+    od: oldCellValue,        // old delete: 被替换的旧值
+    oi: newCellValue,        // old insert: 新值
+  };
+}
+```
+
+#### 8.3.3 saveRawOps 完整实现（真实字段结构）
+
+**文件**: `batch.service.ts:458-519`
+
+```typescript
+@Timing()
+saveRawOps(
+  collectionId: string,    // 表ID
+  opType: RawOpType,       // Create | Edit | Del
+  docType: IdPrefix,       // Record = "rec"
+  dataList: { docId: string; version: number; data?: unknown }[]
+) {
+  // collection 命名: "rec_tbl000000000000000000"
+  const collection = `${docType}_${collectionId}`;
+  const rawOpMap: IRawOpMap = { [collection]: {} };
+
+  // 基础元数据
+  const baseRaw = {
+    src: this.cls.getId() || 'unknown',  // 请求来源ID
+    seq: 1,                              // 序列号
+    m: {
+      ts: Date.now(),                    // 时间戳
+    },
+  };
+
+  this.logger.verbose(`saveOp: ${baseRaw.src}-${collection}`);
+
+  dataList.forEach(({ docId, version, data }) => {
+    let rawOp: IRawOp;
+    if (opType === RawOpType.Create) {
+      rawOp = {
+        ...baseRaw,
+        create: {
+          type: 'json0',
+          data,
+        },
+        v: version,    // 版本号
+      };
+    } else if (opType === RawOpType.Del) {
+      rawOp = {
+        ...baseRaw,
+        del: true,
+        v: version,
+      };
+    } else if (opType === RawOpType.Edit) {
+      rawOp = {
+        ...baseRaw,
+        op: data as IOtOperation[],  // JSON0 OT 操作数组
+        v: version,                  // 基线版本号
+      };
+    } else {
+      throw new CustomHttpException(...);
+    }
+    rawOpMap[collection][docId] = rawOp;
+  });
+
+  // 存入 CLS 上下文，事务提交时发布
+  const prevMap = this.cls.get('tx.rawOpMaps') || [];
+  prevMap.push(rawOpMap);
+  this.cls.set('tx.rawOpMaps', prevMap);
+  return rawOpMap;
+}
+```
+
+#### 8.3.4 IOtOperation 完整接口
+
+**文件**: `packages/core/src/models/op.ts:5-15`
+
+```typescript
+// ot-type from https://github.com/ottypes/json0
+export type IOTPath = (string | number)[];
+
+export interface IOtOperation {
+  p: IOTPath;           // path: (string | number)[]
+  na?: number;          // number add
+  li?: any;             // list insert
+  ld?: any;             // list delete
+  lm?: number;          // list move
+  oi?: any;             // object insert
+  od?: any;             // object delete
+  si?: string;          // string insert
+  sd?: string;          // string delete
+  t?: string;           // type
+  o?: any;              // object (额外字段)
+}
+```
+
+### 8.4 SQL 更新执行 (RecordComputedUpdateService)
 
 **文件**: `apps/nestjs-backend/src/features/record/computed/services/record-computed-update.service.ts:18-243`
 
@@ -873,68 +1149,173 @@ async updateFromSelect(tableId: string, qb: Knex.QueryBuilder, fields: IFieldIns
 
 ## 九、缓存失效机制
 
-### 9.1 代码可证实事实
+### 9.1 代码可证实事实（逐条校验结果）
 
-以下内容有明确的代码证据支持：
+以下内容均已在源码中定位，每条事实标注精确的文件和行号：
+
+---
 
 #### 9.1.1 版本号自增机制
 
-**文件**: `apps/nestjs-backend/src/features/record/computed/services/record-computed-update.service.ts:164-176`
+✅ **校验通过**：有两处独立实现，均可在源码中定位
 
-```sql
--- 每次更新自动递增版本号
-__version = __version + 1
-```
-
-**证据**：`updateFromSelect` 方法将 `__version + 1` 包含在 UPDATE 语句的 SET 子句中，每次更新都会自增。
-
-#### 9.1.2 ShareDB Op 发布
-
-**文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-evaluator.service.ts:337-365`
+**证据 1 - SQL UPDATE 语句中的版本自增**：
+**精确位置**: `apps/nestjs-backend/src/db-provider/postgres.provider.ts:474-475`
 
 ```typescript
-private publishBatch(
-  tableId: string,
-  impactedFieldIds: Set<string>,
-  validFieldIds: Set<string>,
-  excludeFieldIds: Set<string>,
-  evaluatedRows: Array<{ recordId: string; version: number; prevVersion?: number; fields: Record<string, unknown> }>
-): number {
-  const ops = evaluatedRows.flatMap(({ recordId, version, prevVersion, fields }) => {
-    return Array.from(impactedFieldIds)
-      .filter((fid) => validFieldIds.has(fid) && !excludeFieldIds.has(fid))
-      .map((fid) => {
-        const hasValue = Object.prototype.hasOwnProperty.call(fields, fid);
-        const newCellValue = hasValue ? fields[fid] : null;
-        return RecordOpBuilder.editor.setRecord.build({
-          fieldId: fid,
-          newCellValue,
-          oldCellValue: null,
-          recordId,
-          tableId,
-          extraData: { __version: version },
-        });
-      });
-  });
-  
-  this.opStreamHub.publish(ops);
-  return ops.length;
+// bump version on target table; qualify to avoid ambiguity with FROM subquery columns
+updateColumns['__version'] = this.knex.raw('?? + 1', [`${dbTableName}.__version`]);
+```
+
+**证据 2 - BatchService 批量更新中的版本自增**：
+**精确位置**: `apps/nestjs-backend/src/features/calculation/batch.service.ts:440-442`
+
+```typescript
+return {
+  id: recordId,
+  values: {
+    ...Object.entries(updateParam).reduce<{ [dbFieldName: string]: unknown }>(...),
+    __version: version + 1,  // 版本号自增
+  },
+};
+```
+
+**证据 3 - RETURNING 子句返回旧版本号**：
+**精确位置**: `apps/nestjs-backend/src/db-provider/postgres.provider.ts:482-484`
+
+```typescript
+// also return previous version for ShareDB op version alignment
+const returningAll = [
+  ...qualifiedReturning,
+  this.knex.raw('?? - 1 as __prev_version', [`${dbTableName}.__version`]),
+];
+```
+
+**校验结论**：每次数据库更新时 `__version` 都会自增，有三处独立代码证据。
+
+---
+
+#### 9.1.2 publishBatch 调用 saveRawOps
+
+✅ **校验通过**：调用链完整可追踪
+
+**精确位置**: `apps/nestjs-backend/src/features/record/computed/services/computed-evaluator.service.ts:379-385`
+
+```typescript
+this.batchService.saveRawOps(
+  tableId,
+  RawOpType.Edit,
+  IdPrefix.Record,
+  opDataList.map(({ docId, version, data }) => ({ docId, version, data }))
+);
+```
+
+**调用上下文**（`computed-evaluator.service.ts:132-140`）：
+```typescript
+await strategy.run(paginationContext, async (rows) => {
+  if (!rows.length) return;
+  const evaluatedRows = this.buildEvaluatedRows(rows, fieldInstances);
+  totalOps += this.publishBatch(
+    tableId,
+    impactedFieldIds,
+    validFieldIdSet,
+    excludeFieldIds,
+    evaluatedRows
+  );
+});
+```
+
+**校验结论**：`publishBatch` 确实调用 `saveRawOps`，而非直接发布。
+
+---
+
+#### 9.1.3 saveRawOps 存入 CLS 上下文
+
+✅ **校验通过**：有明确的 CLS 存取代码
+
+**精确位置**: `apps/nestjs-backend/src/features/calculation/batch.service.ts:514-518`
+
+```typescript
+// 存入 CLS 上下文，事务提交时发布
+const prevMap = this.cls.get('tx.rawOpMaps') || [];
+prevMap.push(rawOpMap);
+this.cls.set('tx.rawOpMaps', prevMap);
+return rawOpMap;
+```
+
+**CLS 键名**: `tx.rawOpMaps`（数组类型，每个元素是一个 `IRawOpMap`）
+
+**校验结论**：ops 被存入 CLS 的 `tx.rawOpMaps` 键下，事务提交时才真正发布。
+
+---
+
+#### 9.1.4 Op 结构为 JSON0 格式
+
+✅ **校验通过**：有接口定义和构建代码双重证据
+
+**接口定义精确位置**: `packages/core/src/models/op.ts:1-17`
+
+```typescript
+// ot-type from https://github.com/ottypes/json0
+export type IOTPath = (string | number)[];
+
+export interface IOtOperation {
+  p: IOTPath;           // path: (string | number)[]
+  na?: number;          // number add
+  li?: any;             // list insert
+  ld?: any;             // list delete
+  lm?: number;          // list move
+  oi?: any;             // object insert
+  od?: any;             // object delete
+  si?: string;          // string insert
+  sd?: string;          // string delete
+  t?: string;           // type
+  o?: any;              // object (额外字段)
 }
 ```
 
-**证据**：
-- `publishBatch` 方法构造 `setRecord` 类型的 ShareDB ops
-- 每个 op 包含 `fieldId`、`newCellValue`、`recordId`、`tableId` 和 `__version`
-- 通过 `opStreamHub.publish(ops)` 实时发布
+**Op 构建精确位置**: `packages/core/src/op-builder/record/set-record.ts:15-43`
 
-#### 9.1.3 evaluatedRows 结构
+```typescript
+build(params: { fieldId: string; newCellValue: unknown; oldCellValue: unknown }): IOtOperation {
+  // 1. 新值为 null 或空数组 → 删除键
+  if (newCellValue == null || (Array.isArray(newCellValue) && newCellValue.length === 0)) {
+    return {
+      p: ['fields', fieldId],  // path: ["fields", "fldxxx"]
+      od: oldCellValue,        // old delete: 被删除的旧值
+      oi: null,                // old insert: 标记为删除
+    };
+  }
+  // 2. 旧值为 null → 插入键
+  if (oldCellValue == null) {
+    return {
+      p: ['fields', fieldId],
+      oi: newCellValue,
+    };
+  }
+  // 3. 新旧值都存在 → 替换
+  return {
+    p: ['fields', fieldId],
+    od: oldCellValue,
+    oi: newCellValue,
+  };
+}
+```
 
-**文件**: `apps/nestjs-backend/src/features/record/computed/services/computed-evaluator.service.ts:312-334`
+**校验结论**：Op 确实是标准 JSON0 格式，包含 `p`（path）、`oi`（object insert）、`od`（object delete）等字段。
+
+---
+
+#### 9.1.5 evaluatedRows 包含 version 和 prevVersion
+
+✅ **校验通过**：有构建逻辑和使用逻辑双重证据
+
+**构建逻辑精确位置**: `apps/nestjs-backend/src/features/record/computed/services/computed-evaluator.service.ts:304-335`
 
 ```typescript
 private buildEvaluatedRows(
-  rows: unknown[],
-  fieldInstances: Map<string, IFieldInstance>
+  rows: Array<IComputedRowResult>,
+  fieldInstances: IFieldInstance[]
 ): Array<{
   recordId: string;
   version: number;
@@ -943,14 +1324,110 @@ private buildEvaluatedRows(
 }> {
   return rows.map((row) => {
     const recordId = row.__id;
-    const version = row.__version as number;
-    const prevVersion = row.__prev_version as number | undefined;
+    const version = row.__version as number;           // 更新后的新版本号
+    const prevVersion = row.__prev_version as number | undefined;  // 更新前的旧版本号
     // ... 构建 fields 映射 ...
+    return { recordId, version, prevVersion, fields: fieldsMap };
   });
 }
 ```
 
-**证据**：每个评估后的行包含 `__version`（新版本号）和 `__prev_version`（旧版本号）。
+**使用逻辑精确位置**: `apps/nestjs-backend/src/features/record/computed/services/computed-evaluator.service.ts:354-376`
+
+```typescript
+const opDataList = evaluatedRows
+  .map(({ recordId, version, prevVersion, fields }) => {
+    // ... 构建 ops ...
+    const opVersion = prevVersion ?? version;  // 优先使用旧版本号作为基线
+    return { docId: recordId, version: opVersion, data: ops, count: ops.length };
+  })
+```
+
+**校验结论**：`evaluatedRows` 确实包含 `version`（新）和 `prevVersion`（旧），优先使用 `prevVersion` 作为 op 的基线版本号。
+
+---
+
+#### 9.1.6 ISetRecordOpContext 字段结构
+
+✅ **校验通过**：接口定义完整
+
+**精确位置**: `packages/core/src/op-builder/record/set-record.ts:5-11`
+
+```typescript
+export interface ISetRecordOpContext {
+  name: OpName.SetRecord;
+  fieldId: string;
+  newCellValue: unknown;
+  oldCellValue: unknown;
+}
+```
+
+**detect 方法精确位置**: `packages/core/src/op-builder/record/set-record.ts:45-59`
+
+```typescript
+detect(op: IOtOperation): ISetRecordOpContext | null {
+  const { p, oi, od } = op;
+  const result = pathMatcher<{ fieldId: string }>(p, ['fields', ':fieldId']);
+  if (!result) return null;
+  return {
+    name: this.name,
+    fieldId: result.fieldId,
+    newCellValue: oi,
+    oldCellValue: od,
+  };
+}
+```
+
+**校验结论**：接口包含 `name`、`fieldId`、`newCellValue`、`oldCellValue` 四个字段，`detect` 方法验证了字段对应关系。
+
+---
+
+#### 9.1.7 __prev_version 的来源
+
+✅ **校验通过**：SQL 层面计算旧版本号
+
+**精确位置**: `apps/nestjs-backend/src/db-provider/postgres.provider.ts:479-484`
+
+```typescript
+// also return previous version for ShareDB op version alignment
+const returningAll = [
+  ...qualifiedReturning,
+  // Unqualified reference to target table column to avoid FROM-clause issues
+  this.knex.raw('?? - 1 as __prev_version', [`${dbTableName}.__version`]),
+];
+```
+
+**SQL 语义**：`__version - 1 as __prev_version`，即通过新版本号减 1 得到旧版本号。
+
+**校验结论**：`__prev_version` 是在 SQL RETURNING 子句中通过 `__version - 1` 计算得出的。
+
+---
+
+#### 9.1.8 版本号在 RETURNING 子句中的返回
+
+✅ **校验通过**：新版本号和旧版本号同时返回
+
+**精确位置**: `apps/nestjs-backend/src/db-provider/postgres.provider.ts:477-484`
+
+```typescript
+const returningCols = [idFieldName, '__version', ...(returningDbFieldNames || dbFieldNames)];
+const qualifiedReturning = returningCols.map((c) => this.knex.ref(`${dbTableName}.${c}`));
+// also return previous version for ShareDB op version alignment
+const returningAll = [
+  ...qualifiedReturning,
+  this.knex.raw('?? - 1 as __prev_version', [`${dbTableName}.__version`]),
+];
+```
+
+**返回字段顺序**：
+1. `idFieldName` (`__id`)
+2. `__version`（更新后的新版本号）
+3. 其他业务字段
+4. `__prev_version`（更新前的旧版本号，通过计算得出）
+
+**校验结论**：UPDATE 语句的 RETURNING 子句同时返回新旧版本号，供后续 ShareDB op 使用。
+
+---
 
 ### 9.2 推断（合理推测）
 
@@ -958,7 +1435,7 @@ private buildEvaluatedRows(
 
 #### 9.2.1 前端缓存失效机制
 
-**推测**：前端接收到 ShareDB `setRecord` op 后，通过 `__version` 匹配失效本地缓存。
+**推测**：前端接收到 ShareDB op 后，通过 `__version` 匹配失效本地缓存。
 
 **推理依据**：
 - Op 中携带了最新的 `__version`（来自数据库自增后的值）
@@ -969,7 +1446,7 @@ private buildEvaluatedRows(
 
 **推测**：完整的缓存失效链为：
 ```
-源记录更新 → 版本号+1 → ShareDB Op发布 → 前端缓存匹配版本号 → 失效本地缓存 → 触发重新查询/渲染
+源记录更新 → 版本号+1 → SQL UPDATE → saveRawOps 存入 CLS → 事务提交发布 → WebSocket推送 → 前端接收Op → 版本号匹配 → 失效本地缓存 → 触发重新查询/渲染
 ```
 
 **推理依据**：
@@ -1011,9 +1488,18 @@ private buildEvaluatedRows(
 ### 10.7 动态列名拼装
 
 链接级联查询的列名通过 `ILinkEdge` 接口的 `selfKeyName`、`foreignKeyName`、`fkTableName` 动态读取自链接字段配置：
-- `fkHostTableName` 是 `baseDbName.tableDbName` 格式的限定名
+- `fkHostTableName` 是 `baseDbName.tableDbName` 格式的限定名，**不一定是 junction table**
 - 通过 `formatQualifiedName` 转为 `"baseDbName"."tableDbName"` 的 SQL 引用
+- `selfKeyName` 和 `foreignKeyName` 根据关系类型动态变化：`__id` 或外键列名（`__fk_fldxxx`）
+- 仅 `manyMany` 和 单向 `oneMany` 使用独立 junction table，其他关系类型复用现有业务表
 - 避免硬编码，支持多租户和灵活的数据库架构
+
+### 10.8 CLS 延迟发布
+
+通过 `saveRawOps` 将 ops 存入 CLS 上下文，在事务提交时才真正发布，确保：
+- 原子性：事务提交失败时不会发布部分变更
+- 性能：批量发布减少推送次数
+- 一致性：确保数据库状态和发布的 ops 一致
 
 ---
 
@@ -1061,7 +1547,7 @@ Teable 的查找与汇总字段的值传播链路是一个**精心设计的分�
 1. **完整性**: 通过 reference 表 + lookup_options 双重机制确保依赖不遗漏
 2. **性能**: BFS 级联 + 批量 SQL 更新 + 分页策略，兼顾效率与内存
 3. **正确性**: 拓扑排序 + 版本号乐观锁 + 行级锁，保证并发安全
-4. **实时性**: ShareDB 实时推送，确保前端缓存及时失效
+4. **实时性**: CLS 延迟发布 + ShareDB 推送，确保前端缓存及时失效
 5. **健壮性**: 10 种 ALL_RECORDS 兜底条件（去重后） + 对称链接预播种 + 条件边迭代收敛，确保极端场景下的正确性
 
 **三大核心机制的协同作用**：
@@ -1070,7 +1556,10 @@ Teable 的查找与汇总字段的值传播链路是一个**精心设计的分�
 - **条件边迭代收敛**：通过单调增长的记录集和队列去重机制，确保条件汇总的跨表影响被完整传播
 
 **动态列名设计**：
-链接级联查询的列名通过 `ILinkEdge` 接口动态拼装，`fkHostTableName` 是 `baseDbName.tableDbName` 格式的限定名，通过 `formatQualifiedName` 转为 SQL 引用，每个链接字段有独立的 junction table 和列名配置，避免硬编码，支持多租户架构。
+链接级联查询的列名通过 `ILinkEdge` 接口动态拼装，`fkHostTableName` 是 `baseDbName.tableDbName` 格式的限定名，通过 `formatQualifiedName` 转为 SQL 引用。**表述边界**：仅 `manyMany` 和 单向 `oneMany` 使用独立 junction table，`manyOne`、`oneOne`、双向 `oneMany` 复用现有业务表，通过 `selfKeyName` 和 `foreignKeyName` 动态映射 `__id` 或外键列名，避免硬编码，支持多租户架构。
+
+**Op 发布链路**：
+`publishBatch` 不直接推送，而是调用 `batchService.saveRawOps` 将 ops 存入 CLS 上下文的 `tx.rawOpMaps` 键下，在事务提交时才真正发布。Op 结构为标准 JSON0 格式（`{ p, oi, od }`），携带版本号确保一致性。
 
 **两条路径的差异化设计**：
 - **记录变更**：侧重精确性，通过 `changeContextMap` 实现变更前后双端过滤，最小化重算范围

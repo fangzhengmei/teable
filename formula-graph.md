@@ -1111,22 +1111,30 @@ const computedResult = yield* await this.runComputedUpdateById(
 ```
 - **无 skip/defer 支持**，始终同步执行
 
-**2. `updateMany()` - 按过滤条件批量更新** ([PostgresTableRecordRepository.ts:1913-1916](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L1913-L1916)):
+**2. `updateMany()` - 按过滤条件批量更新** ([PostgresTableRecordRepository.ts:1913-2079](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L1913-L2079)):
 ```typescript
 const skipComputed = options?.skipComputedUpdates ?? false;
 const deferComputed = !skipComputed && (options?.deferComputedUpdates ?? false);
 const enqueueDeferredComputedUpdates =
   deferComputed && (options?.enqueueDeferredComputedUpdates ?? false);
+
+// ... 记录更新完成后 ...
+
+const computedResult = deferComputed
+  ? enqueueDeferredComputedUpdates
+    ? await this.runComputedUpdateManyByIds(..., { forceOutbox: true, scheduleDispatchAfterCommit: true })
+    : this.scheduleDeferredComputedUpdateManyByIds(...)
+  : await this.runComputedUpdateManyByIds(...);  // 无 forceOutbox
 ```
 
-updateMany 的完整分支逻辑与 updateManyStream 类似（所有批次完成后统一处理），区别在于 updateMany 是单批操作，直接在记录更新完成后处理。
+updateMany 是单批操作，记录更新完成后统一处理。**`deferComputed = false` 时的具体行为取决于策略模式**（详见 9.9.7 节 `runComputedUpdateManyByIds` 策略分支分析）。
 
-| 条件组合 | 行为 |
-|---------|------|
-| `skipComputed = true` | 跳过计算 |
-| `skipComputed = false`, `deferComputed = false` | 同步执行 `runComputedUpdateManyByIds()` |
-| `skipComputed = false`, `deferComputed = true`, `enqueue = true` | `forceOutbox: true` 写入 Outbox |
-| `skipComputed = false`, `deferComputed = true`, `enqueue = false` | legacy async 调用（`afterCommit`） |
+| 条件组合 | forceOutbox | 行为 |
+|---------|-------------|------|
+| `skipComputed = true` | - | 跳过计算 |
+| `skipComputed = false`, `deferComputed = false` | `false` | 调用 `runComputedUpdateManyByIds({}, {})`，**sync 模式同步，hybrid/async 直接 Outbox** |
+| `skipComputed = false`, `deferComputed = true`, `enqueue = true` | `true` | 强制写入 Outbox（所有策略模式） |
+| `skipComputed = false`, `deferComputed = true`, `enqueue = false` | - | legacy async 调用（`afterCommit` 钩子） |
 
 **3. `updateManyStream()` - 流式更新** ([PostgresTableRecordRepository.ts:2135-2419](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L2135-L2419)):
 ```typescript
@@ -1152,9 +1160,9 @@ if (totalUpdated > 0) {
 | 条件组合 | 单批行为 | 最终行为 |
 |---------|---------|---------|
 | `skipComputed = true` | 跳过计算 | 无后续计算 |
-| `skipComputed = false`, `deferComputed = false` | 单批跳过（流式设计） | 最终同步批量执行 `runComputedUpdateManyByIds()` |
-| `skipComputed = false`, `deferComputed = true`, `enqueue = true` | 单批跳过 | 最终 `forceOutbox: true` 写入 Outbox |
-| `skipComputed = false`, `deferComputed = true`, `enqueue = false` | 单批跳过 | 最终 legacy async 调用（`afterCommit`） |
+| `skipComputed = false`, `deferComputed = false` | 单批跳过（流式设计） | 最终调用 `runComputedUpdateManyByIds({}, {})`，**sync 模式同步，hybrid/async 直接 Outbox** |
+| `skipComputed = false`, `deferComputed = true`, `enqueue = true` | 单批跳过 | 最终 `forceOutbox: true` 写入 Outbox（所有策略模式） |
+| `skipComputed = false`, `deferComputed = true`, `enqueue = false` | 单批跳过 | 最终 legacy async 调用（`afterCommit` 钩子） |
 
 ---
 
@@ -1267,16 +1275,18 @@ if (context.transaction?.afterCommit) {
 
 #### 9.9.4 完整决策矩阵
 
-| 操作方法 | skipComputedUpdates 可用 | deferComputedUpdates 可用 | 默认行为 | 跳过结果 | 延后结果 |
-|---------|-------------------------|--------------------------|---------|---------|---------|
-| `insert()` | ✅ 可用（InternalInsertManyOptions） | ❌ 不可用 | 同步执行 | `computedChangesByRecord = undefined` | - |
-| `insertMany()` | ✅ 可用 | ❌ 不可用 | 同步执行 | `computedChangesByRecord = undefined` | - |
-| `insertManyStream()` | ✅ 可用 | ✅ 可用 | 每批同步执行 | 无计算 | Outbox / Legacy async 批量计算 |
-| `updateOne()` | ❌ 不可用 | ❌ 不可用 | 同步执行 | - | - |
-| `updateMany()` | ✅ 可用 | ✅ 可用 | 同步执行 | 无计算 | 同步执行（sync 模式）或 Outbox（hybrid 模式） |
-| `updateManyStream()` | ✅ 可用 | ✅ 可用 | 最终同步批量执行 | 无计算 | Outbox / Legacy async 批量计算 |
-| `deleteMany()` | ❌ 不可用 | ❌ 不可用 | 同步执行（sync）/ Outbox（hybrid） | - | - |
-| `deleteManyStream()` | ❌ 不可用 | ❌ 不可用 | 每批同步执行（sync）/ Outbox（hybrid） | - | - |
+| 操作方法 | skip 可用 | defer 可用 | 默认行为（defer=false） | 跳过结果 | 延后结果 |
+|---------|----------|-----------|-------------------------|---------|---------|
+| `insert()` | ✅ | ❌ | **sync 同步**（通过 `runComputedUpdate`） | `computedChangesByRecord = undefined` | - |
+| `insertMany()` | ✅ | ❌ | **sync 同步**（通过 `runComputedUpdateMany`） | `computedChangesByRecord = undefined` | - |
+| `insertManyStream()` | ✅ | ✅ | 每批 **sync 同步** | 无计算 | defer=true: Outbox / Legacy async |
+| `updateOne()` | ❌ | ❌ | **sync 同步**（通过 `runComputedUpdate`） | - | - |
+| `updateMany()` | ✅ | ✅ | **sync 同步**（sync 策略）/ **Outbox**（hybrid/async 策略） | 无计算 | defer=true: forceOutbox 强制 Outbox / Legacy async |
+| `updateManyStream()` | ✅ | ✅ | 最终 **sync 同步**（sync）/ **Outbox**（hybrid/async） | 无计算 | defer=true: forceOutbox 强制 Outbox / Legacy async |
+| `deleteMany()` | ❌ | ❌ | **sync 同步**（sync 策略）/ **Outbox**（hybrid/async 策略） | - | - |
+| `deleteManyStream()` | ❌ | ❌ | 每批 **sync 同步**（sync）/ **Outbox**（hybrid/async） | - | - |
+
+> **重要修正**：`updateMany()` 和 `updateManyStream()` 在 `deferComputed = false` 时，**hybrid/async 策略模式下默认直接进入 Outbox**，不执行同步计算。只有 sync 策略模式下才会同步执行。详见 9.9.7 节策略分支分析。
 
 ---
 
@@ -1312,6 +1322,134 @@ deferComputedUpdates: true,
 deferComputedUpdates: command.deferComputedUpdates,
 ```
 数据恢复功能支持延后计算。
+
+---
+
+#### 9.9.7 `runComputedUpdateManyByIds` 策略分支深度分析
+
+##### 核心决策逻辑
+
+`runComputedUpdateManyByIds()` ([PostgresTableRecordRepository.ts:2433-2561](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L2433-L2561)) 是批量更新场景的核心计算函数，其策略分支逻辑与单条记录路径 `runComputedUpdate()` 有重要区别。
+
+**`runComputedUpdateManyByIds` 的分支判断**：
+```typescript
+if (this.computedUpdateStrategy.mode === 'sync' && !options.forceOutbox) {
+  // =====================================================
+  // 同步路径：planStage() + strategy.execute()
+  // =====================================================
+  // 1. planner.planStage() - 事务内生成完整更新计划
+  // 2. strategy.execute() - 事务内执行同步更新
+  // 3. publishComputedUpdateEvents() - 发布实时事件
+} else {
+  // =====================================================
+  // Outbox 路径：直接 buildSeedTaskInput() + enqueueSeedTask()
+  // =====================================================
+  // 1. buildSeedTaskInput() - 仅存储最小触发信息
+  // 2. computedUpdateOutbox.enqueueSeedTask() - 写入 Outbox 表
+  // 3. scheduleDispatch() - 触发 Worker 调度
+  // 4. Worker 异步执行时才调用 planStage()
+}
+```
+
+**与单条记录路径 `runComputedUpdate` 的对比**：
+
+| 路径 | sync 策略 | hybrid 策略（INSERT） | hybrid 策略（UPDATE/DELETE） | async 策略 |
+|------|----------|----------------------|----------------------------|-----------|
+| `runComputedUpdate` (单条) | 同步 | 同步 | Outbox | Outbox |
+| `runComputedUpdateManyByIds` (批量 UPDATE) | 同步（forceOutbox=false） | **Outbox** | **Outbox** | **Outbox** |
+| `runComputedUpdateManyByIds` + `forceOutbox=true` | **强制 Outbox** | **Outbox** | **Outbox** | **Outbox** |
+| `runComputedDeleteUpdateMany` (批量 DELETE) | 同步 | **Outbox** | **Outbox** | **Outbox** |
+
+> **关键差异**：
+> 1. 单条记录路径中 hybrid 策略下 INSERT 是同步执行的；但批量路径中 **hybrid 策略下所有操作类型都直接进入 Outbox**，不做同步规划和执行。
+> 2. `runComputedDeleteUpdateMany` 与 `runComputedUpdateManyByIds` 的策略分支逻辑完全一致（sync 同步，hybrid/async Outbox），但 DELETE 路径不支持 `forceOutbox` 参数。
+> 3. 目的都是减少事务锁持有时间，避免大批量更新/删除导致的性能问题。
+
+##### `forceOutbox` 参数详解
+
+`forceOutbox` 是 `runComputedUpdateManyByIds` 独有的参数（单条记录路径无此参数）：
+
+| forceOutbox 值 | 触发场景 | 行为 |
+|---------------|---------|------|
+| `false`（默认） | `deferComputed = false` 时 | 遵循策略模式：sync 同步，hybrid/async Outbox |
+| `true` | `deferComputed = true` 且 `enqueueDeferredComputedUpdates = true` 时 | **强制所有策略模式都进入 Outbox** |
+
+**调用链示例**：
+```
+updateMany()
+    │
+    ├─ deferComputed = false
+    │   └─ runComputedUpdateManyByIds(..., {})  // forceOutbox 未传 → false
+    │       ├─ sync 策略 → 同步规划执行
+    │       └─ hybrid/async → 直接 Outbox
+    │
+    └─ deferComputed = true, enqueue = true
+        └─ runComputedUpdateManyByIds(..., { forceOutbox: true, scheduleDispatchAfterCommit: true })
+            ├─ sync 策略 → 强制 Outbox（覆盖默认同步行为）
+            ├─ hybrid → 直接 Outbox（无变化）
+            └─ async → 直接 Outbox（无变化）
+```
+
+##### `scheduleDispatchAfterCommit` 参数详解
+
+控制 Outbox 任务的调度时机：
+
+| 值 | 行为 | 适用场景 |
+|----|------|---------|
+| `false`（默认） | 立即调用 `scheduleDispatch(context)`（保留事务上下文） | 同步策略下 forceOutbox 场景 |
+| `true` | 先删除事务上下文，再在 `transaction.afterCommit` 钩子中调度 | defer 场景，避免事务未提交就被 Worker 领取 |
+
+**代码逻辑** ([PostgresTableRecordRepository.ts:2547-2558](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L2547-L2558)):
+```typescript
+if (options.scheduleDispatchAfterCommit) {
+  const dispatchContext: core.IExecutionContext = { ...context };
+  delete dispatchContext.transaction;  // 移除事务上下文
+  const dispatch = () => this.computedUpdateStrategy.scheduleDispatch(dispatchContext);
+  if (context.transaction?.afterCommit) {
+    context.transaction.afterCommit(dispatch);  // 事务提交后再调度
+  } else {
+    dispatch();
+  }
+} else {
+  this.computedUpdateStrategy.scheduleDispatch(context);  // 立即调度
+}
+```
+
+##### Outbox 路径的设计意图
+
+注释明确说明了批量路径直接进入 Outbox 的原因 ([PostgresTableRecordRepository.ts:2508-2510](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L2508-L2510)):
+```typescript
+// For hybrid/async mode, skip planStage to minimize transaction lock hold time.
+// The worker will plan when it processes the seed task asynchronously.
+// This matches the pattern used by runComputedUpdate (single-record path).
+```
+
+**性能权衡**：
+- **同步路径**：数据一致性高，但大批量更新时 `planStage()` 耗时较长，可能导致事务锁持有时间过长
+- **Outbox 路径**：事务提交快，不阻塞用户响应，但计算延迟取决于 Worker 调度间隔
+
+##### 完整策略决策树（批量更新场景）
+
+```
+updateMany() / updateManyStream()
+    │
+    ├─ skipComputed = true → 跳过计算
+    │
+    └─ skipComputed = false
+        │
+        ├─ deferComputed = true
+        │   ├─ enqueue = true
+        │   │   └─ runComputedUpdateManyByIds(..., { forceOutbox: true })
+        │   │       └─ 全部策略模式 → Outbox + scheduleDispatchAfterCommit
+        │   └─ enqueue = false
+        │       └─ scheduleDeferredComputedUpdateManyByIds() → afterCommit 钩子
+        │
+        └─ deferComputed = false
+            └─ runComputedUpdateManyByIds(..., {})
+                ├─ strategy.mode = 'sync'  &&  !forceOutbox → 同步规划执行
+                ├─ strategy.mode = 'hybrid'                  → 直接 Outbox
+                └─ strategy.mode = 'async'                   → 直接 Outbox
+```
 
 ---
 

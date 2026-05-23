@@ -675,9 +675,9 @@ type UpdateImpactHint = {
 | 操作类型 | changeType | 字段级失效逻辑 | 记录级传播模式 | 特殊处理 |
 |---------|------------|---------------|---------------|---------|
 | **INSERT** | `'insert'` | 包含表所有非链接字段 + 所有条件字段 + 无依赖公式 | 同 UPDATE | 所有字段视为已变更（隐式 null 值也需要计算） |
-| **UPDATE（值）** | `'update'` | 值变更传播（isEdgeRelevantForValue） | 条件字段用 conditionalFiltered/ allTargetRecords；非条件字段用 linkTraversal | 过滤字段变更触发 allTargetRecords |
+| **UPDATE（值）** | `'update'` | 值变更传播（isEdgeRelevantForValue） | 条件字段用 conditionalFiltered/allTargetRecords；非条件字段用 linkTraversal | 条件字段过滤字段变更触发 allTargetRecords |
 | **UPDATE（链接）** | `'update'` | 链接关系传播（isEdgeRelevantForLink） → 级联到值依赖 | 同 UPDATE（值） | 对称链接级联更新 |
-| **DELETE** | `'delete'` | 表所有字段作为种子；额外包含条件字段的源字段 | 条件字段用 allTargetRecords；非条件字段 DELETE 时用 allTargetRecords | beforeImage 用于条件字段；extraSeedRecords 包含关联记录 |
+| **DELETE** | `'delete'` | 表所有字段作为种子；额外包含条件字段的源字段 | 条件字段按条件表；非条件字段：带过滤的 oneMany 双向用 allTargetRecords，其余用 linkTraversal | beforeImage 用于条件字段；extraSeedRecords 包含关联记录 |
 
 ### 9.3 INSERT 操作详解
 
@@ -726,9 +726,48 @@ const planningSeedFieldIds =
 #### 传播模式判定（非条件字段）
 
 非条件字段的 lookup/rollup 传播模式判定 ([ComputedUpdatePlanner.ts:1648-1710](packages/v2/adapter-table-repository-postgres/src/record/computed/ComputedUpdatePlanner.ts#L1648-L1710)):
-- 有 `linkFieldId` → `linkTraversal`
-- DELETE 且是 filtered lookup → `allTargetRecords`（原因：`filtered_lookup_delete_requires_source_record`）
-- UPDATE 即使过滤字段变更也保持 `linkTraversal`（原因：链接关系本身是边界）
+
+**核心决策逻辑**：
+- 有 `linkFieldId` → 默认走 `linkTraversal`
+- **只有带过滤条件的 lookup/rollup 在 DELETE 时**才有可能降级为 `allTargetRecords`
+- UPDATE 即使过滤字段变更也保持 `linkTraversal`（原因：链接关系本身是边界，过滤只限定关联记录的子集，边界仍是链接关系）
+
+**DELETE 时的降级条件**（第 1664 行）：
+```typescript
+if (changeType === 'delete' && !canTraverseDelete) {
+  propagationMode = 'allTargetRecords'
+  reason = 'filtered_lookup_delete_requires_source_record'
+}
+```
+
+**`canTraverseFilteredDeleteWithoutSourceRecord()`** ([ComputedUpdatePlanner.ts:1841-1851](packages/v2/adapter-table-repository-postgres/src/record/computed/ComputedUpdatePlanner.ts#L1841-L1851)):
+```typescript
+return (
+  relationship === 'manyMany' ||    // 多对多：可从关联表反向遍历
+  relationship === 'manyOne' ||     // 多对一：可从外键反向遍历
+  relationship === 'oneOne' ||      // 一对一：可从外键反向遍历
+  (relationship === 'oneMany' && isOneWay === true)  // 单向一对多：无子表外键，但单向无需对称更新
+);
+```
+
+**非条件字段传播模式决策矩阵**：
+
+| 过滤条件 | 操作类型 | 链接关系 | canTraverseDelete | 传播模式 |
+|---------|---------|---------|-------------------|---------|
+| 无过滤 | UPDATE/DELETE | 任意 | true | `linkTraversal` |
+| 有过滤 | UPDATE | 任意 | true | `linkTraversal` |
+| 有过滤 | DELETE | manyMany | true | `linkTraversal` |
+| 有过滤 | DELETE | manyOne | true | `linkTraversal` |
+| 有过滤 | DELETE | oneOne | true | `linkTraversal` |
+| 有过滤 | DELETE | oneMany + 单向 | true | `linkTraversal` |
+| 有过滤 | DELETE | oneMany + 双向 | false | `allTargetRecords` |
+
+**对称链接的 DELETE 传播模式** ([ComputedUpdatePlanner.ts:1709-1711](packages/v2/adapter-table-repository-postgres/src/record/computed/ComputedUpdatePlanner.ts#L1709-L1711)):
+```typescript
+const symmetricPropagationMode: DirtyPropagationMode = hasSeedRecords
+  ? 'linkTraversal'
+  : 'allTargetRecords';  // 原因：symmetric_no_seed_records
+```
 
 #### 传播模式判定（条件字段）
 
@@ -767,6 +806,49 @@ DELETE 的传播边过滤 ([ComputedUpdatePlanner.ts:1531-1538](packages/v2/adap
 - 跳过从种子表到 `extraSeedTableIds` 中表的边
 - 原因：这些表的记录已经作为 extraSeedRecords 加入种子，避免重复传播
 
+#### DELETE 场景下条件字段传播模式决策
+
+条件字段（conditionalLookup/conditionalRollup）在 DELETE 时的完整决策逻辑 ([ComputedUpdatePlanner.ts:1540-1623](packages/v2/adapter-table-repository-postgres/src/record/computed/ComputedUpdatePlanner.ts#L1540-L1623)):
+
+```typescript
+// DELETE 始终标记为 requiresOldMatchTracking = true
+const requiresOldMatchTracking =
+  filterFieldsChanged || changeType === 'delete' || !filterFieldsInSource;
+
+const canUseBeforeImage =
+  beforeImageRecords.length > 0 && edge.fromTableId.equals(seedTableId);
+```
+
+**决策树**：
+```
+DELETE + 条件字段:
+  ├─ 无 filterDto → allTargetRecords (conditional_missing_filter)
+  │
+  └─ 有 filterDto:
+      ├─ canUseBeforeImage = true (有 beforeImage 且源表是种子表)
+      │   → conditionalFiltered (includeBeforeImage=true)
+      │      - 通过 beforeImage 精确匹配新旧过滤集合
+      │      - 使用 jsonb_populate_record 重构记录状态
+      │
+      └─ canUseBeforeImage = false
+          → allTargetRecords
+            ├─ 原因：conditional_delete (无 beforeImage)
+            ├─ 原因：conditional_filter_fields_not_in_source (过滤字段不在源表)
+            └─ 原因：conditional_filter_field_changed (过滤字段变更)
+```
+
+**DELETE 场景下条件字段传播模式决策矩阵**：
+
+| filterDto | beforeImage | 源表=种子表 | 过滤字段在源表 | 传播模式 | 原因 |
+|-----------|-------------|------------|--------------|---------|------|
+| 无 | - | - | - | `allTargetRecords` | `conditional_missing_filter` |
+| 有 | 有 | 是 | 是 | `conditionalFiltered` | 精确匹配新旧过滤集合 |
+| 有 | 有 | 否 | 是 | `allTargetRecords` | `conditional_delete` |
+| 有 | 无 | 是 | 是 | `allTargetRecords` | `conditional_delete` |
+| 有 | - | - | 否 | `allTargetRecords` | `conditional_filter_fields_not_in_source` |
+| 有 | 有 | 是 | 是 (且过滤字段变更) | `conditionalFiltered` | includeBeforeImage=true |
+| 有 | 无 | 是 | 是 (且过滤字段变更) | `allTargetRecords` | `conditional_filter_field_changed` |
+
 ### 9.6 传播边去重与合并
 
 `propagationEdgeKey()` ([ComputedUpdatePlanner.ts:1473-1488](packages/v2/adapter-table-repository-postgres/src/record/computed/ComputedUpdatePlanner.ts#L1473-L1488)):
@@ -791,6 +873,164 @@ DELETE 的传播边过滤 ([ComputedUpdatePlanner.ts:1531-1538](packages/v2/adap
 - 条件字段缺少 conditionSpec → `conditional_runtime_missing_condition_spec`
 
 降级后传播模式变为 `allTargetRecords`，确保正确性但牺牲性能。
+
+### 9.8 跳过与延后触发 Gate 机制
+
+重算触发链路上存在多个 gate（守卫），用于在特定条件下跳过计算或延后到异步执行，以优化性能和避免不必要的计算。
+
+#### 9.8.1 跳过触发（Skip Gates）
+
+**Gate 1：空步骤跳过** ([SyncInTransactionStrategy.ts:39-44](packages/v2/adapter-table-repository-postgres/src/record/computed/strategies/SyncInTransactionStrategy.ts#L39-L44) / [HybridWithOutboxStrategy.ts:167-172](packages/v2/adapter-table-repository-postgres/src/record/computed/strategies/HybridWithOutboxStrategy.ts#L167-L172)):
+```typescript
+if (
+  plan.steps.length === 0 ||
+  (plan.seedRecordIds.length === 0 && plan.extraSeedRecords.length === 0)
+) {
+  return ok(undefined);  // 直接返回，不执行任何计算
+}
+```
+
+**Gate 2：空种子字段跳过 - planNextStage** ([SyncInTransactionStrategy.ts:143](packages/v2/adapter-table-repository-postgres/src/record/computed/strategies/SyncInTransactionStrategy.ts#L143) / [HybridWithOutboxStrategy.ts:496](packages/v2/adapter-table-repository-postgres/src/record/computed/strategies/HybridWithOutboxStrategy.ts#L496)):
+```typescript
+if (seedFieldIds.length === 0) return ok({ ...plan, steps: [], edges: [] });
+```
+
+**Gate 3：空种子组跳过 - splitSeedGroupsForPlan** ([ComputedUpdatePlanner.ts:1208-1228](packages/v2/adapter-table-repository-postgres/src/record/computed/ComputedUpdatePlanner.ts#L1208-L1228)):
+```typescript
+const nonEmpty = seedGroups.filter((group) => group.recordIds.length > 0);
+if (nonEmpty.length === 0) return null;  // 返回 null 触发跳过
+```
+
+`splitSeedGroupsForPlan` 会过滤掉所有记录数为 0 的空 seed group，如果全部为空则返回 null，上层调用方收到 null 后跳过后续规划：
+- [SyncInTransactionStrategy.ts:145-146](packages/v2/adapter-table-repository-postgres/src/record/computed/strategies/SyncInTransactionStrategy.ts#L145-L146)
+- [HybridWithOutboxStrategy.ts:498-499](packages/v2/adapter-table-repository-postgres/src/record/computed/strategies/HybridWithOutboxStrategy.ts#L498-L499)
+- [ComputedUpdateWorker.ts:1321-1323](packages/v2/adapter-table-repository-postgres/src/record/computed/worker/ComputedUpdateWorker.ts#L1321-L1323)
+
+**Gate 4：空输入跳过 - ComputedFieldUpdater.execute** ([ComputedFieldUpdater.ts:314-318](packages/v2/adapter-table-repository-postgres/src/record/computed/ComputedFieldUpdater.ts#L314-L318)):
+```typescript
+const noSeedInput = plan.seedRecordIds.length === 0 && plan.extraSeedRecords.length === 0;
+const shouldSeedAllForSchemaUpdate = noSeedInput && plan.changeType === 'update';
+if (plan.steps.length === 0 || (noSeedInput && !shouldSeedAllForSchemaUpdate)) {
+  return ok({ changesByStep: [] });
+}
+```
+
+**特殊例外**：Schema 更新场景（无种子记录但 changeType 为 update）不跳过，而是走全表种子模式。
+
+**Gate 5：无边跳过 - Worker planNextStage** ([ComputedUpdateWorker.ts:1317](packages/v2/adapter-table-repository-postgres/src/record/computed/worker/ComputedUpdateWorker.ts#L1317)):
+```typescript
+if (plan.edges.length === 0) return ok({ ...plan, steps: [], edges: [] });
+```
+
+**Gate 6：空种子字段 + 无全表标记跳过 - Worker planNextStage** ([ComputedUpdateWorker.ts:1318-1319](packages/v2/adapter-table-repository-postgres/src/record/computed/worker/ComputedUpdateWorker.ts#L1318-L1319)):
+```typescript
+if (seedFieldIds.length === 0 && (!seedAllTableIds || seedAllTableIds.length === 0))
+  return ok({ ...plan, steps: [], edges: [] });
+```
+
+**Gate 7：无传播边跳过 - Hybrid planNextStage** ([HybridWithOutboxStrategy.ts:495](packages/v2/adapter-table-repository-postgres/src/record/computed/strategies/HybridWithOutboxStrategy.ts#L495)):
+```typescript
+if (plan.edges.length === 0) return ok({ ...plan, steps: [], edges: [] });
+```
+
+**Gate 8：环检测跳过** - `cyclePolicy: 'skip'`：
+- 检测到环时，跳过环参与字段的更新
+- 只更新非环部分的字段
+
+#### 9.8.2 延后触发（Defer Gates）
+
+延后触发 gate 不取消计算，而是将计算从同步路径移动到异步路径（Outbox）。
+
+**Gate 1：Hybrid 策略同步/异步分割 - splitStepsByPolicy** ([HybridWithOutboxStrategy.ts:544-613](packages/v2/adapter-table-repository-postgres/src/record/computed/strategies/HybridWithOutboxStrategy.ts#L544-L613)):
+
+三种策略将部分或全部步骤延后到异步执行：
+
+| syncPolicy | 延后逻辑 |
+|-----------|---------|
+| `'none'` | 所有步骤都延后，syncSteps = [] |
+| `'seedTableOnly'` | 非种子表的步骤都延后 |
+| `'threshold'` | 超过脏记录阈值或层级阈值的步骤延后 |
+
+**threshold 策略的延后判定**：
+```typescript
+累计脏记录数 += 该层级所有表的脏记录数
+如果 单表最大脏记录 > syncMaxDirtyPerTable（默认 2000）→ 停止同步，后续延后
+如果 累计脏记录 > syncMaxTotalDirty（默认 5000）→ 停止同步，后续延后
+否则 syncMaxLevel = 当前层级，继续检查下一层级
+```
+
+**Gate 2：UPDATE/DELETE 在 Hybrid 模式下整体延后为 Seed Task** ([PostgresTableRecordRepository.ts:2971-2973](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L2971-L2973)):
+```typescript
+const shouldExecuteInline =
+  this.computedUpdateStrategy.mode === 'sync' ||
+  (this.computedUpdateStrategy.mode === 'hybrid' && changeType === 'insert');
+```
+- INSERT：始终同步执行
+- UPDATE/DELETE：延后为 Seed Task，由 Worker 异步处理
+
+**Gate 3：调度延迟 - dispatchDelayMs** ([HybridWithOutboxStrategy.ts:87-91](packages/v2/adapter-table-repository-postgres/src/record/computed/strategies/HybridWithOutboxStrategy.ts#L87-L91)):
+```typescript
+/**
+ * Delay before inline dispatch (ms).
+ * Set to >= 50ms to avoid race condition with transaction commit.
+ */
+dispatchDelayMs: number;
+```
+- 默认值：50ms
+- 目的：避免 Outbox 任务在事务提交前被 Worker 领取，导致读取不到最新数据
+
+**Gate 4：调度模式 - dispatchMode** ([HybridWithOutboxStrategy.ts:69-73](packages/v2/adapter-table-repository-postgres/src/record/computed/strategies/HybridWithOutboxStrategy.ts#L69-L73)):
+
+| dispatchMode | 延后效果 |
+|-------------|---------|
+| `'external'` | 完全延后，仅依赖外部 Worker 轮询（最可靠，生产默认） |
+| `'push'` | 入队后即时调度（延迟 dispatchDelayMs），低延迟但崩溃可能丢失 |
+| `'hybrid'` | push + external 兜底（低延迟 + 高可靠） |
+
+**Gate 5：多阶段更新的后续阶段延后**：
+- 同步策略（Sync）：循环执行所有阶段，不延后
+- 混合策略（Hybrid）：同步阶段只执行 syncSteps，asyncSteps 延后入队
+- 异步策略（Async）：所有阶段都延后
+
+#### 9.8.3 跳过与延后 Gate 总览
+
+```
+runComputedUpdate()
+    │
+    ├─ [GATE] 策略选择：Hybrid + UPDATE/DELETE → 整体延后为 Seed Task
+    │
+    ├─ planner.planStage()
+    │   └─ [GATE] 环检测：cyclePolicy='skip' → 跳过环参与字段
+    │
+    └─ strategy.execute()
+        │
+        ├─ [GATE] plan.steps.length === 0 → 跳过
+        ├─ [GATE] 无种子记录 → 跳过
+        │
+        ├─ [GATE - Hybrid] splitStepsByPolicy → 部分/全部步骤延后
+        │   ├─ syncPolicy='none' → 全部延后
+        │   ├─ syncPolicy='seedTableOnly' → 非种子表延后
+        │   └─ syncPolicy='threshold' → 超阈值部分延后
+        │
+        ├─ 执行同步步骤
+        │
+        └─ [GATE] dispatchMode
+            ├─ 'external' → 仅轮询延后
+            ├─ 'push' → 延迟 dispatchDelayMs 后调度
+            └─ 'hybrid' → push + 轮询兜底
+                │
+                ▼
+            Outbox 表 → Worker.runOnce()
+                │
+                ├─ [GATE] plan.edges.length === 0 → 跳过
+                ├─ [GATE] seedFieldIds 为空 + 无全表标记 → 跳过
+                ├─ [GATE] 无种子组 → 跳过
+                │
+                └─ planNextStage()
+                    ├─ [GATE] 无传播边 → 跳过
+                    ├─ [GATE] 无种子字段 → 跳过
+                    └─ [GATE] 无种子组 → 跳过
+```
 
 ---
 

@@ -1032,6 +1032,287 @@ runComputedUpdate()
                     └─ [GATE] 无种子组 → 跳过
 ```
 
+### 9.9 skipComputedUpdates 与 deferComputedUpdates 触发门槛分析
+
+`skipComputedUpdates` 和 `deferComputedUpdates` 是控制计算字段更新时机的两个关键标志，用于在批量操作（导入、恢复、流式写入）时优化性能。
+
+#### 9.9.1 标志定义与语义
+
+**接口定义** ([TableRecordRepository.ts:138-155](packages/v2/core/src/ports/TableRecordRepository.ts#L138-L155)):
+
+| 标志 | 类型 | 默认值 | 语义 |
+|------|------|--------|------|
+| `skipComputedUpdates` | `boolean` | `false` | 完全跳过计算字段更新，调用方需后续单独执行回填 |
+| `deferComputedUpdates` | `boolean` | `false` | 延后到异步批量执行，不阻塞当前请求响应 |
+| `enqueueDeferredComputedUpdates` | `boolean` | `false` | 配合 `deferComputedUpdates` 使用，true 表示写入 Outbox，false 表示使用 legacy async 调用 |
+
+**互斥关系**：
+```typescript
+const skipComputed = options?.skipComputedUpdates ?? false;
+const deferComputed = !skipComputed && (options?.deferComputedUpdates ?? false);
+```
+- `skipComputedUpdates` 优先级高于 `deferComputedUpdates`
+- 如果 `skipComputedUpdates = true`，则 `deferComputedUpdates` 被忽略
+
+#### 9.9.2 各操作路径的分支位置与触发条件
+
+---
+
+##### INSERT 路径
+
+**1. `insertMany()` - 单批插入** ([PostgresTableRecordRepository.ts:1486-1493](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L1486-L1493)):
+```typescript
+// 分支位置：记录写入完成后
+if (!options?.skipComputedUpdates) {
+  computedResult = yield* await this.runComputedUpdateMany(
+    context, table, records, 'insert', allExtraSeedRecordGroups
+  );
+}
+```
+| 条件 | 行为 | 返回结果 |
+|------|------|---------|
+| `skipComputedUpdates = true` | 跳过计算，`computedResult = undefined` | `computedChangesByRecord = undefined` |
+| `skipComputedUpdates = false` | 同步执行 `runComputedUpdateMany()` | 返回完整计算结果 |
+
+**2. `insertManyStream()` - 流式插入** ([PostgresTableRecordRepository.ts:1552-1637](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L1552-L1637)):
+```typescript
+// 分支位置 1：每批内部调用 insertMany 时
+const result = await this.insertMany(context, batchTable, records, {
+  skipComputedUpdates: skipComputed || deferComputed,  // 每批都跳过
+  ...
+});
+
+// 分支位置 2：所有批次完成后
+if (deferComputed && allInsertedRecords.length > 0) {
+  const computedResult = enqueueDeferredComputedUpdates
+    ? await this.enqueueDeferredComputedUpdateMany(context, table, allInsertedRecords)
+    : this.scheduleDeferredComputedUpdateMany(context, table, allInsertedRecords);
+}
+```
+
+| 条件组合 | 单批行为 | 最终行为 |
+|---------|---------|---------|
+| `skipComputed = true` | 跳过计算 | 无后续计算 |
+| `skipComputed = false`, `deferComputed = false` | 每批同步计算 | 无额外后续 |
+| `skipComputed = false`, `deferComputed = true`, `enqueue = true` | 单批跳过 | 最终批量写入 Outbox（推荐生产） |
+| `skipComputed = false`, `deferComputed = true`, `enqueue = false` | 单批跳过 | 最终批量 legacy async 调用（`transaction.afterCommit`） |
+
+---
+
+##### UPDATE 路径
+
+**1. `updateOne()` - 单条更新** ([PostgresTableRecordRepository.ts:1862-1870](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L1862-L1870)):
+```typescript
+// 注意：updateOne 没有 skip/defer 选项，始终执行同步计算
+const computedResult = yield* await this.runComputedUpdateById(
+  context, table, recordId, 'update', impactHint, extraSeedRecords,
+  beforeImageRecord ? [beforeImageRecord] : []
+);
+```
+- **无 skip/defer 支持**，始终同步执行
+
+**2. `updateMany()` - 按过滤条件批量更新** ([PostgresTableRecordRepository.ts:1913-1916](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L1913-L1916)):
+```typescript
+const skipComputed = options?.skipComputedUpdates ?? false;
+const deferComputed = !skipComputed && (options?.deferComputedUpdates ?? false);
+const enqueueDeferredComputedUpdates =
+  deferComputed && (options?.enqueueDeferredComputedUpdates ?? false);
+```
+
+updateMany 的完整分支逻辑与 updateManyStream 类似（所有批次完成后统一处理），区别在于 updateMany 是单批操作，直接在记录更新完成后处理。
+
+| 条件组合 | 行为 |
+|---------|------|
+| `skipComputed = true` | 跳过计算 |
+| `skipComputed = false`, `deferComputed = false` | 同步执行 `runComputedUpdateManyByIds()` |
+| `skipComputed = false`, `deferComputed = true`, `enqueue = true` | `forceOutbox: true` 写入 Outbox |
+| `skipComputed = false`, `deferComputed = true`, `enqueue = false` | legacy async 调用（`afterCommit`） |
+
+**3. `updateManyStream()` - 流式更新** ([PostgresTableRecordRepository.ts:2135-2419](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L2135-L2419)):
+```typescript
+// 分支位置：所有批次完成后
+if (totalUpdated > 0) {
+  if (!skipComputed) {
+    const computedResult = deferComputed
+      ? enqueueDeferredComputedUpdates
+        ? await this.runComputedUpdateManyByIds(
+            context, table, affectedRecords, impact, extraSeedRecords, [],
+            { forceOutbox: true, scheduleDispatchAfterCommit: true }
+          )
+        : this.scheduleDeferredComputedUpdateManyByIds(
+            context, table, affectedRecords, impact, extraSeedRecords
+          )
+      : await this.runComputedUpdateManyByIds(
+          context, table, affectedRecords, impact, extraSeedRecords
+        );
+  }
+}
+```
+
+| 条件组合 | 单批行为 | 最终行为 |
+|---------|---------|---------|
+| `skipComputed = true` | 跳过计算 | 无后续计算 |
+| `skipComputed = false`, `deferComputed = false` | 单批跳过（流式设计） | 最终同步批量执行 `runComputedUpdateManyByIds()` |
+| `skipComputed = false`, `deferComputed = true`, `enqueue = true` | 单批跳过 | 最终 `forceOutbox: true` 写入 Outbox |
+| `skipComputed = false`, `deferComputed = true`, `enqueue = false` | 单批跳过 | 最终 legacy async 调用（`afterCommit`） |
+
+---
+
+##### DELETE 路径
+
+**1. `deleteMany()` - 按条件批量删除** ([PostgresTableRecordRepository.ts:2804-2810](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L2804-L2810)):
+```typescript
+// 注意：deleteMany 没有 skip/defer 选项，始终执行
+const computedResult = await this.runComputedDeleteUpdateMany(
+  context, table, recordIds,
+  finalizeExtraSeedRecords(extraSeedMap),
+  beforeImageRecords
+);
+```
+- **无 skip/defer 支持**，始终执行（同步或 Outbox 取决于策略模式）
+
+**2. `deleteManyStream()` - 流式删除** ([PostgresTableRecordRepository.ts:2835-2875](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L2835-L2875)):
+```typescript
+// DeleteManyStreamOptions 只包含 onBatchDeleted 回调
+// 注意：deleteManyStream 没有 skip/defer 选项
+const deleteBatch = async (batchRecordIds) => {
+  const deleteResult = await this.deleteMany(
+    context, table, core.RecordByIdsSpec.create(batchRecordIds)
+  );
+  // ...
+};
+```
+- **无 skip/defer 支持**，每批删除都会触发计算更新
+
+---
+
+##### 策略模式的额外影响
+
+除了显式的 `skipComputedUpdates` 和 `deferComputedUpdates` 标志外，`IComputedUpdateStrategy` 的模式也会影响执行时机：
+
+**`runComputedUpdate()` 中的策略选择** ([PostgresTableRecordRepository.ts:3259-3261](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L3259-L3261)):
+```typescript
+const shouldExecuteInline =
+  this.computedUpdateStrategy.mode === 'sync' ||
+  (this.computedUpdateStrategy.mode === 'hybrid' && changeType === 'insert');
+```
+
+**`runComputedUpdateManyByIds()` 中的策略选择** ([PostgresTableRecordRepository.ts:2452](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L2452)):
+```typescript
+if (this.computedUpdateStrategy.mode === 'sync' && !options.forceOutbox) {
+  // 同步规划 + 执行
+} else {
+  // 直接写入 Outbox，Worker 异步规划执行
+}
+```
+
+**`runComputedDeleteUpdateMany()` 中的策略选择** ([PostgresTableRecordRepository.ts:3481](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L3481)):
+```typescript
+if (this.computedUpdateStrategy.mode === 'sync') {
+  // 同步规划 + 执行
+} else {
+  // 直接写入 Outbox
+}
+```
+
+---
+
+#### 9.9.3 两种延后执行模式的区别
+
+**模式 1：Legacy Async - `scheduleDeferredComputedUpdateMany*()`**
+
+`scheduleDeferredComputedUpdateMany()` ([PostgresTableRecordRepository.ts:1642-1670](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L1642-L1670)):
+```typescript
+const computeContext = { ...context };
+delete computeContext.transaction;  // 移除事务上下文
+const run = () => {
+  void this.runComputedUpdateMany(computeContext, ...).then(...);
+};
+if (context.transaction?.afterCommit) {
+  context.transaction.afterCommit(run);  // 事务提交后执行
+} else {
+  run();  // 立即执行（不等待事务）
+}
+```
+
+**特点**：
+- 不写入 Outbox 表
+- 直接在 `afterCommit` 钩子中异步调用计算函数
+- 进程崩溃可能丢失任务
+- 无法与其他 Worker 合并任务
+- 适合低可靠性要求的场景
+
+**模式 2：Outbox - `enqueueDeferredComputedUpdateMany()` / `forceOutbox: true`**
+
+`enqueueDeferredComputedUpdateMany()` ([PostgresTableRecordRepository.ts:1672-1730](packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts#L1672-L1730)):
+```typescript
+const seedTask = buildSeedTaskInput({ ... });
+const enqueueResult = await this.computedUpdateOutbox.enqueueSeedTask(seedTask, context);
+// ...
+const dispatch = () => this.computedUpdateStrategy.scheduleDispatch(dispatchContext);
+if (context.transaction?.afterCommit) {
+  context.transaction.afterCommit(dispatch);
+} else {
+  dispatch();
+}
+```
+
+**特点**：
+- 写入 `computed_update_outbox` 表（事务内原子性）
+- 支持任务合并（相同 `planHash` 的任务合并）
+- Worker 轮询 + 租期管理，故障可转移
+- 生产环境推荐
+
+---
+
+#### 9.9.4 完整决策矩阵
+
+| 操作方法 | skipComputedUpdates 可用 | deferComputedUpdates 可用 | 默认行为 | 跳过结果 | 延后结果 |
+|---------|-------------------------|--------------------------|---------|---------|---------|
+| `insert()` | ✅ 可用（InternalInsertManyOptions） | ❌ 不可用 | 同步执行 | `computedChangesByRecord = undefined` | - |
+| `insertMany()` | ✅ 可用 | ❌ 不可用 | 同步执行 | `computedChangesByRecord = undefined` | - |
+| `insertManyStream()` | ✅ 可用 | ✅ 可用 | 每批同步执行 | 无计算 | Outbox / Legacy async 批量计算 |
+| `updateOne()` | ❌ 不可用 | ❌ 不可用 | 同步执行 | - | - |
+| `updateMany()` | ✅ 可用 | ✅ 可用 | 同步执行 | 无计算 | 同步执行（sync 模式）或 Outbox（hybrid 模式） |
+| `updateManyStream()` | ✅ 可用 | ✅ 可用 | 最终同步批量执行 | 无计算 | Outbox / Legacy async 批量计算 |
+| `deleteMany()` | ❌ 不可用 | ❌ 不可用 | 同步执行（sync）/ Outbox（hybrid） | - | - |
+| `deleteManyStream()` | ❌ 不可用 | ❌ 不可用 | 每批同步执行（sync）/ Outbox（hybrid） | - | - |
+
+---
+
+#### 9.9.5 典型使用场景
+
+| 使用场景 | 操作 | 配置 | 原因 |
+|---------|------|------|------|
+| 数据导入 | `insertManyStream()` | `deferComputedUpdates: true`, `enqueueDeferredComputedUpdates: true` | 避免 N 次计算周期，HTTP 响应后批量处理 |
+| 数据恢复 | `insertManyStream()` | `skipComputedUpdates: true` | 原始数据恢复，所有表写入完成后统一回填 |
+| 批量字段更新 | `updateManyStream()` | `deferComputedUpdates: true`, `enqueueDeferredComputedUpdates: true` | 大批量更新，不阻塞用户响应 |
+| 跨表批量更新 | `updateMany()` | `deferComputedUpdates: true`, `enqueueDeferredComputedUpdates: true` | 过滤条件更新大量记录 |
+| 普通单条操作 | `insert()` / `updateOne()` | 无配置 | 始终同步，保证数据一致性 |
+
+---
+
+#### 9.9.6 使用方示例
+
+**UpdateRecordsCommand** ([UpdateRecordsCommand.ts:32](packages/v2/core/src/commands/UpdateRecordsCommand.ts#L32)):
+```typescript
+deferComputedUpdates: z.boolean().optional().default(false),
+```
+用户通过 API 传递 `deferComputedUpdates=true` 来延后批量更新的计算。
+
+**ImportRecordsHandler** ([ImportRecordsHandler.ts:173](packages/v2/core/src/commands/ImportRecordsHandler.ts#L173)):
+```typescript
+// Use deferComputedUpdates to avoid blocking the response while computed fields update
+deferComputedUpdates: true,
+```
+导入功能默认使用延后计算。
+
+**RestoreRecordsStreamHandler** ([RestoreRecordsStreamHandler.ts:98](packages/v2/core/src/commands/RestoreRecordsStreamHandler.ts#L98)):
+```typescript
+deferComputedUpdates: command.deferComputedUpdates,
+```
+数据恢复功能支持延后计算。
+
 ---
 
 ## 10. 补充类与文件索引

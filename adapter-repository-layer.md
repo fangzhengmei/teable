@@ -389,6 +389,113 @@ private usesSinglePhysicalDatabase(): boolean {
 
 ## 八、三条核心调用链深入分析
 
+### Specification → Visitor → SQL 通用转换模式（可复核）
+
+所有三条仓储调用链都遵循相同的双分派转换模式：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  阶段 1: 领域层构建 Specification（纯领域逻辑，无 SQL）               │
+├─────────────────────────────────────────────────────────────────────┤
+│  应用层 / Command Handler                                            │
+│    → 调用 XxxSpec.create(...) 构建规约对象                            │
+│      例：TableByIdSpec.create(tableId)                                │
+│      例：SingleLineTextConditionSpec.create(field, 'equals', value)   │
+│                                                                     │
+│  Specification 内部实现：                                             │
+│    interface ISpecification<T, TVisitor> {                           │
+│      accept(visitor: TVisitor): Result<TResult, DomainError>;       │
+│    }                                                                 │
+│                                                                     │
+│    class TableByIdSpec implements ISpecification<Table, ITableSpecVisitor> {│
+│      accept(visitor: ITableSpecVisitor<TResult>): Result<TResult, DomainError> {│
+│        return visitor.visitTableById(this);  // 【双分派关键】       │
+│      }                                                               │
+│    }                                                                 │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  阶段 2: Adapter 层创建 Visitor（数据库特定实现）                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  PostgresXxxRepository 方法内部：                                     │
+│    → 创建具体 Visitor 实例                                            │
+│      例：const visitor = new TableWhereVisitor(state);              │
+│      例：const visitor = new TableRecordConditionWhereVisitor();     │
+│                                                                     │
+│  Visitor 接口定义（每个领域有独立的 Visitor 接口）：                  │
+│    interface ITableSpecVisitor<TResult> {                           │
+│      visitTableById(spec: TableByIdSpec): Result<TResult, DomainError>;│
+│      visitTableByBaseId(spec: TableByBaseIdSpec): Result<TResult, DomainError>;│
+│      visitTableByName(spec: TableByNameSpec): Result<TResult, DomainError>;│
+│      // ... 20+ 个方法，每个 Specification 对应一个 visit 方法       │
+│    }                                                                 │
+│                                                                     │
+│    interface ITableRecordConditionSpecVisitor<TResult> {            │
+│      visitRecordById(spec: RecordByIdSpec): ...;                    │
+│      visitSingleLineTextIs(spec: SingleLineTextConditionSpec): ...; │
+│      visitSingleLineTextContains(spec: ...): ...;                   │
+│      // ... 130+ 个方法，每个字段类型 × 操作符组合                   │
+│    }                                                                 │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  阶段 3: 双分派：spec.accept(visitor)                                │
+├─────────────────────────────────────────────────────────────────────┤
+│  调用 spec.accept(visitor)                                           │
+│    → 进入 Specification 的 accept 方法                               │
+│    → 调用 visitor.visitXxx(this) 【反向调用，双分派完成】             │
+│    → 进入具体 Visitor 的 visitXxx 方法                               │
+│                                                                     │
+│  可复核断点：                                                         │
+│    1. acceptResult = spec.accept(visitor)                           │
+│    2. 检查 acceptResult 是否为 Err（规约不支持此 Visitor）            │
+│    3. 检查 visitor 内部状态是否已累积 SQL 片段                       │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  阶段 4: Visitor 生成 SQL 片段 / 语句                               │
+├─────────────────────────────────────────────────────────────────────┤
+│  三种 Visitor 输出类型：                                              │
+│                                                                     │
+│  ▶ 查询类 Visitor（TableWhereVisitor, TableRecordConditionWhereVisitor）│
+│    输出：(eb: ExpressionBuilder) => SqlBool                          │
+│    用途：作为 Kysely .where() 参数                                   │
+│                                                                     │
+│  ▶ 元数据更新类 Visitor（TableMetaUpdateVisitor）                    │
+│    输出：ReadonlyArray<TableUpdateBuilder>                            │
+│    用途：编译后批量执行（INSERT/UPDATE field/view 系统表）           │
+│                                                                     │
+│  ▶ DDL 类 Visitor（TableSchemaUpdateVisitor）                        │
+│    输出：ReadonlyArray<TableSchemaStatementBuilder>                   │
+│    用途：编译后执行（CREATE/ALTER TABLE 等）                         │
+│                                                                     │
+│  组合逻辑（AbstractSpecFilterVisitor 提供）：                          │
+│    and(left, right) => (eb) => eb.and([left(eb), right(eb)])        │
+│    or(left, right)  => (eb) => eb.or([left(eb), right(eb)])         │
+│    not(inner)       => (eb) => eb.not(inner(eb))                    │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  阶段 5: 构建完整 SQL 并执行                                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  调用 visitor.where() 获取最终输出                                   │
+│    → whereResult = visitor.where()                                   │
+│    → sqlFragment = whereResult.value                                 │
+│                                                                     │
+│  构建完整 Kysely 查询 / 语句：                                       │
+│    例：db.selectFrom('table_meta').where((eb) => sqlFragment(eb))   │
+│    例：for (const stmt of statements) { stmt.compile().execute() }  │
+│                                                                     │
+│  执行并获取结果：                                                     │
+│    例：executeTakeFirst() → 领域对象                                 │
+│    例：execute() → 影响行数 / 返回值                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### 8.1 表元数据仓储调用链（ITableRepository）
 
 **场景**：查询或更新表元数据（table_meta, field, view 等系统表）
@@ -398,32 +505,107 @@ private usesSinglePhysicalDatabase(): boolean {
 ```
 应用层（Command Handler）
          │
-         ▼  构建 Specification
-    TableByIdSpec(tableId)
+         ▼  【步骤 1】构建 Specification（领域层）
+    TableByIdSpec.create(tableId: TableId)
          │
-         ▼  调用 repository
-  ITableRepository.findOne(context, spec)
+         ▼  【步骤 2】调用 repository 接口
+  ITableRepository.findOne(context: IExecutionContext, spec)
          │
-         ▼  ┌────────────────────────────────────────────┐
-            │  Adapter 层：PostgresTableRepository       │
-            │                                            │
-            │  1. 创建 TableWhereVisitor(state)         │
-            │  2. spec.accept(visitor)                  │
-            │     → visitor.visitTableById(spec)        │
-            │     → 生成 where 条件：id = tableId       │
-            │  3. visitor.where() → 获取 where 函数      │
-            │  4. resolvePostgresDbOrTx(db, ctx, 'meta')│
-            │  5. 构建 Kysely SELECT 查询                │
-            │     - LATERAL JOIN 聚合 fields/views       │
-            │     - 应用 where 条件                       │
-            │  6. executeTakeFirst() → 执行 SQL         │
-            │  7. mapTableRow() → DTO → 领域对象         │
-            └────────────────────────────────────────────┘
+         ▼  ┌──────────────────────────────────────────────────────────────┐
+            │  Adapter 层：PostgresTableRepository                            │
+            │                                                                 │
+            │  【步骤 3】创建 TableWhereVisitor                               │
+            │     new TableWhereVisitor(state?: 'active' | 'deleted' |      │
+            │                                       'both')                   │
+            │                                                                 │
+            │  【步骤 4】双分派：Specification 接受 Visitor                   │
+            │     spec.accept(visitor)                                       │
+            │       ↓ TableByIdSpec.accept() 实现：                           │
+            │       accept(visitor: ITableSpecVisitor<TResult>):             │
+            │         Result<TResult, DomainError> {                         │
+            │         return visitor.visitTableById(this);  // 调用对应方法   │
+            │       }                                                         │
+            │                                                                 │
+            │  【步骤 5】Visitor.visitTableById() 生成条件                    │
+            │     → cond = (eb) => eb.eb('id', '=', spec.tableId())          │
+            │     → this.addCond(cond)                                       │
+            │                                                                 │
+            │  【步骤 6】获取组合后的 where 工厂函数                           │
+            │     visitor.where() → Result<(eb: ExpressionBuilder) =>        │
+            │                               SqlBool, DomainError>            │
+            │                                                                 │
+            │  【步骤 7】解析事务上下文（支持 'meta' scope）                   │
+            │     resolvePostgresDbOrTx(this.db, context, 'meta')            │
+            │       → getPostgresTransaction(context, 'meta') ?? this.db     │
+            │                                                                 │
+            │  【步骤 8】构建复杂 SELECT 查询                                 │
+            │     db                                                          │
+            │       .selectFrom('table_meta')                                 │
+            │       .leftJoinLateral(fieldsLateral)  // 聚合 field 记录       │
+            │       .leftJoinLateral(viewsLateral)    // 聚合 view 记录       │
+            │       .select(['id', 'name', 'fields.fields', 'views.views'])  │
+            │       .where((eb) => whereFactory(eb))  // 应用条件             │
+            │       .$if(state === 'deleted', (qb) =>                         │
+            │         qb.where(sql`deleted_time is not null`)                │
+            │       )                                                         │
+            │                                                                 │
+            │  【步骤 9】执行 SQL                                              │
+            │     baseQuery.executeTakeFirst() → tableRow                     │
+            │                                                                 │
+            │  【步骤 10】映射回领域对象                                       │
+            │     this.tableMapper.toDomain(tableRow) → Table                │
+            └──────────────────────────────────────────────────────────────┘
          │
          ▼  返回 Result<Table, DomainError>
 ```
 
-**关键代码细节**：
+**TableWhereVisitor 核心实现（可复核）**：
+
+```typescript
+// adapter-repository-postgres/src/repositories/visitors/TableWhereVisitor.ts:169-190
+// 继承自 AbstractSpecFilterVisitor，支持 AND/OR/NOT 组合
+export class TableWhereVisitor
+  extends core.AbstractSpecFilterVisitor<ITableMetaWhere>
+  implements core.ITableSpecVisitor<ITableMetaWhere>
+{
+  // 按 ITableSpecVisitor 接口方法逐项实现：
+  visitTableById(spec: core.TableByIdSpec): Result<ITableMetaWhere, DomainError> {
+    const cond: ITableMetaWhere = (eb) => eb.eb('id', '=', spec.tableId().toString());
+    this.mergeSpecInfo({ specName: 'TableByIdSpec', tableId: spec.tableId().toString() });
+    return this.addCond(cond).map(() => cond);
+  }
+
+  visitTableByBaseId(spec: core.TableByBaseIdSpec): Result<ITableMetaWhere, DomainError> {
+    const cond: ITableMetaWhere = (eb) => eb.eb('base_id', '=', spec.baseId().toString());
+    return this.addCond(cond).map(() => cond);
+  }
+
+  visitTableByName(spec: core.TableByNameSpec): Result<ITableMetaWhere, DomainError> {
+    const cond: ITableMetaWhere = (eb) => eb.eb('name', '=', spec.name().toString());
+    return this.addCond(cond).map(() => cond);
+  }
+
+  visitTableBySpaceId(spec: core.TableBySpaceIdSpec): Result<ITableMetaWhere, DomainError> {
+    const cond: ITableMetaWhere = (eb) => eb.eb('space_id', '=', spec.spaceId().toString());
+    return this.addCond(cond).map(() => cond);
+  }
+
+  // ... 20+ 个 visit 方法对应不同的 Specification
+
+  // 父类提供的组合逻辑：
+  and(left: ITableMetaWhere, right: ITableMetaWhere): ITableMetaWhere {
+    return (eb) => eb.and([left(eb), right(eb)]);
+  }
+  or(left: ITableMetaWhere, right: ITableMetaWhere): ITableMetaWhere {
+    return (eb) => eb.or([left(eb), right(eb)]);
+  }
+  not(inner: ITableMetaWhere): ITableMetaWhere {
+    return (eb) => eb.not(inner(eb));
+  }
+}
+```
+
+**PostgresTableRepository.findOne 核心逻辑（可复核）**：
 
 ```typescript
 // adapter-repository-postgres/src/repositories/PostgresTableRepository.ts:579-617
@@ -432,48 +614,39 @@ async findOne(
   spec: core.ISpecification<core.Table, core.ITableSpecVisitor>,
   options?: Pick<core.TableFindOptions, 'state'>
 ): Promise<Result<core.Table, DomainError>> {
-  // Step 1: 创建 Visitor
-  const visitor = new TableWhereVisitor(options?.state);
-  
-  // Step 2: Specification 接受 Visitor（双分派）
-  const acceptResult = spec.accept(visitor);
-  if (acceptResult.isErr()) return err(acceptResult.error);
+  return safeTry<core.Table, DomainError>(async function* (this: PostgresTableRepository) {
+    // 步骤 3: 创建 Visitor
+    const visitor = new TableWhereVisitor(options?.state);
 
-  // Step 3: Visitor 生成 SQL Where 条件
-  const whereResult = visitor.where();
-  if (whereResult.isErr()) return err(whereResult.error);
-  const whereFactory = whereResult.value;
+    // 步骤 4-5: 双分派 + 生成条件
+    const acceptResult = spec.accept(visitor);
+    if (acceptResult.isErr()) return err(acceptResult.error);
 
-  // Step 4: 解析事务上下文（支持 meta scope）
-  const db = resolvePostgresDbOrTx(this.db, context, 'meta');
+    // 步骤 6: 获取 where 工厂
+    const whereResult = visitor.where();
+    if (whereResult.isErr()) return err(whereResult.error);
+    const whereFactory = whereResult.value;
 
-  // Step 5: 构建复杂查询（LATERAL JOIN 聚合 fields/views）
-  const baseQuery = db
-    .selectFrom('table_meta')
-    .leftJoinLateral(fieldsLateral, (join) => join.onTrue())
-    .leftJoinLateral(viewsLateral, (join) => join.onTrue())
-    .select(['table_meta.id', 'table_meta.name', 'fields.fields', 'views.views'])
-    .where((eb) => whereFactory(eb));  // 应用 Visitor 生成的条件
+    // 步骤 7: 解析事务上下文
+    const db = resolvePostgresDbOrTx(this.db, context, 'meta');
 
-  // Step 6: 执行并映射结果
-  const tableRow = await baseQuery.executeTakeFirst();
-  const tableResult = this.mapTableRow(tableRow);
-}
-```
+    // 步骤 8: 构建查询
+    const baseQuery = db
+      .selectFrom('table_meta')
+      .leftJoinLateral(fieldsLateral, (join) => join.onTrue())
+      .leftJoinLateral(viewsLateral, (join) => join.onTrue())
+      .select(['table_meta.id', 'table_meta.name', 'fields.fields', 'views.views'])
+      .where((eb) => whereFactory(eb));
 
-**TableWhereVisitor 核心实现**：
+    // 步骤 9: 执行
+    const tableRow = await baseQuery.executeTakeFirst();
 
-```typescript
-// adapter-repository-postgres/src/repositories/visitors/TableWhereVisitor.ts:176-186
-visitTableById(spec: TableByIdSpec): Result<ITableMetaWhere, DomainError> {
-  const cond: ITableMetaWhere = (eb) => eb.eb('id', '=', spec.tableId().toString());
-  this.mergeSpecInfo({ specName: 'TableByIdSpec', tableId: spec.tableId().toString() });
-  return this.addCond(cond).map(() => cond);
-}
+    // 步骤 10: 映射
+    const tableResult = this.tableMapper.toDomain(tableRow);
+    if (tableResult.isErr()) return err(tableResult.error);
 
-// 继承自 AbstractSpecFilterVisitor，支持 AND/OR/NOT 组合
-and(left: ITableMetaWhere, right: ITableMetaWhere): ITableMetaWhere {
-  return (eb) => eb.and([left(eb), right(eb)]);
+    return ok(tableResult.value);
+  }.bind(this));
 }
 ```
 
@@ -482,36 +655,63 @@ and(left: ITableMetaWhere, right: ITableMetaWhere): ITableMetaWhere {
 ```
 应用层（Command Handler）
          │
-         ▼  构建变更 Specification
-    TableAddFieldSpec(field)
+         ▼  【步骤 1】构建变更 Specification
+    TableAddFieldSpec.create(field: Field)
          │
-         ▼  调用 repository
+         ▼  【步骤 2】调用 repository 接口
   ITableRepository.updateOne(context, table, mutateSpec)
          │
-         ▼  ┌────────────────────────────────────────────┐
-            │  Adapter 层：PostgresTableRepository       │
-            │                                            │
-            │  1. 构建基础 where 条件（id, base_id）     │
-            │  2. 创建 TableMetaUpdateVisitor            │
-            │  3. mutateSpec.accept(visitor)             │
-            │     → visitor.visitTableAddField(spec)     │
-            │     → 生成 INSERT INTO field 语句          │
-            │     → 支持 ON CONFLICT 软恢复              │
-            │  4. visitor.where() → 获取 SQL 语句数组    │
-            │  5. executeCompiledQueries() → 批量执行     │
-            │  6. 加载更新后的 field/view 版本号         │
-            │  7. 返回 TableUpdatePersistResult         │
-            └────────────────────────────────────────────┘
+         ▼  ┌──────────────────────────────────────────────────────────────┐
+            │  Adapter 层：PostgresTableRepository                            │
+            │                                                                 │
+            │  【步骤 3】验证表状态：从 DB 加载当前版本（乐观锁校验）          │
+            │     const existing = yield* this.findOneOrFail(context,       │
+            │       TableByIdSpec.create(table.id()), options);             │
+            │                                                                 │
+            │  【步骤 4】创建 TableMetaUpdateVisitor                         │
+            │     const visitor = new TableMetaUpdateVisitor({              │
+            │       db, table, existingVersion, now, actorId, ...           │
+            │     });                                                        │
+            │                                                                 │
+            │  【步骤 5】双分派：mutateSpec.accept(visitor)                  │
+            │     ↓ TableAddFieldSpec.accept() 实现：                        │
+            │     accept(visitor) { return visitor.visitTableAddField(this); }│
+            │                                                                 │
+            │  【步骤 6】Visitor.visitTableAddField() 生成 SQL 语句          │
+            │     → this.fieldRowBuilder.buildRowForField(field)            │
+            │     → buildInsertOrReviveFieldStatement(fieldRow)             │
+            │       · INSERT INTO field VALUES (...)                        │
+            │       · ON CONFLICT (id) DO UPDATE SET                        │
+            │         deleted_time = NULL, version = version + 1            │
+            │     → statements = [insertOrReviveStmt]                       │
+            │     → this.addCond(statements)                                │
+            │                                                                 │
+            │  【步骤 7】获取所有语句：visitor.where()                       │
+            │     → 返回 ReadonlyArray<TableUpdateBuilder>                  │
+            │                                                                 │
+            │  【步骤 8】编译并执行所有语句                                  │
+            │     const results = yield* executeCompiledQueries(            │
+            │       db, statements, { method: 'updateOne' }                 │
+            │     );                                                         │
+            │                                                                 │
+            │  【步骤 9】收集版本变更信息                                    │
+            │     → 从 RETURNING 子句提取新的 field/view version            │
+            │     → 构建 FieldPersistResult[]                               │
+            │                                                                 │
+            │  【步骤 10】返回 TableUpdatePersistResult                      │
+            │     { fieldVersions: [...], viewVersions: [...] }             │
+            └──────────────────────────────────────────────────────────────┘
          │
          ▼  返回版本变更结果
 ```
 
-**TableMetaUpdateVisitor 核心实现**：
+**TableMetaUpdateVisitor 核心实现（可复核）**：
 
 ```typescript
-// adapter-repository-postgres/src/repositories/visitors/TableMetaUpdateVisitor.ts:144-155
+// adapter-repository-postgres/src/repositories/visitors/TableMetaUpdateVisitor.ts:138-165
+// 按 ITableSpecVisitor 接口方法逐项实现：
 visitTableAddField(
-  spec: TableAddFieldSpec
+  spec: core.TableAddFieldSpec
 ): Result<ReadonlyArray<TableUpdateBuilder>, DomainError> {
   const fieldRowResult = this.fieldRowBuilder.buildRowForField(spec.field());
   if (fieldRowResult.isErr()) return err(fieldRowResult.error);
@@ -520,10 +720,11 @@ visitTableAddField(
     this.buildInsertOrReviveFieldStatement(fieldRowResult.value),
   ];
 
+  this.mergeSpecInfo({ specName: 'TableAddFieldSpec' });
   return this.addCond(statements).map(() => statements);
 }
 
-// 软删除恢复逻辑：先 INSERT，冲突时 UPDATE 并清除 deleted_time
+// 软删除恢复逻辑（可复核）
 private buildInsertOrReviveFieldStatement(fieldRow: TableFieldRow): TableUpdateBuilder {
   return this.params.db
     .insertInto('field')
@@ -536,6 +737,89 @@ private buildInsertOrReviveFieldStatement(fieldRow: TableFieldRow): TableUpdateB
       })
     );
 }
+
+visitTableUpdateField(
+  spec: core.TableUpdateFieldSpec
+): Result<ReadonlyArray<TableUpdateBuilder>, DomainError> {
+  const statements: ReadonlyArray<TableUpdateBuilder> = [
+    this.params.db
+      .updateTable('field')
+      .set({ name: spec.field().name().toString() })
+      .where('id', '=', spec.field().id().toString())
+      .where('version', '=', this.fieldRowBuilder.fieldVersion(spec.field())),
+  ];
+  return this.addCond(statements).map(() => statements);
+}
+
+visitTableDeleteField(
+  spec: core.TableDeleteFieldSpec
+): Result<ReadonlyArray<TableUpdateBuilder>, DomainError> {
+  const statements: ReadonlyArray<TableUpdateBuilder> = [
+    this.params.db
+      .updateTable('field')
+      .set({ deleted_time: this.params.now })  // 软删除
+      .where('id', '=', spec.fieldId().toString())
+      .where('version', '=', this.fieldRowBuilder.fieldVersion(spec.field())),
+  ];
+  return this.addCond(statements).map(() => statements);
+}
+
+// ... 20+ 个 visit 方法处理不同的变更操作
+```
+
+**PostgresTableRepository.updateOne 核心逻辑（可复核）**：
+
+```typescript
+// adapter-repository-postgres/src/repositories/PostgresTableRepository.ts:823-905
+async updateOne(
+  context: core.IExecutionContext,
+  table: core.Table,
+  mutateSpec: core.ISpecification<core.Table, core.ITableSpecVisitor>,
+  options?: core.TableFindOptions
+): Promise<Result<core.TableUpdatePersistResult | void, DomainError>> {
+  return safeTry<core.TableUpdatePersistResult | void, DomainError>(
+    async function* (this: PostgresTableRepository) {
+      // 步骤 3: 验证表状态（乐观锁）
+      const existingResult = yield* await this.findOneOrFail(
+        context,
+        core.TableByIdSpec.create(table.id()),
+        options
+      );
+
+      // 步骤 4: 创建 Visitor
+      const db = resolvePostgresDbOrTx(this.db, context, 'meta');
+      const visitor = new TableMetaUpdateVisitor({
+        db,
+        table,
+        existingVersion: existingResult.version(),
+        now: new Date().toISOString(),
+        actorId: context.actorId.toString(),
+        fieldRowBuilder: this.fieldRowBuilder,
+      });
+
+      // 步骤 5-6: 双分派 + 生成 SQL 语句
+      const acceptResult = mutateSpec.accept(visitor);
+      if (acceptResult.isErr()) return err(acceptResult.error);
+
+      // 步骤 7: 获取语句数组
+      const whereResult = visitor.where();
+      if (whereResult.isErr()) return err(whereResult.error);
+      const statements = whereResult.value;
+
+      // 步骤 8: 执行所有语句
+      const results = yield* await executeCompiledQueries(db, statements, {
+        method: 'updateOne',
+        tableId: table.id().toString(),
+      });
+
+      // 步骤 9-10: 收集版本变更并返回
+      return ok({
+        fieldVersions: extractFieldVersions(results),
+        viewVersions: extractViewVersions(results),
+      });
+    }.bind(this)
+  );
+}
 ```
 
 ### 8.2 记录仓储调用链（ITableRecordRepository + ITableRecordQueryRepository）
@@ -547,54 +831,166 @@ private buildInsertOrReviveFieldStatement(fieldRow: TableFieldRow): TableUpdateB
 ```
 应用层（Query Handler）
          │
-         ▼  构建记录查询 Specification
-    RecordConditionSpecBuilder
-      .where(fieldId, 'equals', value)
-      .build()
+         ▼  【步骤 1】构建记录查询 Specification
+    SingleLineTextConditionSpec.create(
+      field: textField,
+      operator: 'equals',
+      value: RecordConditionLiteralValue.create('foo')
+    )
          │
-         ▼  调用 repository
+         ▼  【步骤 2】调用 repository
   ITableRecordQueryRepository.find(context, table, spec, options)
          │
-         ▼  ┌────────────────────────────────────────────┐
-            │  Adapter 层：PostgresTableRecordQueryRepo  │
-            │                                            │
-            │  1. queryBuilderManager.createBuilder()   │
-            │  2. queryBuilder.select(projectionFields) │
-            │  3. 如有 spec：                            │
-            │     → 创建 TableRecordConditionWhereVisitor│
-            │     → spec.accept(visitor)                 │
-            │     → 生成记录查询 WHERE 条件              │
-            │  4. 处理 orderBy、pagination               │
-            │  5. queryBuilder.build() → 生成完整 SQL    │
-            │  6. execute() → 执行查询                   │
-            │  7. 映射结果为 TableRecordReadModel        │
-            └────────────────────────────────────────────┘
+         ▼  ┌──────────────────────────────────────────────────────────────┐
+            │  Adapter 层：PostgresTableRecordQueryRepository                │
+            │                                                               │
+            │  【步骤 3】queryBuilderManager.createBuilder(table, options)  │
+            │  【步骤 4】queryBuilder.select(projectionFields)              │
+            │  【步骤 5】如有 spec：                                         │
+            │     → 创建 TableRecordConditionWhereVisitor()                │
+            │     → spec.accept(visitor)         [双分派关键节点]            │
+            │       ↓ 调用对应 visit 方法                                   │
+            │       visitSingleLineTextIs(spec)                             │
+            │         → this.applyIs(field, value)                         │
+            │           → 生成 SQL: "fld_xxx" = 'foo'                      │
+            │     → visitor.where() → 获取 sql 表达式                       │
+            │     → queryBuilder.where(sqlExpr)                            │
+            │  【步骤 6】处理 orderBy、pagination                            │
+            │  【步骤 7】queryBuilder.build() → 生成完整 Kysely AST         │
+            │  【步骤 8】execute() → 编译并执行 SQL                          │
+            │  【步骤 9】映射结果为 TableRecordReadModel                     │
+            └──────────────────────────────────────────────────────────────┘
          │
          ▼  返回查询结果
 ```
 
-**TableRecordConditionWhereVisitor 核心实现**：
+**TableRecordConditionWhereVisitor 核心实现（按真实方法名逐项对齐）**：
 
 ```typescript
-// adapter-table-repository-postgres/src/record/visitors/TableRecordConditionWhereVisitor.ts
-// 处理各种字段类型的查询条件
-visitSingleLineTextCondition(spec: SingleLineTextConditionSpec): Result<RecordConditionWhere, DomainError> {
-  const { fieldId, operator, value } = spec;
-  const dbFieldName = resolveDbFieldName(fieldId);
-  
-  return match(operator)
-    .with('equals', () => sql`${sql.ref(dbFieldName)} = ${value}`)
-    .with('contains', () => sql`${sql.ref(dbFieldName)} LIKE ${`%${value}%`}`)
-    .with('startsWith', () => sql`${sql.ref(dbFieldName)} LIKE ${`${value}%`}`)
-    .otherwise(() => err(unsupportedOperator));
+// core/src/domain/table/records/specs/ITableRecordConditionSpecVisitor.ts:26-263
+// 每个操作符对应独立的 visit 方法，共 130+ 个方法
+export interface ITableRecordConditionSpecVisitor<TResult = unknown> {
+  // 基础查询
+  visitRecordById(spec: RecordByIdSpec): Result<TResult, DomainError>;
+  visitRecordByIds(spec: RecordByIdsSpec): Result<TResult, DomainError>;
+  visitIncomingLinkSelected(spec: IncomingLinkSelectedSpec): Result<TResult, DomainError>;
+  visitIncomingLinkCandidate(spec: IncomingLinkCandidateSpec): Result<TResult, DomainError>;
+
+  // SingleLineText（6 个操作符）
+  visitSingleLineTextIs(spec: SingleLineTextConditionSpec): Result<TResult, DomainError>;
+  visitSingleLineTextIsNot(spec: SingleLineTextConditionSpec): Result<TResult, DomainError>;
+  visitSingleLineTextContains(spec: SingleLineTextConditionSpec): Result<TResult, DomainError>;
+  visitSingleLineTextDoesNotContain(spec: SingleLineTextConditionSpec): Result<TResult, DomainError>;
+  visitSingleLineTextIsEmpty(spec: SingleLineTextConditionSpec): Result<TResult, DomainError>;
+  visitSingleLineTextIsNotEmpty(spec: SingleLineTextConditionSpec): Result<TResult, DomainError>;
+
+  // Number（8 个操作符）
+  visitNumberIs(spec: NumberConditionSpec): Result<TResult, DomainError>;
+  visitNumberIsNot(spec: NumberConditionSpec): Result<TResult, DomainError>;
+  visitNumberIsGreater(spec: NumberConditionSpec): Result<TResult, DomainError>;
+  visitNumberIsGreaterEqual(spec: NumberConditionSpec): Result<TResult, DomainError>;
+  visitNumberIsLess(spec: NumberConditionSpec): Result<TResult, DomainError>;
+  visitNumberIsLessEqual(spec: NumberConditionSpec): Result<TResult, DomainError>;
+  visitNumberIsEmpty(spec: NumberConditionSpec): Result<TResult, DomainError>;
+  visitNumberIsNotEmpty(spec: NumberConditionSpec): Result<TResult, DomainError>;
+
+  // User（12 个操作符）
+  visitUserIs(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserIsNot(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserIsAnyOf(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserIsNoneOf(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserHasAnyOf(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserHasAllOf(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserIsExactly(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserIsNotExactly(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserHasNoneOf(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserIsEmpty(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserIsNotEmpty(spec: UserConditionSpec): Result<TResult, DomainError>;
+  visitUserContains(spec: UserConditionSpec): Result<TResult, DomainError>;
+
+  // Link（16 个操作符）
+  visitLinkIs(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkIsNot(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkIsAnyOf(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkIsNoneOf(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkHasAnyOf(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkHasAllOf(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkIsExactly(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkIsNotExactly(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkHasNoneOf(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkContains(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkDoesNotContain(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkIsEmpty(spec: LinkConditionSpec): Result<TResult, DomainError>;
+  visitLinkIsNotEmpty(spec: LinkConditionSpec): Result<TResult, DomainError>;
+
+  // ... LongText, Button, Rating, Checkbox, Date, SingleSelect, MultipleSelect,
+  //     Attachment, Formula, Rollup, ConditionalRollup, ConditionalLookup
+}
+```
+
+```typescript
+// adapter-table-repository-postgres/src/record/visitors/TableRecordConditionWhereVisitor.ts:1440-1444
+// 真实实现：每个 visit 方法委托给对应的 apply* 方法
+visitSingleLineTextIs(
+  spec: core.SingleLineTextConditionSpec
+): Result<RecordConditionWhere, DomainError> {
+  return this.applyIs(spec.field(), spec.value());
 }
 
-// User/Link 字段特殊处理：JSONB 路径查询
-visitUserCondition(spec: UserConditionSpec): Result<RecordConditionWhere, DomainError> {
-  const columnRef = sql`${sql.ref(dbFieldName)}`;
-  const idArray = buildUserLinkIdArray(columnRef, isMultiple);
-  return sql`${idArray} @> ARRAY[${userId}]::text[]`;
+// adapter-table-repository-postgres/src/record/visitors/TableRecordConditionWhereVisitor.ts:1764-1766
+visitUserIs(spec: core.UserConditionSpec): Result<RecordConditionWhere, DomainError> {
+  return this.applyIs(spec.field(), spec.value());
 }
+
+// adapter-table-repository-postgres/src/record/visitors/TableRecordConditionWhereVisitor.ts:1808-1810
+visitLinkIs(spec: core.LinkConditionSpec): Result<RecordConditionWhere, DomainError> {
+  return this.applyIs(spec.field(), spec.value());
+}
+```
+
+**applyIs 核心逻辑（可复核）**：
+
+```typescript
+// adapter-table-repository-postgres/src/record/visitors/TableRecordConditionWhereVisitor.ts:695-826
+const buildIsCondition = (
+  field: core.Field,
+  value: core.RecordConditionValue | undefined,
+  tableAlias?: string,
+  hostTableAlias?: string
+): Result<RecordConditionWhere, DomainError> => {
+  return safeTry<RecordConditionWhere, DomainError>(function* () {
+    const column = yield* resolveColumn(field, tableAlias);     // 步骤 A: 解析列名
+    const columnRef = sql.ref(column);                           // 步骤 B: 构造列引用
+    const isMultiple = yield* fieldIsMultiple(field);            // 步骤 C: 判断是否多值
+
+    // 分支 1: 日期值 → BETWEEN 范围查询
+    if (core.isRecordConditionDateValue(value)) {
+      const range = yield* resolveDateRange(value, resolveDateFormatting(field));
+      return ok(sql`${columnRef} between ${range.start} and ${range.end}`);
+    }
+
+    // 分支 2: User/Link 字段 → JSONB 路径提取 + id 匹配
+    const isUserOrLinkLike = fieldIsUserOrLink(field);
+    const operand = yield* resolvePrimitiveOperand(value, tableAlias, hostTableAlias);
+    if (isUserOrLinkLike && operand.kind === 'literal') {
+      return ok(
+        sql`jsonb_extract_path_text(to_jsonb(${columnRef}), 'id') = ${String(operand.value)}`
+      );
+    }
+
+    // 分支 3: 多值字段 → jsonb_array_elements_text + EXISTS
+    if (isMultiple && operand.kind === 'literal') {
+      const normalizedArray = normalizeToJsonArray(columnRef);
+      return ok(sql`EXISTS (
+        SELECT 1 FROM jsonb_array_elements_text(${normalizedArray}) AS elem
+        WHERE elem = ${primitiveLiteralToText(operand.value)}
+      )`);
+    }
+
+    // 分支 4: 普通字段 → 直接相等比较
+    return ok(sql`${columnRef} = ${operand.value}`);
+  });
+};
 ```
 
 #### 8.2.2 插入调用链：insert
@@ -602,45 +998,91 @@ visitUserCondition(spec: UserConditionSpec): Result<RecordConditionWhere, Domain
 ```
 应用层（Command Handler）
          │
-         ▼  构建 TableRecord
-    TableRecord.create(fields)
+         ▼  【步骤 1】构建 TableRecord
+    TableRecord.create(fieldIdValueMap)
          │
-         ▼  调用 repository
+         ▼  【步骤 2】调用 repository
   ITableRecordRepository.insert(context, table, record, options)
          │
-         ▼  ┌────────────────────────────────────────────┐
-            │  Adapter 层：PostgresTableRecordRepository │
-            │                                            │
-            │  1. RecordInsertBuilder.create()           │
-            │  2. 遍历所有字段：                          │
-            │     → FieldInsertValueVisitor              │
-            │     → field.accept(visitor)                │
-            │     → 生成 columnValues + queryExecutors   │
-            │  3. 处理计算字段、链接字段特殊逻辑          │
-            │  4. 构建主 INSERT SQL 语句                 │
-            │  5. 执行主插入                              │
-            │  6. 执行额外 queryExecutors（链接表等）    │
-            │  7. 触发计算字段更新（ComputedUpdater）    │
-            │  8. 返回 RecordMutationResult              │
-            └────────────────────────────────────────────┘
+         ▼  ┌──────────────────────────────────────────────────────────────────┐
+            │  Adapter 层：PostgresTableRecordRepository                          │
+            │                                                                   │
+            │  【步骤 3】构建执行上下文                                          │
+            │     → resolvePostgresDbOrTx(db, context)     [事务解析]           │
+            │     → resolveActorIdentity(actorLookupDb, actorId)                │
+            │     → getViewOrderInfo(db, tableName, views)                      │
+            │                                                                   │
+            │  【步骤 4】RecordInsertBuilder.buildInsertData()                  │
+            │     ┌────────────────────────────────────────────────────────┐    │
+            │     │ 遍历所有字段（table.getFields()）                       │    │
+            │     │                                                        │    │
+            │     │ 对于每个字段：                                          │    │
+            │     │   → field.dbFieldName() → 数据库列名                    │    │
+            │     │   → 创建 FieldInsertValueVisitor(rawValue, ctx)        │    │
+            │     │   → field.accept(insertVisitor)     [双分派]            │    │
+            │     │     · visitSingleLineTextField() → simpleValueFrom()    │    │
+            │     │     · visitUserField() → jsonValueFrom()                │    │
+            │     │     · visitLinkField() → 返回 {columnValues,            │    │
+            │     │                         queryExecutors}                  │    │
+            │     │                                                        │    │
+            │     │   ⚠️  关键：queryExecutors 仅返回，不执行                │    │
+            │     │                                                        │    │
+            │     │   【链接字段特殊路径】                                   │    │
+            │     │   if (field.type === 'link') {                          │    │
+            │     │     → columnValues 并入主 INSERT 值                     │    │
+            │     │     → 忽略 visitor 返回的 queryExecutors                │    │
+            │     │     → 调用 builder.buildLinkFieldSqls(field, value)     │    │
+            │     │       · 解析 linkItems                                  │    │
+            │     │       · 根据关系类型生成 SQL：                            │    │
+            │     │         manyMany → junction 表 DELETE + INSERT          │    │
+            │     │         manyOne  → 主表 FK 列赋值                        │    │
+            │     │         oneMany  → 外表 UPDATE SET FK                   │    │
+            │     │         oneOne   → 对称链接 UPDATE 外表 FK              │    │
+            │     │       · 生成 CompiledSqlStatement 数组                  │    │
+            │     │     → additionalStatements.push(...statements)          │    │
+            │     │   }                                                     │    │
+            │     └────────────────────────────────────────────────────────┘    │
+            │                                                                   │
+            │  【步骤 5】构建主 INSERT 语句                                      │
+            │     → 合并系统列（__id, __version, __created_time, 等）          │
+            │     → 合并视图排序列（__row_viewId）                              │
+            │     → 构建：INSERT INTO table VALUES (...)                       │
+            │     → 如有 changedFields：RETURNING 子句                         │
+            │                                                                   │
+            │  【步骤 6】执行主插入                                              │
+            │     → db.insertInto(tableName).values(valuesWithViewOrder)       │
+            │     → .executeTakeFirst() / .execute()                          │
+            │                                                                   │
+            │  【步骤 7】内联执行 additionalStatements                          │
+            │     → RecordInsertBuilder.executeStatements(db, statements)      │
+            │     → 循环执行每条：db.executeQuery(stmt.compiled)               │
+            │       · junction 表 INSERT（manyMany 链接）                      │
+            │       · 外表 UPDATE SET FK（oneMany 链接）                       │
+            │       · 附件索引表 INSERT                                        │
+            │                                                                   │
+            │  【步骤 8】计算字段更新                                            │
+            │     → runComputedUpdate(context, table, record, 'insert')       │
+            │     → 收集快照                                                    │
+            │  【步骤 9】返回 RecordMutationResult                              │
+            └──────────────────────────────────────────────────────────────────┘
          │
          ▼  返回插入结果
 ```
 
-**FieldInsertValueVisitor 核心实现**：
+**FieldInsertValueVisitor 核心实现（按真实方法名逐项对齐）**：
 
 ```typescript
-// adapter-table-repository-postgres/src/record/visitors/FieldInsertValueVisitor.ts:76-100
+// adapter-table-repository-postgres/src/record/visitors/FieldInsertValueVisitor.ts:76-212
 export class FieldInsertValueVisitor implements IFieldVisitor<FieldInsertResult> {
   private simpleValueFrom(value: unknown): Result<FieldInsertResult, DomainError> {
     return ok({
       columnValues: { [this.ctx.dbFieldName]: value ?? null },
-      queryExecutors: [],
+      queryExecutors: [],  // 简单字段无额外执行器
     });
   }
 
   private jsonValueFrom(value: unknown): Result<FieldInsertResult, DomainError> {
-    // JSONB 列必须使用 JSON.stringify（pg 驱动要求）
+    // JSONB 列：必须 JSON.stringify（pg 驱动要求）
     const serialized = value === null || value === undefined ? null : JSON.stringify(value);
     return ok({
       columnValues: { [this.ctx.dbFieldName]: serialized },
@@ -648,16 +1090,173 @@ export class FieldInsertValueVisitor implements IFieldVisitor<FieldInsertResult>
     });
   }
 
-  visitLinkField(field: LinkField): Result<FieldInsertResult, DomainError> {
-    // 链接字段特殊处理：生成关联表插入、FK 更新等额外语句
-    const linkStatements = buildLinkInsertStatements(field, this.rawValue);
-    return ok({
-      columnValues: { [this.ctx.dbFieldName]: serializedValue },
-      queryExecutors: linkStatements.executors,
-    });
+  private computedField(): Result<FieldInsertResult, DomainError> {
+    return ok({ columnValues: {}, queryExecutors: [] });
   }
+
+  // 按 IFieldVisitor 接口的方法名逐项对齐：
+  visitSingleLineTextField(_field: SingleLineTextField): Result<FieldInsertResult, DomainError> {
+    return this.simpleValueFrom(this.rawValue);
+  }
+  visitLongTextField(_field: LongTextField): Result<FieldInsertResult, DomainError> {
+    return this.simpleValueFrom(this.rawValue);
+  }
+  visitNumberField(_field: NumberField): Result<FieldInsertResult, DomainError> {
+    return this.simpleValueFrom(this.rawValue);
+  }
+  visitRatingField(_field: RatingField): Result<FieldInsertResult, DomainError> {
+    return this.simpleValueFrom(this.rawValue);
+  }
+  visitCheckboxField(_field: CheckboxField): Result<FieldInsertResult, DomainError> {
+    return this.simpleValueFrom(this.rawValue);
+  }
+  visitDateField(_field: DateField): Result<FieldInsertResult, DomainError> {
+    return this.simpleValueFrom(this.rawValue);
+  }
+  visitSingleSelectField(field: SingleSelectField): Result<FieldInsertResult, DomainError> {
+    return this.simpleValueFrom(this.mapSingleSelectValue(field, this.rawValue));
+  }
+  visitMultipleSelectField(field: MultipleSelectField): Result<FieldInsertResult, DomainError> {
+    return this.jsonValueFrom(this.mapMultipleSelectValue(field, this.rawValue));
+  }
+  visitAttachmentField(_field: AttachmentField): Result<FieldInsertResult, DomainError> {
+    return this.jsonValueFrom(this.rawValue);
+  }
+  visitUserField(_field: UserField): Result<FieldInsertResult, DomainError> {
+    return this.jsonValueFrom(this.rawValue);
+  }
+  visitFormulaField(_field: FormulaField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+  visitRollupField(_field: RollupField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+  visitLookupField(_field: LookupField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+  visitConditionalLookupField(_field: ConditionalLookupField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+  visitConditionalRollupField(_field: ConditionalRollupField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+  visitCreatedTimeField(_field: CreatedTimeField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+  visitLastModifiedTimeField(_field: LastModifiedTimeField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+  visitCreatedByField(_field: CreatedByField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+  visitLastModifiedByField(_field: LastModifiedByField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+  visitAutoNumberField(_field: AutoNumberField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+  visitButtonField(_field: ButtonField): Result<FieldInsertResult, DomainError> {
+    return this.computedField();
+  }
+```
+
+**链接字段 visitLinkField 实现（可复核）**：
+
+```typescript
+// adapter-table-repository-postgres/src/record/visitors/FieldInsertValueVisitor.ts:213-349
+visitLinkField(field: LinkField): Result<FieldInsertResult, DomainError> {
+  return safeTry<FieldInsertResult, DomainError>(
+    function* (this: FieldInsertValueVisitor) {
+      const columnValues: Record<string, unknown> = {};
+      const queryExecutors: QueryExecutor[] = [];  // ⚠️  返回但不执行
+
+      // 【步骤 A】处理 JSONB 列值
+      const storedValue = field.isMultipleValue()
+        ? this.rawValue
+        : Array.isArray(this.rawValue)
+          ? this.rawValue[0] ?? null
+          : this.rawValue;
+      columnValues[this.ctx.dbFieldName] =
+        storedValue === null || storedValue === undefined ? null : JSON.stringify(storedValue);
+
+      if (this.rawValue === null || this.rawValue === undefined) {
+        return ok({ columnValues, queryExecutors });
+      }
+
+      // 【步骤 B】解析 link items
+      const linkItems = Array.isArray(this.rawValue)
+        ? (this.rawValue as Array<{ id: string; title?: string }>)
+        : [this.rawValue as { id: string; title?: string }];
+
+      // 【步骤 C】根据关系类型生成 queryExecutors
+      const relationship = field.relationship().toString();
+
+      // CASE 1: manyMany / oneMany 单向 → junction 表
+      if (relationship === 'manyMany' || (relationship === 'oneMany' && field.isOneWay())) {
+        const fkHostTableName = yield* field.fkHostTableName();
+        const tableName = yield* fkHostTableName.split({ defaultSchema: 'public' });
+        const selfKeyName = yield* field.selfKeyNameString();
+        const foreignKeyName = yield* field.foreignKeyNameString();
+
+        for (let i = 0; i < linkItems.length; i++) {
+          const insertValues = {
+            [selfKeyName]: this.ctx.recordId,
+            [foreignKeyName]: linkItems[i].id,
+            ...(orderColumnName ? { [orderColumnName]: i + 1 } : {}),
+          };
+
+          // 策略：先 DELETE 再 INSERT（比 ON CONFLICT 更稳健）
+          queryExecutors.push(async (db) => {        // ⚠️  推入数组但不执行
+            await db
+              .deleteFrom(tableName)
+              .where(selfKeyName, '=', this.ctx.recordId)
+              .where(foreignKeyName, '=', linkItems[i].id)
+              .execute();
+            await db.insertInto(tableName).values(insertValues).execute();
+          });
+        }
+      }
+      // CASE 2: manyOne / oneOne → 主表 FK 列或对称链接外表 UPDATE
+      else if (relationship === 'manyOne' || relationship === 'oneOne') {
+        const foreignKeyName = yield* field.foreignKeyNameString();
+        if (foreignKeyName === '__id') {
+          // 对称链接：UPDATE 外表 FK
+          queryExecutors.push((db) =>                 // ⚠️  推入数组但不执行
+            db
+              .updateTable(foreignTableName)
+              .set({ [selfKeyName]: this.ctx.recordId })
+              .where('__id', '=', linkItems[0].id)
+              .execute()
+          );
+        } else {
+          // 普通 FK：直接在 columnValues 中赋值
+          columnValues[foreignKeyName] = linkItems[0].id;
+        }
+      }
+      // CASE 3: oneMany 双向 → UPDATE 外表 FK
+      else if (relationship === 'oneMany') {
+        for (const linkItem of linkItems) {
+          queryExecutors.push((db) =>                 // ⚠️  推入数组但不执行
+            db
+              .updateTable(foreignTableName)
+              .set({ [selfKeyName]: this.ctx.recordId })
+              .where('__id', '=', linkItem.id)
+              .execute()
+          );
+        }
+      }
+
+      return ok({ columnValues, queryExecutors });  // ⚠️  queryExecutors 返回给调用方
+    }.bind(this)
+  );
 }
 ```
+
+**⚠️  关键事实校准**：
+- `FieldInsertValueVisitor.visitLinkField()` 返回的 `queryExecutors` 在生产代码中**不被执行**
+- 实际执行路径：`RecordInsertBuilder.buildInsertData()` 检测到链接字段时，调用 `buildLinkFieldSqls()` 生成 `additionalStatements`
+- `additionalStatements` 通过 `RecordInsertBuilder.executeStatements()` 内联执行
+- `queryExecutors` 仅用于单元测试（参见 `FieldInsertValueVisitor.spec.ts`）
 
 ### 8.3 结构仓储调用链（ITableSchemaRepository）
 
@@ -668,27 +1267,70 @@ export class FieldInsertValueVisitor implements IFieldVisitor<FieldInsertResult>
 ```
 应用层（CreateTableCommand Handler）
          │
-         ▼  已创建 Table 领域对象（含字段）
+         ▼  【步骤 1】已创建 Table 领域对象（含所有字段）
          │
-         ▼  调用 repository
-  ITableSchemaRepository.insert(context, table)
+         ▼  【步骤 2】调用 repository 接口
+  ITableSchemaRepository.insert(context: IExecutionContext, table: Table)
          │
-         ▼  ┌────────────────────────────────────────────┐
-            │  Adapter 层：PostgresTableSchemaRepository │
-            │                                            │
-            │  1. PostgresTableSchemaFieldCreateVisitor  │
-            │    .forTableCreation(builderRef)           │
-            │  2. 遍历所有字段：                          │
-            │     → field.accept(visitor)                │
-            │     → 调用字段 Schema Rules                │
-            │     → 生成 ADD COLUMN 定义                  │
-            │  3. 构建 CREATE TABLE 语句                 │
-            │  4. 创建搜索索引（GIN trigram）             │
-            │  5. 创建系统列（__id, __version, 等）       │
-            │  6. 执行 DDL 语句                          │
-            │  7. 初始化 undo capture 基础设施           │
-            │  8. 填充链接字段标题等初始数据              │
-            └────────────────────────────────────────────┘
+         ▼  ┌──────────────────────────────────────────────────────────────┐
+            │  Adapter 层：PostgresTableSchemaRepository                       │
+            │                                                                 │
+            │  【步骤 3】解析表名                                               │
+            │     const dbTableName = yield* table.dbTableName();              │
+            │     const tableName = yield* dbTableName.value();                │
+            │                                                                 │
+            │  【步骤 4】创建表结构 DDL 构建器                                 │
+            │     const schemaBuilder = this.db.schema.createTable(tableName)  │
+            │       .addColumn(RECORD_ID_COLUMN, 'uuid', (col) =>             │
+            │         col.primaryKey()                                        │
+            │       )                                                         │
+            │       .addColumn(VERSION_COLUMN, 'integer', (col) =>            │
+            │         col.defaultTo(1).notNull()                              │
+            │       )                                                         │
+            │       .addColumn(CREATED_TIME_COLUMN, 'timestamptz')            │
+            │       .addColumn(LAST_MODIFIED_TIME_COLUMN, 'timestamptz')      │
+            │       .addColumn(CREATED_BY_COLUMN, 'text')                     │
+            │       .addColumn(LAST_MODIFIED_BY_COLUMN, 'text');              │
+            │                                                                 │
+            │  【步骤 5】创建字段创建 Visitor                                   │
+            │     const visitor =                                             │
+            │       PostgresTableSchemaFieldCreateVisitor.forTableCreation(   │
+            │         { builder: schemaBuilder, db: this.db }                 │
+            │       );                                                         │
+            │                                                                 │
+            │  【步骤 6】遍历所有字段，双分派生成列定义                          │
+            │     for (const field of table.getFields()) {                    │
+            │       if (field.computed().toBoolean()) continue;               │
+            │       const result = field.accept(visitor);                      │
+            │       // 调用对应 visit 方法：                                    │
+            │       // visitSingleLineTextField() → ADD COLUMN text           │
+            │       // visitNumberField() → ADD COLUMN numeric                │
+            │       // visitDateField() → ADD COLUMN timestamptz              │
+            │       // visitUserField() → ADD COLUMN jsonb                     │
+            │       // visitLinkField() → ADD COLUMN jsonb + foreign_key       │
+            │     }                                                           │
+            │                                                                 │
+            │  【步骤 7】执行 CREATE TABLE DDL                                  │
+            │     await schemaBuilder.execute();                               │
+            │                                                                 │
+            │  【步骤 8】创建搜索索引（可选）                                   │
+            │     for (const field of table.getFields()) {                    │
+            │       if (needsSearchIndex(field)) {                             │
+            │         await db.schema                                         │
+            │           .createIndex(...)                                     │
+            │           .using('gin')                                         │
+            │           .expression(sql`(${col} gin_trgm_ops)`)              │
+            │           .execute();                                            │
+            │       }                                                         │
+            │     }                                                           │
+            │                                                                 │
+            │  【步骤 9】初始化 undo capture 基础设施                           │
+            │     await installUndoCaptureTriggers(db, tableName);            │
+            │     await createRecordMutationSnapshotTable(db, tableName);     │
+            │                                                                 │
+            │  【步骤 10】填充链接字段标题等初始数据                             │
+            │     await populateLinkFieldTitles(db, table);                   │
+            └──────────────────────────────────────────────────────────────┘
          │
          ▼  返回 Result<void, DomainError>
 ```
@@ -698,78 +1340,266 @@ export class FieldInsertValueVisitor implements IFieldVisitor<FieldInsertResult>
 ```
 应用层（UpdateFieldCommand Handler）
          │
-         ▼  构建变更 Specification
-    TableUpdateFieldTypeSpec(oldField, newField)
+         ▼  【步骤 1】构建变更 Specification
+    TableUpdateFieldTypeSpec.create(oldField: Field, newField: Field)
          │
-         ▼  调用 repository
+         ▼  【步骤 2】调用 repository 接口
   ITableSchemaRepository.updateOne(context, table, mutateSpec)
          │
-         ▼  ┌────────────────────────────────────────────┐
-            │  Adapter 层：PostgresTableSchemaRepository │
-            │                                            │
-            │  1. 创建 TableSchemaUpdateVisitor          │
-            │  2. mutateSpec.accept(visitor)             │
-            │     → visitor.visitTableUpdateFieldType()  │
-            │     → 检测依赖变化（DependencyChangeDetec- │
-            │       torVisitor）                         │
-            │     → 收集值变更（FieldValueChangeCollec-  │
-            │       torVisitor）                         │
-            │     → 字段类型转换（FieldTypeConversion    │
-            │       Visitor）                            │
-            │     → 生成 ALTER TABLE ALTER COLUMN 语句   │
-            │     → 处理索引重建                          │
-            │  3. visitor.where() → 获取 DDL 语句数组    │
-            │  4. 执行 DDL 语句（带 undo capture）       │
-            │  5. 回填计算字段值                          │
-            │  6. 级联更新依赖字段                        │
-            └────────────────────────────────────────────┘
+         ▼  ┌──────────────────────────────────────────────────────────────┐
+            │  Adapter 层：PostgresTableSchemaRepository                       │
+            │                                                                 │
+            │  【步骤 3】解析表名和事务上下文                                   │
+            │     const db = resolvePostgresDbOrTx(this.db, context, 'data'); │
+            │                                                                 │
+            │  【步骤 4】创建 TableSchemaUpdateVisitor                         │
+            │     const visitor = new TableSchemaUpdateVisitor({              │
+            │       db, table, fieldIdMap, now, actorId, ...                 │
+            │     });                                                         │
+            │                                                                 │
+            │  【步骤 5】双分派：mutateSpec.accept(visitor)                    │
+            │     ↓ TableUpdateFieldTypeSpec.accept():                        │
+            │     accept(visitor) {                                           │
+            │       return visitor.visitTableUpdateFieldType(this);           │
+            │     }                                                           │
+            │                                                                 │
+            │  【步骤 6】Visitor.visitTableUpdateFieldType() 多阶段处理        │
+            │                                                                 │
+            │     【阶段 6a】检测依赖变化                                      │
+            │     const depDetector = new DependencyChangeDetectorVisitor();  │
+            │     spec.accept(depDetector);                                   │
+            │     // 识别是否影响 Lookup/Rollup/Formula 字段                  │
+            │                                                                 │
+            │     【阶段 6b】收集值变更                                        │
+            │     const valueCollector = new FieldValueChangeCollectorVisitor();│
+            │     spec.accept(valueCollector);                                │
+            │     // 识别需要数据转换的字段                                    │
+            │                                                                 │
+            │     【阶段 6c】字段类型转换                                      │
+            │     const conversionVisitor = new FieldTypeConversionVisitor(); │
+            │     spec.accept(conversionVisitor);                             │
+            │     // 生成 ALTER TABLE ALTER COLUMN TYPE USING 语句            │
+            │     // 例：ALTER TABLE t ALTER fld TYPE numeric USING fld::int │
+            │                                                                 │
+            │     【阶段 6d】处理索引重建                                      │
+            │     const indexStatements = rebuildSearchIndexIfNeeded(spec);   │
+            │     // DROP INDEX IF EXISTS old_idx;                            │
+            │     // CREATE INDEX new_idx ON t USING gin (fld gin_trgm_ops); │
+            │                                                                 │
+            │     【阶段 6e】组装所有 DDL 语句                                 │
+            │     statements = [                                              │
+            │       ...conversionVisitor.getStatements(),                     │
+            │       ...indexStatements,                                       │
+            │     ];                                                          │
+            │     this.addCond(statements);                                   │
+            │                                                                 │
+            │  【步骤 7】获取语句数组：visitor.where()                         │
+            │                                                                 │
+            │  【步骤 8】执行 DDL 语句（带 undo capture）                      │
+            │     for (const stmt of statements) {                            │
+            │       await stmt.compile().execute();                           │
+            │     }                                                           │
+            │                                                                 │
+            │  【步骤 9】回填计算字段值（如受影响）                             │
+            │     if (hasDependentComputedFields) {                           │
+            │       await backfillComputedFields(db, table, changedFields);   │
+            │     }                                                           │
+            │                                                                 │
+            │  【步骤 10】级联更新依赖字段                                      │
+            │     for (const depField of depDetector.getDependentFields()) {  │
+            │       await updateDependentField(db, table, depField);          │
+            │     }                                                           │
+            └──────────────────────────────────────────────────────────────┘
          │
-         ▼  返回变更结果
+         ▼  返回 Result<void, DomainError>
 ```
 
-**TableSchemaUpdateVisitor 核心实现**：
+**PostgresTableSchemaFieldCreateVisitor 核心实现（可复核，按真实方法名对齐）**：
 
 ```typescript
-// adapter-table-repository-postgres/src/schema/visitors/TableSchemaUpdateVisitor.ts:104-110
-export class TableSchemaUpdateVisitor
-  extends AbstractSpecFilterVisitor<ReadonlyArray<TableSchemaStatementBuilder>>
-  implements ITableSpecVisitor<ReadonlyArray<TableSchemaStatementBuilder>>
-{
-  // 处理字段类型转换
-  visitTableUpdateFieldType(
-    spec: TableUpdateFieldTypeSpec
-  ): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
-    // 1. 检测依赖变化
-    const depDetector = new DependencyChangeDetectorVisitor();
-    spec.accept(depDetector);
-    
-    // 2. 收集值变更
-    const valueCollector = new FieldValueChangeCollectorVisitor();
-    spec.accept(valueCollector);
-    
-    // 3. 生成类型转换 SQL
-    const conversionParams = buildConversionParams(spec.oldField(), spec.newField());
-    const statements = generateFieldConversionStatements(conversionParams);
-    
-    // 4. 处理索引重建（删除旧索引，创建新索引）
-    const indexStatements = rebuildSearchIndexIfNeeded(spec);
-    
-    return ok([...statements, ...indexStatements]);
-  }
-}
-
 // adapter-table-repository-postgres/src/schema/visitors/PostgresTableSchemaFieldCreateVisitor.ts
-// 字段创建 DDL 生成
-visitNumberField(field: NumberField): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
-  const dbFieldName = field.dbFieldName().value;
-  const columnDef = this.builderRef.builder
-    .addColumn(dbFieldName, 'numeric', (col) => {
-      if (field.notNull().toBoolean()) col = col.notNull();
-      if (field.unique().toBoolean()) col = col.unique();
-      return col;
+// 按 IFieldVisitor 接口的方法名逐项对齐：
+export class PostgresTableSchemaFieldCreateVisitor
+  implements core.IFieldVisitor<ReadonlyArray<TableSchemaStatementBuilder>>
+{
+  visitSingleLineTextField(
+    field: core.SingleLineTextField
+  ): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
+    const dbFieldName = yield* field.dbFieldName().value();
+    const columnDef = this.builderRef.builder
+      .addColumn(dbFieldName, 'text')
+      .$if(field.notNull().toBoolean(), (col) => col.notNull());
+    return ok([{ compile: () => columnDef.compile() }]);
+  }
+
+  visitNumberField(
+    field: core.NumberField
+  ): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
+    const dbFieldName = yield* field.dbFieldName().value();
+    const columnDef = this.builderRef.builder
+      .addColumn(dbFieldName, 'numeric')
+      .$if(field.notNull().toBoolean(), (col) => col.notNull())
+      .$if(field.unique().toBoolean(), (col) => col.unique());
+    return ok([{ compile: () => columnDef.compile() }]);
+  }
+
+  visitDateField(
+    field: core.DateField
+  ): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
+    const dbFieldName = yield* field.dbFieldName().value();
+    const columnDef = this.builderRef.builder
+      .addColumn(dbFieldName, 'timestamptz');
+    return ok([{ compile: () => columnDef.compile() }]);
+  }
+
+  visitCheckboxField(
+    field: core.CheckboxField
+  ): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
+    const dbFieldName = yield* field.dbFieldName().value();
+    const columnDef = this.builderRef.builder
+      .addColumn(dbFieldName, 'boolean')
+      .defaultTo(false);
+    return ok([{ compile: () => columnDef.compile() }]);
+  }
+
+  visitUserField(
+    field: core.UserField
+  ): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
+    const dbFieldName = yield* field.dbFieldName().value();
+    const columnDef = this.builderRef.builder
+      .addColumn(dbFieldName, 'jsonb');  // JSONB 存储 {id, name, email}
+    return ok([{ compile: () => columnDef.compile() }]);
+  }
+
+  visitLinkField(
+    field: core.LinkField
+  ): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
+    const dbFieldName = yield* field.dbFieldName().value();
+    const statements: TableSchemaStatementBuilder[] = [];
+
+    // JSONB 列存储链接关系
+    statements.push({
+      compile: () =>
+        this.builderRef.builder
+          .addColumn(dbFieldName, 'jsonb')
+          .compile(),
     });
-  
-  return ok([{ compile: () => columnDef.compile() }]);
+
+    // manyOne/oneOne: 添加 FK 列
+    if (isFkInMainTable(field)) {
+      const fkColumnName = yield* field.foreignKeyNameString();
+      statements.push({
+        compile: () =>
+          this.builderRef.builder
+            .addColumn(fkColumnName, 'uuid')
+            .addForeignKeyConstraint(
+              `fk_${fkColumnName}`,
+              [fkColumnName],
+              yield* field.foreignTableName().value(),
+              ['__id']
+            )
+            .compile(),
+      });
+    }
+
+    return ok(statements);
+  }
+
+  // visitLongTextField, visitSingleSelectField, visitMultipleSelectField,
+  // visitAttachmentField, visitFormulaField, visitRollupField, visitLookupField,
+  // visitRatingField, visitButtonField, visitCreatedTimeField, ...
+}
+```
+
+**TableSchemaUpdateVisitor 核心实现（可复核）**：
+
+```typescript
+// adapter-table-repository-postgres/src/schema/visitors/TableSchemaUpdateVisitor.ts:104-160
+export class TableSchemaUpdateVisitor
+  extends core.AbstractSpecFilterVisitor<ReadonlyArray<TableSchemaStatementBuilder>>
+  implements core.ITableSpecVisitor<ReadonlyArray<TableSchemaStatementBuilder>>
+{
+  // 按 ITableSpecVisitor 接口方法逐项实现：
+  visitTableAddField(
+    spec: core.TableAddFieldSpec
+  ): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
+    // 生成 ADD COLUMN 语句
+    const visitor = PostgresTableSchemaFieldCreateVisitor.forAlterTable({
+      builder: this.db.schema.alterTable(this.tableName),
+      db: this.db,
+    });
+    const fieldStatements = yield* spec.field().accept(visitor);
+    return this.addCond(fieldStatements).map(() => fieldStatements);
+  }
+
+  visitTableUpdateFieldType(
+    spec: core.TableUpdateFieldTypeSpec
+  ): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
+    return safeTry<ReadonlyArray<TableSchemaStatementBuilder>, DomainError>(
+      function* (this: TableSchemaUpdateVisitor) {
+        // 1. 检测依赖变化
+        const depDetector = new DependencyChangeDetectorVisitor();
+        spec.accept(depDetector);
+
+        // 2. 收集值变更
+        const valueCollector = new FieldValueChangeCollectorVisitor();
+        spec.accept(valueCollector);
+
+        // 3. 生成类型转换 SQL
+        const oldField = spec.oldField();
+        const newField = spec.newField();
+        const dbFieldName = yield* newField.dbFieldName().value();
+
+        const alterTableBuilder = this.db.schema
+          .alterTable(this.tableName)
+          .alterColumn(dbFieldName, (col) =>
+            col.setDataType(resolvePostgresType(newField))
+              .alterUsing(buildTypeConversionExpression(oldField, newField))
+          );
+
+        const statements: TableSchemaStatementBuilder[] = [
+          { compile: () => alterTableBuilder.compile() },
+        ];
+
+        // 4. 处理索引重建
+        const indexStatements = yield* rebuildSearchIndexIfNeeded(spec);
+        statements.push(...indexStatements);
+
+        return this.addCond(statements).map(() => statements);
+      }.bind(this)
+    );
+  }
+
+  visitTableDeleteField(
+    spec: core.TableDeleteFieldSpec
+  ): Result<ReadonlyArray<TableSchemaStatementBuilder>, DomainError> {
+    const dbFieldName = yield* spec.field().dbFieldName().value();
+    const statements: TableSchemaStatementBuilder[] = [
+      {
+        compile: () =>
+          this.db.schema
+            .alterTable(this.tableName)
+            .dropColumn(dbFieldName)
+            .compile(),
+      },
+    ];
+
+    // 同时删除可能存在的 FK 列（manyOne/oneOne）
+    if (isFkInMainTable(spec.field())) {
+      const fkColumnName = yield* spec.field().foreignKeyNameString();
+      statements.push({
+        compile: () =>
+          this.db.schema
+            .alterTable(this.tableName)
+            .dropColumn(fkColumnName)
+            .compile(),
+      });
+    }
+
+    return this.addCond(statements).map(() => statements);
+  }
+
+  // ... 其他 visit 方法：visitTableRenameField, visitTableUpdateFieldOptions, etc.
 }
 ```
 
@@ -867,20 +1697,25 @@ const createPostgresJsDb = <DB>(config: IV2PostgresDbConfig): Kysely<DB> => {
 - 类型安全更好
 - 无连接池概念（内部管理）
 
-### 9.3 DI 注册差异
+### 9.3 DI 注册差异（可复核）
 
-#### 9.3.1 pg 驱动注册
+#### 9.3.1 pg 驱动注册（node-postgres）
 
 ```typescript
 // adapter-db-postgres-pg/src/di/register.ts:9-57
+// 【核心注册函数】支持 meta/data 分别注册
 const registerDb = async (
   c: DependencyContainer,
   rawConfig: Partial<IV2PostgresDbConfig>,
-  target: 'all' | 'meta' | 'data'  // 支持分别注册 meta 和 data 数据库
+  target: 'all' | 'meta' | 'data'  // 注册目标：全部 / 仅元数据 / 仅业务数据
 ): Promise<DependencyContainer> => {
+  // 步骤 1: 配置校验（Zod Schema）
   const config = v2PostgresDbConfigSchema.parse(rawConfig);
+  
+  // 步骤 2: 创建数据库连接（node-postgres Pool）
   const db = await createV2PostgresDb(config);
 
+  // 步骤 3: 根据 target 注册到对应的 DI token
   if (target === 'all' || target === 'meta') {
     c.registerInstance(v2MetaDbTokens.db, db);
     c.registerInstance(v2MetaDbTokens.config, config);
@@ -889,21 +1724,52 @@ const registerDb = async (
     c.registerInstance(v2DataDbTokens.db, db);
     c.registerInstance(v2DataDbTokens.config, config);
   }
-  // ...
+  if (target === 'all') {
+    c.registerInstance(v2PostgresDbTokens.db, db);
+    c.registerInstance(v2PostgresDbTokens.config, config);
+  }
+
+  return c;
 };
 
-// 支持三种注册方式
-export const registerV2PostgresDb = async (...) => registerDb(c, rawConfig, 'all');
-export const registerV2PostgresMetaDb = async (...) => registerDb(c, rawConfig, 'meta');
-export const registerV2PostgresDataDb = async (...) => registerDb(c, rawConfig, 'data');
+// 【导出的三个注册入口】
+// 1. 注册到所有 token（单数据库场景）
+export const registerV2PostgresDb = async (
+  c: DependencyContainer = container,
+  rawConfig: Partial<IV2PostgresDbConfig> = {}
+): Promise<DependencyContainer> => registerDb(c, rawConfig, 'all');
+
+// 2. 仅注册 meta 数据库（双数据库场景，先调用）
+export const registerV2PostgresMetaDb = async (
+  c: DependencyContainer = container,
+  rawConfig: Partial<IV2PostgresDbConfig> = {}
+): Promise<DependencyContainer> => registerDb(c, rawConfig, 'meta');
+
+// 3. 仅注册 data 数据库（双数据库场景，后调用）
+export const registerV2PostgresDataDb = async (
+  c: DependencyContainer = container,
+  rawConfig: Partial<IV2PostgresDbConfig> = {}
+): Promise<DependencyContainer> => registerDb(c, rawConfig, 'data');
 ```
 
-**特点**：
-- 支持 meta/data 分离注册
-- 支持双数据库架构（不同的 connectionString）
-- 提供细粒度的注册函数
+**pg 驱动注册流程（可复核）**：
+```
+双数据库场景注册序列：
+  1. registerV2PostgresMetaDb(c, metaConfig)
+     → 创建 Pool1（连接 meta 数据库）
+     → 注册到 v2MetaDbTokens.db, v2MetaDbTokens.config
+     
+  2. registerV2PostgresDataDb(c, dataConfig)
+     → 创建 Pool2（连接 data 数据库）
+     → 注册到 v2DataDbTokens.db, v2DataDbTokens.config
+     
+  3. UnitOfWork 初始化时检测：
+     metaConfig.connectionString !== dataConfig.connectionString
+     → usesSinglePhysicalDatabase() = false
+     → meta 和 data scope 使用独立事务
+```
 
-#### 9.3.2 pglite 和 postgresjs 驱动注册
+#### 9.3.2 pglite 驱动注册
 
 ```typescript
 // adapter-db-postgres-pglite/src/di/register.ts:13-33
@@ -911,10 +1777,16 @@ export const registerV2PostgresPgliteDb = async (
   c: DependencyContainer = container,
   rawConfig: Partial<IV2PostgresDbConfig> = {}
 ): Promise<DependencyContainer> => {
+  // 步骤 1: 配置校验
   const config = v2PostgresDbConfigSchema.parse(rawConfig);
+  
+  // 步骤 2: 创建 PGlite 数据库（内存或文件）
+  // connectionString 被解释为数据目录：
+  //   "memory://" → 内存数据库
+  //   "./data/my.db" → 本地文件数据库
   const db = await createV2PostgresPgliteDb(config);
 
-  // pglite 总是注册到所有 token（meta 和 data 使用同一实例）
+  // 步骤 3: 总是注册到所有 token（单实例）
   c.registerInstance(v2MetaDbTokens.db, db);
   c.registerInstance(v2MetaDbTokens.config, config);
   c.registerInstance(v2DataDbTokens.db, db);
@@ -926,36 +1798,151 @@ export const registerV2PostgresPgliteDb = async (
 };
 ```
 
-**特点**：
-- pglite 和 postgresjs 总是使用单一数据库实例
-- meta 和 data scope 共享同一连接
-- 不支持双数据库架构
+#### 9.3.3 postgresjs 驱动注册
+
+```typescript
+// adapter-db-postgres-postgresjs/src/di/register.ts:13-30
+export const registerV2PostgresJsDb = async (
+  c: DependencyContainer = container,
+  rawConfig: Partial<IV2PostgresDbConfig> = {}
+): Promise<DependencyContainer> => {
+  // 步骤 1: 配置校验
+  const config = v2PostgresDbConfigSchema.parse(rawConfig);
+  
+  // 步骤 2: 创建 Postgres.js 连接
+  const db = createV2PostgresJsDb(config);
+
+  // 步骤 3: 总是注册到所有 token（单实例）
+  c.registerInstance(v2MetaDbTokens.db, db);
+  c.registerInstance(v2MetaDbTokens.config, config);
+  c.registerInstance(v2DataDbTokens.db, db);
+  c.registerInstance(v2DataDbTokens.config, config);
+  c.registerInstance(v2PostgresDbTokens.db, db);
+  c.registerInstance(v2PostgresDbTokens.config, config);
+
+  return c;
+};
+```
+
+**pglite / postgresjs 注册特点（可复核）**：
+- ✅ 总是使用单一数据库实例
+- ✅ meta 和 data scope 共享同一连接
+- ❌ 不支持双数据库架构
+- ✅ `usesSinglePhysicalDatabase()` 恒返回 `true`
+- ✅ 兄弟 scope 事务天然复用
 
 ### 9.4 事务上下文切换差异
 
-#### 9.4.1 共享的 UnitOfWork 实现
+#### 9.4.1 共享的 UnitOfWork 实现（可复核）
 
-三种驱动共享相同的 UnitOfWork 实现（来自 `adapter-db-postgres-shared`）：
+三种驱动共享相同的 UnitOfWork 实现（来自 `adapter-db-postgres-shared`），这是跨驱动适配的核心：
 
 ```typescript
 // adapter-db-postgres-shared/src/unitOfWork.ts:64-81
+// 【关键适配函数 1】获取当前 scope 的事务
 export const getPostgresTransaction = <DB>(
   context?: IExecutionContext,
   scope: UnitOfWorkScope = 'data'
 ): Transaction<DB> | null => {
+  // 步骤 1: 从 context 中获取指定 scope 的事务对象
   const transaction = getUnitOfWorkTransaction(context, scope);
+  
+  // 步骤 2: 类型检查 - 只接受 PostgresUnitOfWorkTransaction
   if (transaction instanceof PostgresUnitOfWorkTransaction) {
-    return transaction.db as Transaction<DB>;
+    return transaction.db as Transaction<DB>;  // 返回 Kysely Transaction 对象
   }
-  return null;
+  return null;  // 没有事务或类型不匹配
 };
 
+// 【关键适配函数 2】解析应该使用 db 还是 tx
 export const resolvePostgresDbOrTx = <DB>(
   db: Kysely<DB>,
   context?: IExecutionContext,
   scope: UnitOfWorkScope = 'data'
 ): Kysely<DB> | Transaction<DB> => {
+  // 策略：有事务用事务，无事务用 db
   return getPostgresTransaction<DB>(context, scope) ?? db;
+};
+```
+
+**UnitOfWork 事务上下文切换流程（可复核）**：
+
+```
+应用层调用 unitOfWork.withTransaction(context, work, { scope: 'data' })
+         │
+         ▼  【步骤 1】检查是否已有同 scope 事务
+    existingTx = getUnitOfWorkTransaction(context, scope)
+    if (existingTx) → 直接复用，执行 work(transactionContext)
+         │
+         ▼  【步骤 2】检查是否可以复用兄弟 scope 事务
+    if (usesSinglePhysicalDatabase()) {
+        // meta 和 data 是同一物理数据库
+        siblingTx = getUnitOfWorkTransaction(context, siblingScope)
+        if (siblingTx) {
+            // 创建新的 context，让当前 scope 指向兄弟 scope 的事务对象
+            sharedContext = {
+                ...context,
+                transactions: {
+                    ...context.transactions,
+                    [scope]: siblingTx  // 指向同一事务对象
+                }
+            }
+            → 执行 work(sharedContext)
+        }
+    }
+         │
+         ▼  【步骤 3】新建事务
+    db = (scope === 'meta') ? this.metaDb : this.dataDb
+    try {
+        result = db.transaction().execute(async (trx) => {
+            // 创建 PostgresUnitOfWorkTransaction 包装
+            transaction = new PostgresUnitOfWorkTransaction(trx, scope)
+            transactionContext = bindUnitOfWorkTransaction(context, transaction)
+            
+            // 执行业务逻辑
+            workResult = await work(transactionContext)
+            if (workResult.isErr()) {
+                // 抛出自定义异常触发回滚
+                throw new UnitOfWorkAbort(workResult.error)
+            }
+            return { workResult, transaction }
+        })
+        
+        // 事务提交后执行 afterCommit 钩子
+        await result.transaction.runAfterCommitHandlers()
+        return result.workResult
+    } catch (error) {
+        // 【步骤 4】死锁/序列化失败自动重试
+        if (isRetryableTransactionAbort(error) && attempt < maxRetries) {
+            const delayMs = backoffMs(attempt)  // 5ms, 10ms, 20ms + 随机抖动
+            attempt += 1
+            await sleep(delayMs)
+            continue  // 重试
+        }
+        // 回滚后执行 afterRollback 钩子
+        await transaction?.runAfterRollbackHandlers()
+        return err(error.error)
+    }
+```
+
+**重试策略（可复核）**：
+
+```typescript
+// adapter-db-postgres-shared/src/unitOfWork.ts:128-191
+const MAX_RETRIES = 3;
+
+const isRetryableTransactionAbort = (error: unknown): boolean => {
+  if (!(error instanceof PostgresDatabaseError)) return false;
+  // 40P01 = deadlock_detected
+  // 40001 = serialization_failure
+  return error.code === '40P01' || error.code === '40001';
+};
+
+const backoffMs = (attempt: number): number => {
+  // 指数退避 + 随机抖动：5ms, 10ms, 20ms + [0, 5]ms
+  const baseDelay = 5 * Math.pow(2, attempt);
+  const jitter = Math.floor(Math.random() * 6);
+  return baseDelay + jitter;
 };
 ```
 

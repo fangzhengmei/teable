@@ -4,315 +4,375 @@
 
 ### 1.1 字段权限模型 (Field Permission Model)
 
-字段权限的核心载体是 `enabledFieldIds` —— 一个**白名单数组**，表示当前用户有权限访问的字段 ID 集合。
-
-#### 数据结构定义
+字段权限的核心载体是 `enabledFieldIds` —— 一个**白名单数组**，表示当前用户有权限访问的字段 ID 集合。该值由 `RecordPermissionService` 扩展点提供。
 
 ```typescript
-// ListTableRecordsHandler.ts:215-221
-type IRecordReadQuerySource = {
-  enabledFieldIds?: ReadonlyArray<string>;  // 字段权限白名单
-  tableName?: string;
-  cteName?: string;
-  cteSql?: string;
+// record-permission.service.ts:4-14
+export type IWrapViewQuery = {
+  keepPrimaryKey?: boolean;  // 是否强制保留主键字段
+  viewId?: string;
 };
 
-type IExecutionContextWithRecordReadQuerySource = IExecutionContext & {
-  recordReadQuerySource?: IRecordReadQuerySource;  // 注入到执行上下文
+export type IRecordReadQuerySource = {
+  tableName: string;
+  cteName: string;
+  cteSql: string;
+  enabledFieldIds?: string[];  // 字段权限白名单
 };
 ```
 
-#### 权限注入链路
-
-权限信息通过 `RecordPermissionService` 计算并注入到执行上下文：
-
-```typescript
-// record-open-api-v2.service.ts:497-518
-private async createV2ReadContext(tableId: string, query: ...) {
-  const context = await this.v2ContextFactory.createContext();
-  const readSource = await this.recordPermissionService.getReadQuerySource(tableId, {
-    viewId: query.viewId,
-    keepPrimaryKey: Boolean(query.filterLinkCellSelected),
-  });
-  return {
-    ...context,
-    recordReadQuerySource: {
-      tableName: readSource.tableName,
-      cteName: readSource.cteName,
-      cteSql: readSource.cteSql,
-      enabledFieldIds: readSource.enabledFieldIds,  // 注入权限
-    },
-  } as IExecutionContext;
-}
-```
-
-> **关键点**：`enabledFieldIds` 由 `RecordPermissionService` 的 `wrapView()` 和 `getReadQuerySource()` 方法提供，这是权限系统的扩展点。
+`RecordPermissionService` 是一个**基础服务类**，实际的权限计算逻辑由业务扩展实现：
+- `wrapView()` - 返回权限包装后的查询构建器和 `enabledFieldIds`
+- `getReadQuerySource()` - 返回读取查询源信息
 
 ---
 
-### 1.2 视图列裁剪模型 (View Column Trimming)
+## 二、两条读取链路的完整流程
 
-视图列可见性通过 `ViewColumnMeta` 数据结构控制，每个视图为每个字段维护一份元数据。
+### 2.1 链路一：仅依赖字段白名单的查询处理（v1 链路）
 
-#### ViewColumnMeta 数据结构
+**入口**：`record.service.ts: getRecords()` (line 1033)
 
-```typescript
-// ViewColumnMeta.ts:12-20
-export type ViewColumnMetaEntry = {
-  order?: number | null;       // 列排序
-  visible?: boolean;           // 是否可见（用于 form/kanban/gallery 等）
-  hidden?: boolean;            // 是否隐藏（用于 grid 视图）
-  width?: number;              // 列宽
-  required?: boolean;          // 是否必填
-  statisticFunc?: string | null;  // 统计函数
-  [key: string]: unknown;
-};
+#### 完整流程
 
-export type ViewColumnMetaValue = Record<string, ViewColumnMetaEntry>;
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ 阶段 1: 查询记录 ID（仅用于排序、分页、过滤）                       │
+└──────────────────────────────────────────────────────────────────┘
+getRecords()
+    ↓
+getDocIdsByQuery()
+    ↓
+prepareQuery()
+    ├─ recordPermissionService.wrapView()  → 获取 enabledFieldIds
+    │     (record.service.ts:729-736)
+    ├─ sanitizeFilterByEnabledFields()     → 移除过滤条件中无权限字段
+    │     (record.service.ts:741)
+    └─ getNecessaryFieldMap()              → 构建字段映射（考虑权限）
+          (record.service.ts:519-543)
+    ↓
+buildFilterSortQuery()
+    ├─ projectionIds = fieldMap.values ∩ enabledFieldIds
+    │     (record.service.ts:837-841)
+    └─ SQL SELECT 仅包含 projectionIds 字段
+    ↓
+返回记录 ID 列表 (queryResult.ids)
+
+┌──────────────────────────────────────────────────────────────────┐
+│ 阶段 2: 计算返回字段投影 (projection)                              │
+└──────────────────────────────────────────────────────────────────┘
+projection =
+    ├─ ① 用户显式指定 query.projection → 使用用户指定
+    │     (record.service.ts:1056-1057)
+    └─ ② 否则调用 getViewProjection()
+          ├─ 检测 columnMeta 中有 visible 属性 → visible 模式（白名单）
+          ├─ 检测 columnMeta 中有 hidden 属性 → hidden 模式（黑名单）
+          └─ 都没有 → 返回 undefined（不限制）
+          (record.service.ts:978-1031)
+
+┌──────────────────────────────────────────────────────────────────┐
+│ 阶段 3: 获取实际字段数据                                          │
+└──────────────────────────────────────────────────────────────────┘
+getSnapshotBulkWithPermission(recordIds, projection)
+    ├─ recordPermissionService.wrapView(keepPrimaryKey: true)
+    │     → 再次获取 enabledFieldIds
+    │     (record.service.ts:1907-1913)
+    └─ finalProjection =
+          ├─ ① 如果有 projection（来自用户或视图）→ 直接使用
+          │     ⚠️  此时 enabledFieldIds 被忽略！
+          │     (record.service.ts:1915-1917)
+          └─ ② 否则 convertEnabledFieldIdsToProjection(enabledFieldIds)
+    ↓
+getSnapshotBulkInner() → SQL SELECT 仅包含 finalProjection 字段
 ```
 
-#### 视图类型差异
+#### 关键代码位置
 
-不同视图类型使用不同的可见性判断逻辑：
+| 步骤 | 文件 | 行号 |
+|------|------|------|
+| 入口 | `record.service.ts` | 1033 |
+| 查询 ID | `record.service.ts` | 1038-1054 |
+| 计算投影 | `record.service.ts` | 1056-1058 |
+| 获取数据 | `record.service.ts` | 1060-1067 |
+| getViewProjection | `record.service.ts` | 978-1031 |
+| getSnapshotBulkWithPermission | `record.service.ts` | 1898-1926 |
+
+> **⚠️ 重要发现**：v1 链路中，如果指定了 `viewId` 或用户提供了 `projection`，则 `enabledFieldIds` 在**返回字段时被完全忽略**。只有当两者都没有时，才会使用权限白名单过滤返回字段。
+
+---
+
+### 2.2 链路二：携带视图与权限信息的读取上下文（v2 链路）
+
+**入口**：`record-open-api-v2.service.ts: getRecords()` (line 208)
+
+#### 完整流程
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ 阶段 1: 构建权限上下文                                            │
+└──────────────────────────────────────────────────────────────────┘
+getRecords()
+    ↓
+createV2ReadContext()
+    └─ recordPermissionService.getReadQuerySource()
+       → enabledFieldIds 注入到 context.recordReadQuerySource
+       (record-open-api-v2.service.ts:497-518)
+
+┌──────────────────────────────────────────────────────────────────┐
+│ 阶段 2: 预过滤排序和分组字段                                      │
+└──────────────────────────────────────────────────────────────────┘
+sanitizeReadableSortAndGroup(query, enabledFieldIds)
+    ├─ orderBy = orderBy.filter(item => enabledFieldIdSet.has(item.fieldId))
+    └─ groupBy = groupBy.filter(item => enabledFieldIdSet.has(item.fieldId))
+    (record-open-api-v2.service.ts:520-539)
+
+┌──────────────────────────────────────────────────────────────────┐
+│ 阶段 3: 计算返回字段投影 (snapshotProjection)                     │
+└──────────────────────────────────────────────────────────────────┘
+resolveSnapshotProjection()
+    ├─ ① 用户显式指定 query.projection → 使用用户指定
+    │     (record-open-api-v2.service.ts:421-426)
+    ├─ ② 否则如果有 enabledFieldIds
+    │     ├─ fieldKeyType === Id → toProjectionMap(enabledFieldIds)
+    │     └─ 其他 → 查询字段元数据转换键类型
+    │     ⚠️  此时视图可见性被忽略！
+    │     (record-open-api-v2.service.ts:428-446)
+    └─ ③ 否则（没有 enabledFieldIds）
+          └─ getFieldsByQuery(viewId, filterHidden: true)
+             → 只返回视图可见字段
+             (record-open-api-v2.service.ts:448-470)
+
+┌──────────────────────────────────────────────────────────────────┐
+│ 阶段 4: 查询记录 ID（v2 领域层处理）                               │
+└──────────────────────────────────────────────────────────────────┘
+executeListRecordsEndpoint() → ListTableRecordsHandler.handle()
+    ├─ getEnabledFieldIdSet(context) → 从 context 获取权限
+    ├─ sanitizeFilterByEnabledFieldIds() → 过滤查询条件
+    │     (ListTableRecordsHandler.ts:229-264)
+    ├─ resolveSortValues() → 过滤排序字段
+    │     (ListTableRecordsHandler.ts:286-327)
+    ├─ 计算 searchVisibleFieldIds = 
+    │     query.viewId
+    │       ? filterFieldIdsByEnabledFieldIds(
+    │           getOrderedVisibleFieldIds(viewId),  // 视图可见字段
+    │           enabledFieldIds                    // 权限字段
+    │         )
+    │       : filterFieldIdsByEnabledFieldIds(table.fieldIds(), enabledFieldIds)
+    │     (ListTableRecordsHandler.ts:482-492)
+    └─ tableRecordQueryRepository.find() → 返回记录 ID 列表
+
+┌──────────────────────────────────────────────────────────────────┐
+│ 阶段 5: 获取实际字段数据                                          │
+└──────────────────────────────────────────────────────────────────┘
+getSnapshotBulkWithPermission(recordIds, snapshotProjection)
+    └─ （与 v1 相同，但此时 snapshotProjection 已按 v2 策略计算）
+```
+
+#### 关键代码位置
+
+| 步骤 | 文件 | 行号 |
+|------|------|------|
+| 入口 | `record-open-api-v2.service.ts` | 208 |
+| 构建上下文 | `record-open-api-v2.service.ts` | 221, 497-518 |
+| 过滤排序分组 | `record-open-api-v2.service.ts` | 227-230, 520-539 |
+| 计算投影 | `record-open-api-v2.service.ts` | 233-238, 415-470 |
+| 查询记录 ID | `record-open-api-v2.service.ts` | 255-282 |
+| 获取数据 | `record-open-api-v2.service.ts` | 290-297 |
+| v2 Handler | `ListTableRecordsHandler.ts` | 410-539 |
+
+> **⚠️ 重要发现**：v2 链路中，如果有 `enabledFieldIds`，返回字段**完全基于权限白名单，不考虑视图可见性**。只有当没有权限白名单时，才会使用视图可见性过滤返回字段。
+>
+> 但**搜索字段**是个例外：`searchVisibleFieldIds` 始终是 `视图可见字段 ∩ 权限字段` 的交集。
+
+---
+
+## 三、不同视图在展示侧的可见性分支
+
+### 3.1 核心判断逻辑
+
+视图可见性有**三套独立的判断逻辑**，分别用于不同场景：
+
+#### 场景 A：API 层返回字段列表（考虑强制显示字段）
+**判断函数**：`isNotHiddenField()` (is-not-hidden-field.ts:9-45)
+
+这是**唯一考虑强制显示字段**的判断逻辑，用于 `GET /tables/{tableId}/fields` 接口。
 
 ```typescript
-// getOrderedVisibleFieldIds.ts:14-21
-function isFieldVisible(meta: ViewColumnMetaEntry | undefined, viewType: string): boolean {
-  // Form, Kanban, Gallery, Calendar, Plugin 视图使用 visible 属性
+export const isNotHiddenField = (fieldId: string, view) => {
+  const { type: viewType, columnMeta, options } = view;
+
+  // Kanban 视图：stackFieldId、coverFieldId 强制显示
+  if (viewType === ViewType.Kanban) {
+    const { stackFieldId, coverFieldId } = options as IKanbanViewOptions;
+    return (
+      [stackFieldId, coverFieldId].includes(fieldId) ||
+      columnMeta[fieldId]?.visible !== false
+    );
+  }
+
+  // Gallery 视图：coverFieldId 强制显示
+  if (viewType === ViewType.Gallery) {
+    const { coverFieldId } = options as IGalleryViewOptions;
+    return fieldId === coverFieldId || columnMeta[fieldId]?.visible !== false;
+  }
+
+  // Calendar 视图：日期字段、标题字段、颜色配置字段强制显示
+  if (viewType === ViewType.Calendar) {
+    const { startDateFieldId, endDateFieldId, titleFieldId, colorConfig } = options as ICalendarViewOptions;
+    return (
+      (colorConfig?.type === ColorConfigType.Field && colorConfig.fieldId === fieldId) ||
+      [startDateFieldId, endDateFieldId, titleFieldId].includes(fieldId) ||
+      columnMeta[fieldId]?.visible !== false
+    );
+  }
+
+  // Form 视图：必须显式标记 visible: true
+  if (viewType === ViewType.Form) {
+    return Boolean(columnMeta[fieldId]?.visible);
+  }
+
+  // Grid 等其他视图：默认可见，hidden: true 才隐藏
+  return !columnMeta[fieldId]?.hidden;
+};
+```
+
+#### 场景 B：v1 链路返回数据投影（不考虑强制显示字段）
+**判断函数**：`getViewProjection()` (record.service.ts:978-1031)
+
+根据 `columnMeta` 中实际存在的属性自动判断模式：
+
+```typescript
+const useVisible = Object.values(columnMeta).some(column => 'visible' in column);
+const useHidden = Object.values(columnMeta).some(column => 'hidden' in column);
+
+if (useVisible) {
+  if (column.visible) acc[fieldKey] = true;  // 白名单模式
+} else if (useHidden) {
+  if (!column.hidden) acc[fieldKey] = true;  // 黑名单模式
+}
+```
+
+#### 场景 C：v2 链路搜索字段可见性（不考虑强制显示字段）
+**判断函数**：`isFieldVisible()` (getOrderedVisibleFieldIds.ts:14-21)
+
+根据视图类型硬编码判断：
+
+```typescript
+function isFieldVisible(meta, viewType) {
+  // Form, Kanban, Gallery, Calendar, Plugin → 使用 visible 属性
   if (['form', 'kanban', 'gallery', 'calendar', 'plugin'].includes(viewType)) {
-    return meta?.visible === true;  // 白名单模式：必须显式标记可见
+    return meta?.visible === true;  // 白名单模式
   }
-  // Grid 视图使用 hidden 属性（默认可见）
-  return meta?.hidden !== true;     // 黑名单模式：默认可见，显式标记隐藏才不可见
-}
-```
-
-#### 视图默认列可见性初始化
-
-新建视图时，`ViewColumnMeta.forView()` 方法会根据视图类型设置默认可见性：
-
-```typescript
-// ViewColumnMeta.ts:71-107
-static forView(params: { viewType: ViewType; fields: ...; primaryFieldId: FieldId }) {
-  // Form 视图：通过 FieldFormVisibilityVisitor 判断字段是否可在表单中显示
-  if (viewType === 'form') {
-    const visitor = new FieldFormVisibilityVisitor();
-    for (const field of params.fields) {
-      const visibleResult = field.accept(visitor);
-      if (visibleResult.isOk() && visibleResult.value) {
-        columnMeta[key] = { ...previous, visible: true };
-      }
-    }
-  }
-
-  // Kanban/Gallery/Calendar 视图：仅主键字段默认可见
-  if (['kanban', 'gallery', 'calendar'].includes(viewType)) {
-    const key = params.primaryFieldId.toString();
-    columnMeta[key] = { ...previous, visible: true };
-  }
+  // Grid → 使用 hidden 属性
+  return meta?.hidden !== true;     // 黑名单模式
 }
 ```
 
 ---
 
-## 二、查询侧的三层过滤机制
+### 3.2 各视图可见性规则汇总
 
-### 2.1 第一层：查询条件过滤 (Filter Sanitization)
+| 视图类型 | 可见性模式 | 默认值 | 强制显示字段 | 使用场景 |
+|----------|-----------|--------|-------------|----------|
+| **Grid** | `hidden` 黑名单 | 可见 | 无 | 所有场景 |
+| **Form** | `visible` 白名单 | 隐藏 | 无 | 所有场景 |
+| **Kanban** | `visible` 白名单* | 可见** | `stackFieldId`（分组字段）<br>`coverFieldId`（封面字段） | 仅 API 字段列表 |
+| **Gallery** | `visible` 白名单* | 可见** | `coverFieldId`（封面字段） | 仅 API 字段列表 |
+| **Calendar** | `visible` 白名单* | 可见** | `startDateFieldId`（开始日期）<br>`endDateFieldId`（结束日期）<br>`titleFieldId`（标题）<br>`colorConfig.fieldId`（颜色字段） | 仅 API 字段列表 |
+| **Plugin** | `visible` 白名单 | 隐藏 | 无 | 所有场景 |
 
-在构建查询条件时，会移除所有引用无权限字段的过滤条件。
-
-```typescript
-// ListTableRecordsHandler.ts:229-264
-const sanitizeFilterByEnabledFieldIds = (
-  filter: RecordFilter | undefined,
-  enabledFieldIds: ReadonlySet<string> | undefined
-): RecordFilter | undefined => {
-  const sanitizeNode = (node: RecordFilterNode): RecordFilterNode | undefined => {
-    if (isRecordFilterCondition(node)) {
-      return enabledFieldIds.has(node.fieldId) ? node : undefined;  // 无权限字段直接移除
-    }
-    // 递归处理过滤组和 NOT 节点...
-  };
-  return sanitizeNode(filter);
-};
-```
-
-**应用位置**：`ListTableRecordsHandler.handle()` 第 459-462 行，在合并视图默认过滤和用户查询过滤后应用。
+> * 注：Kanban/Gallery/Calendar 在 v1 `getViewProjection()` 和 v2 `isFieldVisible()` 中使用 `visible` 白名单模式，但 `isNotHiddenField()` 中使用 `visible !== false`（默认可见）。这是不一致的。
+>
+> ** 注：仅 `isNotHiddenField()` 中默认可见，其他判断逻辑中默认隐藏。
 
 ---
 
-### 2.2 第二层：排序字段过滤 (Sort Sanitization)
+### 3.3 强制显示字段规则说明
 
-排序时会跳过无权限的字段。
+强制显示字段**仅在 API 层返回字段列表**时生效（`isNotHiddenField()`），在**查询过滤和数据返回**时不生效。
 
-```typescript
-// ListTableRecordsHandler.ts:286-327
-const resolveSortValues = (
-  table: Table,
-  sort: ReadonlyArray<RecordSortValue> | undefined,
-  fieldKeyType: FieldKeyType,
-  enabledFieldIds?: ReadonlySet<string>
-) => {
-  for (const item of sort ?? []) {
-    // ... 解析 fieldId ...
-    if (enabledFieldIds && !enabledFieldIds.has(normalizedFieldId)) {
-      continue;  // 无权限字段跳过
-    }
-    resolvedSort.push({ fieldId: normalizedFieldId, order: item.order });
-  }
-};
-```
+这意味着：
+- 如果某个强制显示字段在 `columnMeta` 中被标记为隐藏
+  - ✓ `GET /fields` 接口仍然会返回该字段（因为强制显示）
+  - ✗ `GET /records` 接口返回的数据中**不包含**该字段
+  - ✗ 搜索时**不会**在该字段中搜索
+  - ✗ 不能用该字段作为过滤条件
+
+> **设计不一致**：强制显示字段规则仅应用于字段元数据 API，未同步到记录查询和数据返回。
 
 ---
 
-### 2.3 第三层：搜索字段过滤 (Search Field Filtering)
+## 四、查询过滤与展示侧可见性的对齐机制
 
-搜索时只在有权限且视图可见的字段中进行。
+### 4.1 各层级过滤对比表
+
+| 过滤层级 | v1 链路 | v2 链路 | 对齐情况 |
+|---------|---------|---------|---------|
+| **查询条件过滤** | ✓ `sanitizeFilterByEnabledFields()`<br>按 `enabledFieldIds` 过滤 | ✓ `sanitizeFilterByEnabledFieldIds()`<br>按 `enabledFieldIds` 过滤 | ✓ 两者对齐，都基于权限 |
+| **排序字段过滤** | ✓ SQL `projectionIds`<br>按 `enabledFieldIds` 过滤 | ✓ `resolveSortValues()`<br>按 `enabledFieldIds` 过滤 | ✓ 两者对齐，都基于权限 |
+| **搜索字段过滤** | ✓ `getSearchFields()`<br>先过滤视图隐藏字段<br>再按 `enabledFieldIds` 过滤 | ✓ `searchVisibleFieldIds`<br>`视图可见字段 ∩ 权限字段` | ✓ 两者对齐，都是交集 |
+| **返回字段过滤** | ✗ 有 viewId/projection 时<br>**忽略 `enabledFieldIds`**<br>仅使用视图可见性 | ✗ 有 `enabledFieldIds` 时<br>**忽略视图可见性**<br>仅使用权限白名单 | ✗ 两者策略相反，不对齐 |
+| **强制显示字段** | ✗ 不考虑 | ✗ 不考虑 | ✗ 都不考虑，仅字段列表 API 考虑 |
+
+---
+
+### 4.2 返回字段过滤策略对比
+
+```
+v1 链路返回字段策略：
+
+用户指定 projection?
+    ├─ 是 → 使用用户 projection
+    └─ 否 → 指定了 viewId?
+              ├─ 是 → 使用 getViewProjection() → 视图可见性
+              └─ 否 → 使用 enabledFieldIds → 权限白名单
+
+v2 链路返回字段策略：
+
+用户指定 projection?
+    ├─ 是 → 使用用户 projection
+    └─ 否 → 有 enabledFieldIds?
+              ├─ 是 → 使用 enabledFieldIds → 权限白名单
+              └─ 否 → 使用视图可见字段
+```
+
+**结论**：v1 和 v2 的返回字段策略**完全相反**：
+- v1：视图优先，权限兜底
+- v2：权限优先，视图兜底
+
+---
+
+### 4.3 搜索字段的特殊处理（交集策略）
+
+搜索字段在两条链路中都使用**交集策略**，这是唯一一致的地方：
 
 ```typescript
-// ListTableRecordsHandler.ts:482-492
+// v2 ListTableRecordsHandler.ts:482-492
 const searchVisibleFieldIds =
   query.viewId && !query.ignoreViewQuery
     ? filterFieldIdsByEnabledFieldIds(
-        yield* table.getOrderedVisibleFieldIds(query.viewId),  // 先取视图可见字段
-        enabledFieldIds                                      // 再与权限取交集
+        yield* table.getOrderedVisibleFieldIds(query.viewId),  // 视图可见
+        enabledFieldIds                                      // 权限允许
       )
     : filterFieldIdsByEnabledFieldIds(table.fieldIds(), enabledFieldIds);
-
-const visibleRowSearch = resolveVisibleRowSearch(
-  RecordSearch.fromOptionalTuple(query.search),
-  searchVisibleFieldIds
-);
 ```
 
 ```typescript
-// ListTableRecordsHandler.ts:359-368
-const filterFieldIdsByEnabledFieldIds = (
-  fieldIds: ReadonlyArray<FieldId>,
-  enabledFieldIds: ReadonlySet<string> | undefined
-): ReadonlyArray<FieldId> => {
-  if (enabledFieldIds == null) return fieldIds;
-  return fieldIds.filter((fieldId) => enabledFieldIds.has(fieldId.toString()));
-};
-```
-
-> **关键点**：`searchVisibleFieldIds` 是 **视图可见字段 ∩ 权限允许字段** 的交集。
-
----
-
-## 三、API 返回侧的字段裁剪
-
-### 3.1 SQL 查询层面的列裁剪
-
-在构建 SQL 查询时，通过 `projectionFieldIds` 只选择允许的字段。
-
-```typescript
-// record.service.ts:837-841
-const projectionIds = fieldMap
-  ? Array.from(new Set(Object.values(fieldMap).map((f) => f.id))).filter(
-      (id) => !enabledFieldIds || enabledFieldIds.includes(id)  // 权限过滤
-    )
-  : [];
-```
-
-### 3.2 搜索字段的双重过滤
-
-`getSearchFields()` 方法同时考虑视图隐藏和权限限制：
-
-```typescript
-// record.service.ts:2088-2103
-if (viewId) {
-  const { columnMeta: viewColumnRawMeta } = await this.prismaService.view.findUnique(...);
-  viewColumnMeta = viewColumnRawMeta ? JSON.parse(viewColumnRawMeta) : null;
-
-  if (viewColumnMeta) {
-    Object.entries(viewColumnMeta).forEach(([key, value]) => {
-      if (get(value, ['hidden'])) {
-        delete fieldInstanceMap[key];  // 先移除视图隐藏字段
-      }
-    });
-  }
+// v1 record.service.ts:2088-2103
+if (viewColumnMeta) {
+  Object.entries(viewColumnMeta).forEach(([key, value]) => {
+    if (get(value, ['hidden'])) {
+      delete fieldInstanceMap[key];  // 先移除视图隐藏
+    }
+  });
 }
 
 if (projection?.length) {
   Object.keys(fieldInstanceMap).forEach((fieldId) => {
     if (!projection.includes(fieldId)) {
-      delete fieldInstanceMap[fieldId];  // 再按权限投影过滤
+      delete fieldInstanceMap[fieldId];  // 再按权限过滤
     }
   });
-}
-```
-
----
-
-## 四、三者关系与同步机制
-
-### 4.1 整体数据流
-
-```
-权限服务 (RecordPermissionService)
-    ↓ wrapView() / getReadQuerySource()
-enabledFieldIds (权限白名单)
-    ↓ 注入到 IExecutionContext.recordReadQuerySource
-查询处理器 (ListTableRecordsHandler)
-    ├─→ 步骤1: sanitizeFilterByEnabledFieldIds()  过滤查询条件
-    ├─→ 步骤2: resolveSortValues()               过滤排序字段
-    ├─→ 步骤3: getOrderedVisibleFieldIds()        获取视图可见字段
-    │     └─→ isFieldVisible()                   根据视图类型判断可见性
-    ├─→ 步骤4: filterFieldIdsByEnabledFieldIds()  视图可见字段 ∩ 权限字段
-    └─→ 步骤5: resolveVisibleRowSearch()          搜索字段过滤
-    ↓
-数据库查询 (PostgresTableRecordQueryRepository)
-    ├─→ queryBuilder.select(projectionFieldIds)  SQL 列裁剪
-    └─→ buildRecordSearchWhereClause()           搜索条件构建
-    ↓
-API 响应
-    └─→ FieldKeyResolverService.transformResponseKeys()  字段键转换（无过滤）
-```
-
-### 4.2 同步的核心原则
-
-| 机制 | 控制维度 | 生效时机 | 数据来源 |
-|------|----------|----------|----------|
-| 字段权限 | `enabledFieldIds` 白名单 | 查询构建全阶段 | `RecordPermissionService` |
-| 视图列可见性 | `ViewColumnMeta.hidden/visible` | 获取可见字段列表时 | 视图配置（用户可调整） |
-| API 返回过滤 | `projectionFieldIds` 裁剪 | SQL 查询和结果序列化 | 前两者的交集 |
-
-### 4.3 关键同步点
-
-#### 同步点 1：查询条件的双重校验
-
-查询条件中的字段必须同时满足：
-1. 在 `enabledFieldIds` 权限白名单中
-2. 字段存在且有效（由 `resolveFilterFieldKeys` 校验）
-
-#### 同步点 2：搜索字段的交集计算
-
-```
-最终搜索字段 = (视图可见字段) ∩ (权限允许字段) ∩ (用户指定搜索字段)
-```
-
-代码实现：
-```typescript
-// 先取视图可见字段，再与权限取交集
-filterFieldIdsByEnabledFieldIds(
-  yield* table.getOrderedVisibleFieldIds(query.viewId),  // 视图层
-  enabledFieldIds                                      // 权限层
-)
-```
-
-#### 同步点 3：新增字段时的视图同步
-
-新增字段时，`cloneViewsWithField()` 方法会同步更新所有视图的 `columnMeta`：
-
-```typescript
-// Table.ts:1230-1301
-private cloneViewsWithField(fields: ReadonlyArray<Field>, newField: Field, options?) {
-  // Grid 视图：如果已有显式隐藏配置，则新增字段默认为隐藏
-  if (view.type().toString() === 'grid' && hasExplicitHiddenVisibilityConfig) {
-    nextEntry = { ...defaultEntry, hidden: true };
-  }
-  // 其他视图：使用默认可见性
 }
 ```
 
@@ -322,41 +382,65 @@ private cloneViewsWithField(fields: ReadonlyArray<Field>, newField: Field, optio
 
 | 功能 | 文件路径 | 关键行 |
 |------|----------|--------|
-| 字段权限上下文定义 | `packages/v2/core/src/queries/ListTableRecordsHandler.ts` | 215-227 |
-| 查询条件权限过滤 | `packages/v2/core/src/queries/ListTableRecordsHandler.ts` | 229-264 |
-| 排序字段权限过滤 | `packages/v2/core/src/queries/ListTableRecordsHandler.ts` | 286-327 |
-| 可见字段交集计算 | `packages/v2/core/src/queries/ListTableRecordsHandler.ts` | 359-368, 482-492 |
-| 视图可见性判断 | `packages/v2/core/src/domain/table/methods/getOrderedVisibleFieldIds.ts` | 14-21 |
-| 获取有序可见字段ID | `packages/v2/core/src/domain/table/methods/getOrderedVisibleFieldIds.ts` | 34-103 |
+| **权限模型** | | |
+| RecordPermissionService 定义 | `apps/nestjs-backend/src/features/record/record-permission.service.ts` | 1-35 |
+| enabledFieldIds 注入 v2 上下文 | `apps/nestjs-backend/src/features/record/open-api/record-open-api-v2.service.ts` | 497-518 |
+| **v1 链路** | | |
+| v1 getRecords 入口 | `apps/nestjs-backend/src/features/record/record.service.ts` | 1033-1073 |
+| v1 计算 projection | `apps/nestjs-backend/src/features/record/record.service.ts` | 1056-1058 |
+| getViewProjection | `apps/nestjs-backend/src/features/record/record.service.ts` | 978-1031 |
+| getSnapshotBulkWithPermission | `apps/nestjs-backend/src/features/record/record.service.ts` | 1898-1926 |
+| v1 搜索字段过滤 | `apps/nestjs-backend/src/features/record/record.service.ts` | 2088-2103 |
+| **v2 链路** | | |
+| v2 getRecords 入口 | `apps/nestjs-backend/src/features/record/open-api/record-open-api-v2.service.ts` | 208-310 |
+| resolveSnapshotProjection | `apps/nestjs-backend/src/features/record/open-api/record-open-api-v2.service.ts` | 415-470 |
+| sanitizeReadableSortAndGroup | `apps/nestjs-backend/src/features/record/open-api/record-open-api-v2.service.ts` | 520-539 |
+| ListTableRecordsHandler | `packages/v2/core/src/queries/ListTableRecordsHandler.ts` | 410-539 |
+| 权限过滤查询条件 | `packages/v2/core/src/queries/ListTableRecordsHandler.ts` | 229-264 |
+| 权限过滤排序字段 | `packages/v2/core/src/queries/ListTableRecordsHandler.ts` | 286-327 |
+| 搜索字段交集计算 | `packages/v2/core/src/queries/ListTableRecordsHandler.ts` | 482-492 |
+| **视图可见性** | | |
+| isNotHiddenField（强制显示） | `apps/nestjs-backend/src/utils/is-not-hidden-field.ts` | 9-45 |
+| isFieldVisible（v2 搜索） | `packages/v2/core/src/domain/table/methods/getOrderedVisibleFieldIds.ts` | 14-21 |
+| getOrderedVisibleFieldIds | `packages/v2/core/src/domain/table/methods/getOrderedVisibleFieldIds.ts` | 34-104 |
+| filterFieldsByView | `apps/nestjs-backend/src/features/field/fields-utils.ts` | 48-70 |
 | ViewColumnMeta 定义 | `packages/v2/core/src/domain/table/views/ViewColumnMeta.ts` | 12-36 |
-| 视图默认可见性初始化 | `packages/v2/core/src/domain/table/views/ViewColumnMeta.ts` | 71-107 |
-| 权限注入上下文 | `apps/nestjs-backend/src/features/record/open-api/record-open-api-v2.service.ts` | 497-518 |
-| 搜索字段双重过滤 | `apps/nestjs-backend/src/features/record/record.service.ts` | 2071-2168 |
-| 字段同步过滤计划 | `packages/v2/core/src/domain/table/fields/filter-sync.ts` | 54-126 |
 
 ---
 
-## 六、设计特点总结
+## 六、设计特点与不一致性总结
 
-### 6.1 权限与视图解耦设计
+### 6.1 设计优点
 
-- **字段权限** 是**系统级**控制，由权限服务计算，用户无法修改
-- **视图可见性** 是**用户级**配置，用户可以在视图中隐藏/显示字段
-- 两者通过**取交集**的方式协同，最终可见字段是两者的叠加限制
+1. **权限多层防御**：查询条件、排序、搜索在两条链路中都基于权限过滤，避免了"先查询后过滤"的性能和安全问题。
 
-### 6.2 多层防御的安全设计
+2. **搜索字段交集策略**：搜索字段同时考虑视图可见性和权限，符合用户预期——用户不会在隐藏字段中搜索。
 
-权限控制不是在最后一步过滤返回结果，而是在**查询构建的每个阶段**都进行校验：
-1. 过滤条件中不能引用无权限字段
-2. 排序不能使用无权限字段
-3. 搜索不能在无权限字段中进行
-4. SQL 查询只选择有权限的列
+3. **强制显示字段**：Kanban/Gallery/Calendar 等视图保证功能必需字段始终在字段列表中可见，避免视图配置损坏。
 
-这种设计避免了"先查询后过滤"带来的性能问题和安全隐患。
+### 6.2 已知不一致性
 
-### 6.3 视图类型的差异化处理
+| 问题 | 影响 | 建议 |
+|------|------|------|
+| **v1/v2 返回字段策略相反** | 相同权限下，v1 和 v2 API 返回不同的字段集合 | 统一为交集策略：`视图可见 ∩ 权限允许` |
+| **强制显示字段仅应用于字段列表 API** | 强制显示字段在数据查询时可能不返回，导致前端展示异常 | 将强制显示字段规则同步到返回字段投影计算 |
+| **三套可见性判断逻辑** | 不同场景可能得出不同的可见性结论 | 统一为单一判断函数，在所有场景复用 |
+| **v1 有 viewId 时忽略权限** | 可能导致权限泄露——无权限字段通过视图可见性返回 | v1 也应采用交集策略 |
+| **v2 有 enabledFieldIds 时忽略视图** | 用户隐藏的字段仍然返回，不符合用户预期 | v2 也应采用交集策略 |
 
-不同视图类型使用不同的可见性默认值，符合各视图的使用场景：
-- **Grid 视图**：默认全部可见，用户按需隐藏（适合数据浏览）
-- **Form 视图**：默认全部隐藏，用户按需添加（适合数据录入）
-- **Kanban/Gallery 视图**：仅主键默认可见（适合卡片展示）
+### 6.3 理想的同步机制
+
+建议统一为以下策略：
+
+```
+最终返回字段 = (用户指定投影) ∪ (视图可见字段 ∩ 权限允许字段 ∪ 强制显示字段)
+查询条件字段 ∈ 权限允许字段
+排序字段 ∈ 权限允许字段
+搜索字段 ∈ (视图可见字段 ∩ 权限允许字段)
+```
+
+这样可以确保：
+1. 权限始终是硬约束，不会被绕过
+2. 视图可见性是用户偏好，与权限取交集
+3. 强制显示字段作为补充，确保视图功能正常
+4. 所有层级对齐，避免不一致

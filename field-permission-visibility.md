@@ -862,43 +862,337 @@ if (projection?.length) {
 
 ---
 
-## 九、风险判断与确定性结论的边界
+## 九、默认 no-op 权限实现下各机制的生效情况
 
-### 9.1 可以得出的确定性结论
+### 9.1 默认运行态的前提
 
 ✅ **已确认事实**：
-1. `RecordPermissionService` 默认是空实现，当前仓库默认运行态无字段级权限控制
-2. `RecordPermissionService` 在 `record.module.ts:20` 注册，`global.module.ts:93` 明确标注为可覆盖
-3. v1 有 viewId 时返回字段忽略 `enabledFieldIds`，使用视图可见性
-4. v2 有 `enabledFieldIds` 时返回字段忽略视图可见性，使用权限白名单
-5. v1 两段搜索链路对 `ignoreViewQuery` 处理不一致
-6. v1 搜索字段只检查 `hidden`，不检查 `visible`
-7. 两套链路都遵循"单一来源原则"，不做交集运算
-8. 三套可见性判断逻辑独立且存在不一致
-9. 强制显示字段仅在 v2 无权限时影响返回投影
-10. 显式 projection 在两条链路中都具有最高优先级
+当前仓库 `RecordPermissionService` 的默认实现（`record-permission.service.ts:16-35`）是空操作（no-op）：
+- `getReadQuerySource()` 返回 `undefined`
+- `wrapView()` 返回 `{ viewCte: undefined, builder }`（直接透传原 builder，不返回 `enabledFieldIds`）
+
+因此在默认运行态下：
+- `enabledFieldIds` 始终为 `undefined`
+- 所有基于 `enabledFieldIds` 的权限过滤逻辑被旁路
+- 字段可见性完全由视图配置和显式 projection 控制
 
 ---
 
-### 9.2 需要结合权限实现验证的假设
+### 9.2 三种机制在默认运行态下的行为
 
-❓ **待验证假设**：
-1. `enabledFieldIds` 的具体生成逻辑：是否包含主键？是否考虑视图？
-2. `keepPrimaryKey: true` 的实际作用：是否强制添加主键到 `enabledFieldIds`？
-3. CTE 的具体实现：是否在 SQL 层面有额外的字段过滤？
-4. 什么场景下 `enabledFieldIds` 为 `undefined`？
-5. 实际业务中是否会同时使用 `visible` 和 `hidden` 属性？
-6. 业务扩展实现中，`wrapView()` 是否会传入 `viewId` 用于计算 `enabledFieldIds`？
+#### 机制 1：显式 projection
+
+**入口位置**：
+- v1：`record.service.ts:1056-1057` → `query.projection ? this.convertProjection(query.projection)`
+- v2：`record-open-api-v2.service.ts:421-426` → `explicitProjection = this.toProjectionMap(query.projection); if (explicitProjection) return explicitProjection`
+
+**优先级**：最高（两条链路一致）
+
+**兜底机制**：无。显式 projection 一旦存在，直接使用，不与任何其他机制取交集。
+
+**默认运行态下的行为**：与权限扩展无关。显式 projection 的行为不受 `enabledFieldIds` 影响。
+
+**风险**：显式 projection 可能包含用户无权限访问的字段（如果权限服务已扩展），但在默认运行态下无此风险。
 
 ---
 
-### 9.3 风险判断的边界
+#### 机制 2：视图可见性
 
-⚠️ **风险判断基于以下前提**：
-1. 假设 `enabledFieldIds` 确实是权限白名单（即只包含用户有权限的字段）
-2. 假设字段级权限是启用的（即 `enabledFieldIds` 不是 `undefined` 也不是全量字段）
-3. 假设 `columnMeta` 中同时使用 `visible` 和 `hidden` 属性不会出现在实际业务中
-4. 假设视图配置是正确的（即 Form 视图不会出现 `hidden` 属性）
-5. 假设用户显式指定的 `projection` 已经过前端或业务层校验
+**入口位置**：
+- v1：`record.service.ts:1058` → `await this.getViewProjection(tableId, query)`
+- v2：`record-open-api-v2.service.ts:448-470` → `getFieldsByQuery(viewId, filterHidden: true)`
 
-如果以上前提不成立，风险等级可能需要调整。
+**优先级**：
+- v1：次高（显式 projection → 视图可见性 → 权限白名单）
+- v2：最低（显式 projection → 权限白名单 → 视图可见性）
+
+**兜底机制**：
+- v1：当 `getViewProjection()` 返回 `undefined` 时，回退到 `enabledFieldIds`（但默认运行态下也是 `undefined`，最终不限制）
+- v2：当 `enabledFieldIds` 不存在且 `viewId` 存在时才使用
+
+**默认运行态下的行为**：
+- v1：显式 projection → 视图可见性 → 无限制（最终兜底）
+- v2：显式 projection → 无限制（`enabledFieldIds` 为 `undefined`，跳过）→ 视图可见性
+
+**关键差异**：默认运行态下，v1 的视图可见性是次高优先级，v2 的视图可见性是兜底优先级。但由于 `enabledFieldIds` 为 `undefined`，两条链路最终都会使用视图可见性（如果存在 `viewId`）。
+
+---
+
+#### 机制 3：搜索字段过滤
+
+**入口位置**：
+- v1 主查询搜索：`record.service.ts:896-901` → `getSearchFields(fieldMap, search, query?.viewId, enabledFieldIds)`
+- v1 搜索命中索引：`record.service.ts:2194-2199` → `getSearchFields(..., ignoreViewQuery ? undefined : viewId, projection)`
+- v2：`ListTableRecordsHandler.ts:482-492` → `searchVisibleFieldIds = filterFieldIdsByEnabledFieldIds(getOrderedVisibleFieldIds(viewId), enabledFieldIds)`
+
+**优先级**：搜索字段过滤独立于返回字段投影，在搜索时单独计算。
+
+**兜底机制**：
+- v1：当 `viewId` 存在时使用视图过滤，`enabledFieldIds` 为 `undefined` 时跳过权限过滤
+- v2：当 `enabledFieldIds` 为 `undefined` 时，`filterFieldIdsByEnabledFieldIds` 直接返回原数组
+
+**默认运行态下的行为**：
+- v1：搜索字段按视图可见性过滤（`enabledFieldIds` 为 `undefined`）
+- v2：搜索字段按视图可见性过滤（`enabledFieldIds` 为 `undefined`，`filterFieldIdsByEnabledFieldIds` 直接返回 `getOrderedVisibleFieldIds()` 的结果）
+
+---
+
+### 9.3 默认运行态下的完整行为总结
+
+| 场景 | v1 链路 | v2 链路 |
+|------|---------|---------|
+| 显式 projection 存在 | 使用 projection，不限制 | 使用 projection，不限制 |
+| 显式 projection 不存在 + viewId 存在 | 使用视图可见性过滤返回字段 | 使用视图可见性过滤返回字段 |
+| 显式 projection 不存在 + viewId 不存在 | 不限制（返回所有字段） | 不限制（返回所有字段） |
+| 搜索时 viewId 存在 | 按视图可见性过滤搜索字段 | 按视图可见性过滤搜索字段 |
+| 搜索时 viewId 不存在 | 不过滤搜索字段（使用所有字段） | 不过滤搜索字段（使用所有字段） |
+
+⚠️ **注意**：默认运行态下两条链路的行为基本一致（因为 `enabledFieldIds` 为 `undefined`）。但代码逻辑上的优先级差异在权限服务扩展后会导致行为分化。
+
+---
+
+## 十、v1 搜索链路 ignoreViewQuery 分叉的完整影响分析
+
+### 10.1 分叉的根源
+
+✅ **已确认事实**：
+v1 搜索链路在同一个请求 `getRecords()` 中有两处搜索字段计算，对 `ignoreViewQuery` 的处理不一致：
+
+**分叉点 1（主查询搜索）**：`record.service.ts:896-901`
+```typescript
+const searchFields = await this.getSearchFields(
+  fieldMap,
+  search,
+  query?.viewId,       // ⚠️ 直接传递原始 query.viewId
+  enabledFieldIds
+);
+```
+**行为**：不考虑 `ignoreViewQuery`，始终使用 `viewId`。
+
+**分叉点 2（搜索命中索引）**：`record.service.ts:2194-2199`
+```typescript
+const searchFields = await this.getSearchFields(
+  fieldInstanceMap,
+  search,
+  ignoreViewQuery ? undefined : viewId,  // ✅ 正确处理 ignoreViewQuery
+  projection
+);
+```
+**行为**：考虑 `ignoreViewQuery`，为 `true` 时传递 `undefined`。
+
+---
+
+### 10.2 同一请求中的完整执行流程
+
+```
+getRecords(tableId, query)
+  │
+  ├─→ getDocIdsByQuery(tableId, query)
+  │     │
+  │     ├─→ prepareQuery(query)
+  │     │     └─→ viewId = ignoreViewQuery ? undefined : query.viewId  (line 721)
+  │     │         用于 getTinyView / mergeWithDefaultFilter
+  │     │         但不用于后续 buildFilterSortQuery 中的搜索字段计算
+  │     │
+  │     ├─→ buildFilterSortQuery(tableId, { ...query, filter })
+  │     │     └─→ getSearchFields(fieldMap, search, query?.viewId, enabledFieldIds)  (line 896)
+  │     │         ⚠️ 使用原始 query.viewId，未考虑 ignoreViewQuery
+  │     │         → 这是分叉点 1：主查询搜索
+  │     │
+  │     ├─→ SQL 查询执行 → 获取记录 ID 列表
+  │     │
+  │     └─→ getSearchHitIndex(tableId, { ...query, viewId }, builder, enabledFieldIds)
+  │           └─→ getSearchFields(..., ignoreViewQuery ? undefined : viewId, projection)  (line 2197)
+  │               ✅ 正确处理 ignoreViewQuery
+  │               → 这是分叉点 2：搜索命中索引
+  │
+  ├─→ 计算 projection（返回字段投影）
+  │     └─→ query.projection ? this.convertProjection(query.projection)
+  │         : await this.getViewProjection(tableId, query)
+  │
+  └─→ getSnapshotBulkWithPermission(recordIds, projection, ...)
+        └─→ 获取实际字段数据
+```
+
+---
+
+### 10.3 不同 ignoreViewQuery 值的影响
+
+#### 场景 A：`ignoreViewQuery: false`（默认）
+
+| 阶段 | viewId 参数 | 搜索字段范围 | 影响 |
+|------|-------------|-------------|------|
+| 主查询搜索（分叉点 1） | `query.viewId` | 视图可见字段 | ✅ 与预期一致 |
+| 搜索命中索引（分叉点 2） | `viewId`（非 undefined） | 视图可见字段 | ✅ 与预期一致 |
+| 结果 | 两个阶段一致 | 一致 | 无问题 |
+
+#### 场景 B：`ignoreViewQuery: true`
+
+| 阶段 | viewId 参数 | 搜索字段范围 | 影响 |
+|------|-------------|-------------|------|
+| 主查询搜索（分叉点 1） | `query.viewId` | 视图可见字段 | ⚠️ 仍然按视图过滤，与 ignoreViewQuery 意图不符 |
+| 搜索命中索引（分叉点 2） | `undefined` | 所有字段 | ✅ 符合 ignoreViewQuery 意图 |
+| 结果 | 两个阶段不一致 | 主查询搜索范围 ≠ 搜索命中索引范围 | 可能导致搜索结果不一致 |
+
+---
+
+### 10.4 实际影响分析
+
+⚠️ **风险判断**：
+
+当 `ignoreViewQuery: true` 时：
+1. **主查询搜索**仍然按视图隐藏字段过滤搜索范围，可能导致搜索不到预期结果
+2. **搜索命中索引**不按视图过滤，搜索范围更大
+3. 两个阶段的搜索字段范围不一致，可能导致：
+   - 主查询搜索能命中的记录，搜索命中索引中也能命中
+   - 但主查询搜索不能命中的记录，搜索命中索引中可能命中
+   - 最终结果以主查询为准，搜索命中索引只是附加信息
+
+**实际影响程度**：
+- `searchHitIndex` 是附加信息，不影响最终返回的记录列表
+- 但 `searchHitIndex` 用于前端高亮搜索命中位置，可能导致高亮位置与实际搜索范围不一致
+- 如果 `ignoreViewQuery: true` 的意图是"忽略视图过滤，在所有字段中搜索"，则主查询搜索的行为不符合预期
+
+---
+
+## 十一、最终判定模板
+
+### 11.1 可直接得出结论的代码事实
+
+以下结论基于当前仓库代码可直接验证，无需假设：
+
+✅ **确定性结论**：
+
+1. **RecordPermissionService 默认是空实现**
+   - 证据：`record-permission.service.ts:18-34`
+   - 含义：`getReadQuerySource()` 返回 `undefined`，`wrapView()` 不返回 `enabledFieldIds`
+   - 影响：默认运行态下无字段级权限控制
+
+2. **RecordPermissionService 的装配关系**
+   - 证据：`record.module.ts:20`（注册）、`record.module.ts:22`（导出）、`global.module.ts:93`（覆盖入口注释）
+   - 含义：该服务设计为可扩展覆盖
+   - 影响：字段级权限是否生效取决于业务扩展实现
+
+3. **显式 projection 优先级最高**
+   - 证据：v1: `record.service.ts:1056-1057`；v2: `record-open-api-v2.service.ts:421-426`
+   - 含义：用户指定的 projection 直接使用，不与任何其他机制取交集
+   - 影响：显式 projection 可能绕过权限或视图限制
+
+4. **v1/v2 返回字段策略相反**
+   - 证据：v1: `record.service.ts:1056-1058, 1915-1917`；v2: `record-open-api-v2.service.ts:421-470`
+   - 含义：v1 视图优先、权限兜底；v2 权限优先、视图兜底
+   - 影响：相同参数下两条链路可能返回不同的字段集合
+
+5. **v1 两段搜索对 ignoreViewQuery 处理不一致**
+   - 证据：`record.service.ts:896-901`（主查询搜索）vs `record.service.ts:2194-2199`（搜索命中索引）
+   - 含义：主查询搜索不考虑 ignoreViewQuery，搜索命中索引考虑
+   - 影响：`ignoreViewQuery: true` 时两段搜索范围不一致
+
+6. **v1 搜索字段只检查 hidden，不检查 visible**
+   - 证据：`record.service.ts:2098-2101`（只检查 `get(value, ['hidden'])`）
+   - 含义：使用 `visible` 白名单的视图（Form/Kanban/Gallery/Calendar）中，v1 搜索可能在未标记 `visible: true` 的字段中搜索
+   - 影响：可能导致信息泄露（如果权限服务已扩展）
+
+7. **两套链路都遵循"单一来源原则"**
+   - 证据：v1: `record.service.ts:1915-1917`（`projection ?? convertEnabledFieldIdsToProjection`）；v2: `record-open-api-v2.service.ts:421-470`（if-else 分支，互斥）
+   - 含义：每次只从一个来源获取返回字段列表，不做交集运算
+   - 影响：v1 视图可见性可能绕过权限，v2 权限白名单可能绕过视图隐藏
+
+8. **三套可见性判断逻辑独立且不一致**
+   - 证据：
+     - `isNotHiddenField()`: `is-not-hidden-field.ts:9-45`
+     - `getViewProjection()`: `record.service.ts:978-1031`
+     - `isFieldVisible()`: `getOrderedVisibleFieldIds.ts:14-21`
+   - 含义：Kanban/Gallery/Calendar 在不同判断逻辑中默认可见性不同
+   - 影响：字段列表 API 和数据查询可能返回不同的可见字段集合
+
+9. **强制显示字段仅在 v2 无权限时影响返回投影**
+   - 证据：`record-open-api-v2.service.ts:448-470`（只有 `enabledFieldIds` 不存在时才调用 `getFieldsByQuery(viewId, filterHidden: true)`）
+   - 含义：启用字段级权限后，强制显示字段规则失效
+   - 影响：Kanban 等视图的功能必需字段可能不返回
+
+10. **ignoreViewQuery 在 prepareQuery 中影响 viewId 变量**
+    - 证据：`record.service.ts:721`（`const viewId = query.ignoreViewQuery ? undefined : query.viewId;`）
+    - 含义：`ignoreViewQuery: true` 时，`getTinyView` 和 `mergeWithDefaultFilter` 不会使用视图配置
+    - 影响：视图默认过滤、排序等不生效，但主查询搜索仍然使用视图过滤
+
+---
+
+### 11.2 基于扩展实现的风险结论
+
+以下结论基于代码逻辑推断，但依赖于 `RecordPermissionService` 的具体扩展实现：
+
+⚠️ **风险结论**：
+
+1. **v1 有 viewId 时可能绕过权限**
+   - 代码事实：`record.service.ts:1915-1917`（`projection ?? convertEnabledFieldIdsToProjection`）
+   - 风险前提：`enabledFieldIds` 是权限白名单，且 `viewId` 存在
+   - 风险描述：v1 链路中，当 `viewId` 存在时，返回字段使用视图可见性，不与 `enabledFieldIds` 取交集
+   - 风险等级：高
+
+2. **v2 有 enabledFieldIds 时可能绕过用户隐藏偏好**
+   - 代码事实：`record-open-api-v2.service.ts:428-446`（直接使用 `enabledFieldIds`，不考虑视图）
+   - 风险前提：`enabledFieldIds` 包含用户在视图中隐藏的字段
+   - 风险描述：v2 链路中，当 `enabledFieldIds` 存在时，返回字段使用权限白名单，不考虑用户在视图中的隐藏设置
+   - 风险等级：低（用户体验问题，非安全问题）
+
+3. **v1 搜索在 Form/Kanban 等视图中可能信息泄露**
+   - 代码事实：`record.service.ts:2098-2101`（只检查 `hidden`，不检查 `visible`）
+   - 风险前提：使用 `visible` 白名单的视图（Form/Kanban/Gallery/Calendar），且字段级权限已扩展
+   - 风险描述：v1 搜索时可能在未标记 `visible: true` 的字段中搜索，泄露隐藏字段内容
+   - 风险等级：高
+
+4. **启用权限后强制显示字段规则失效**
+   - 代码事实：`record-open-api-v2.service.ts:428-446`（有 `enabledFieldIds` 时跳过视图可见性）
+   - 风险前提：Kanban/Gallery/Calendar 视图的功能必需字段（如 `stackFieldId`）不在 `enabledFieldIds` 中
+   - 风险描述：启用字段级权限后，Kanban 等视图的功能必需字段可能不返回，导致前端渲染异常
+   - 风险等级：中
+
+5. **显式 projection 可能绕过权限检查**
+   - 代码事实：v1: `record.service.ts:1056-1057`；v2: `record-open-api-v2.service.ts:421-426`
+   - 风险前提：用户可以通过 API 指定任意 `projection`
+   - 风险描述：显式 projection 直接使用，不与权限取交集，可能返回无权限字段
+   - 风险等级：高（如果 API 未做权限校验）
+
+---
+
+### 11.3 待验证项
+
+以下内容需要结合实际业务代码或测试验证，当前无法从代码中确定：
+
+❓ **待验证项**：
+
+1. **`enabledFieldIds` 的生成逻辑**
+   - 问题：业务扩展实现中，`enabledFieldIds` 是否包含主键字段？是否考虑视图配置？
+   - 验证方法：查看业务扩展的 `RecordPermissionService` 实现
+   - 影响：决定权限白名单的范围
+
+2. **`keepPrimaryKey` 的实际作用**
+   - 问题：`keepPrimaryKey: true` 是否会强制在 `enabledFieldIds` 中添加主键字段？
+   - 验证方法：查看业务扩展的 `wrapView()` 实现
+   - 影响：决定主键字段是否始终可访问
+
+3. **CTE 的字段过滤作用**
+   - 问题：业务扩展的 `wrapView()` 返回的 `viewCte` 是否在 SQL 层面限制了字段访问？
+   - 验证方法：查看业务扩展的 `wrapView()` 实现中 CTE 的 SQL 内容
+   - 影响：决定是否存在额外的 SQL 层面权限控制
+
+4. **`enabledFieldIds` 为 `undefined` 的场景**
+   - 问题：在业务扩展实现中，什么情况下 `enabledFieldIds` 为 `undefined`？
+   - 验证方法：查看业务扩展的 `wrapView()` 和 `getReadQuerySource()` 实现
+   - 影响：决定视图可见性和权限白名单的切换条件
+
+5. **`visible` 和 `hidden` 的共存情况**
+   - 问题：实际业务中是否会在同一个 `columnMeta` 中同时使用 `visible` 和 `hidden` 属性？
+   - 验证方法：查看前端视图配置逻辑或数据库中的实际数据
+   - 影响：决定 `getViewProjection()` 中 `useVisible`/`useHidden` 判断的可靠性
+
+6. **业务扩展中 `wrapView()` 对 `viewId` 的使用**
+   - 问题：业务扩展的 `wrapView()` 是否会使用传入的 `viewId` 计算 `enabledFieldIds`？
+   - 验证方法：查看业务扩展的 `wrapView()` 实现
+   - 影响：决定视图配置是否会影响权限白名单
+
+7. **`ignoreViewQuery: true` 的实际使用场景**
+   - 问题：前端或业务代码中是否会设置 `ignoreViewQuery: true`？
+   - 验证方法：查看前端代码或 API 调用日志
+   - 影响：决定 v1 搜索分叉是否会在实际场景中触发

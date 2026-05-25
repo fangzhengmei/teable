@@ -1755,7 +1755,7 @@ export function generateFieldConversionStatements(
 | **双分派节点** | `spec.accept(visitor)` → `visitor.visitXxx(spec)` | `field.accept(visitor)` → `visitor.visitXxxField(field)` | `mutateSpec.accept(visitor)` → `visitor.visitTableUpdateXxx(spec)` |
 | **事务范围** | 与其他元数据操作共享 | 支持跨记录批量 | 按 scope 分批执行，支持 meta/data 切换 |
 | **版本管理** | field/view version 递增（乐观锁） | record __version 乐观锁 | 通过 mutation_snapshot 捕获 undo |
-| **错误处理** | 数据库错误包装为 DomainError | 死锁自动重试（最多3次） | Unique/NotNull 违规捕获为领域验证错误 |
+| **错误处理** | 数据库错误包装为 DomainError | 基础设施错误自动重试（最多3次）<br>基于 `infrastructure` 标签 + 错误消息匹配 | Unique/NotNull 违规捕获为领域验证错误 |
 | **返回类型** | `Result<TableUpdatePersistResult \| void>` | `Result<RecordMutationResult>` | `Result<Table>` |
 
 ## 九、三种 PostgreSQL 驱动的注册与事务差异
@@ -2021,14 +2021,14 @@ export const resolvePostgresDbOrTx = <DB>(
 };
 ```
 
-**UnitOfWork 事务上下文切换流程（可复核）**：
+**UnitOfWork 事务上下文切换流程（可复核，与源码完全一致）**：
 
 ```
 应用层调用 unitOfWork.withTransaction(context, work, { scope: 'data' })
          │
          ▼  【步骤 1】检查是否已有同 scope 事务
     existingTx = getUnitOfWorkTransaction(context, scope)
-    if (existingTx) → 直接复用，执行 work(transactionContext)
+    if (existingTx) → 直接复用，执行 work(activateUnitOfWorkScope(context, scope))
          │
          ▼  【步骤 2】检查是否可以复用兄弟 scope 事务
     if (usesSinglePhysicalDatabase()) {
@@ -2038,8 +2038,10 @@ export const resolvePostgresDbOrTx = <DB>(
             // 创建新的 context，让当前 scope 指向兄弟 scope 的事务对象
             sharedContext = {
                 ...context,
+                transaction: siblingTx,        // ⚠️  同步顶层 transaction 字段
                 transactions: {
-                    ...context.transactions,
+                    ...(context.transactions ?? {}),
+                    ...(siblingTx.scope ? { [siblingTx.scope]: siblingTx } : {}),
                     [scope]: siblingTx  // 指向同一事务对象
                 }
             }
@@ -2049,56 +2051,82 @@ export const resolvePostgresDbOrTx = <DB>(
          │
          ▼  【步骤 3】新建事务
     db = (scope === 'meta') ? this.metaDb : this.dataDb
-    try {
-        result = db.transaction().execute(async (trx) => {
-            // 创建 PostgresUnitOfWorkTransaction 包装
-            transaction = new PostgresUnitOfWorkTransaction(trx, scope)
-            transactionContext = bindUnitOfWorkTransaction(context, transaction)
+    const maxRetries = 3;  // ⚠️  定义在方法内部
+    let attempt = 0;
+    while (true) {
+        let transaction: PostgresUnitOfWorkTransaction<DB> | undefined;
+        try {
+            const transactionResult = await db.transaction().execute(async (trx) => {
+                // 创建 PostgresUnitOfWorkTransaction 包装
+                transaction = new PostgresUnitOfWorkTransaction(trx, scope)
+                transactionContext = bindUnitOfWorkTransaction(context, transaction)
+                
+                // 执行业务逻辑
+                workResult = await work(transactionContext)
+                if (workResult.isErr()) {
+                    // 抛出自定义异常触发回滚
+                    throw new UnitOfWorkAbort(workResult.error)
+                }
+                return { workResult, transaction }
+            })
             
-            // 执行业务逻辑
-            workResult = await work(transactionContext)
-            if (workResult.isErr()) {
-                // 抛出自定义异常触发回滚
-                throw new UnitOfWorkAbort(workResult.error)
+            // 事务提交后执行 afterCommit 钩子
+            await transactionResult.transaction.runAfterCommitHandlers()
+            return transactionResult.workResult
+        } catch (error) {
+            // 【步骤 4】死锁/序列化失败自动重试
+            if (error instanceof UnitOfWorkAbort) {
+                // ⚠️  注意：传入的是 error.error（DomainError），不是 error
+                if (attempt < maxRetries && isRetryableTransactionAbort(error.error)) {
+                    const delayMs = backoffMs(attempt);  // 5/10/20ms + [0,9]ms 抖动
+                    attempt += 1;
+                    await sleep(delayMs);
+                    continue;  // 重试
+                }
+                // 回滚后执行 afterRollback 钩子
+                await transaction?.runAfterRollbackHandlers();
+                return err(error.error);
             }
-            return { workResult, transaction }
-        })
-        
-        // 事务提交后执行 afterCommit 钩子
-        await result.transaction.runAfterCommitHandlers()
-        return result.workResult
-    } catch (error) {
-        // 【步骤 4】死锁/序列化失败自动重试
-        if (isRetryableTransactionAbort(error) && attempt < maxRetries) {
-            const delayMs = backoffMs(attempt)  // 5ms, 10ms, 20ms + 随机抖动
-            attempt += 1
-            await sleep(delayMs)
-            continue  // 重试
+            // 非 UnitOfWorkAbort 的异常（如 Kysely 内部错误）
+            await transaction?.runAfterRollbackHandlers();
+            return err(domainError.unexpected({
+                message: `Unexpected unit of work error: ${describeError(error)}`
+            }));
         }
-        // 回滚后执行 afterRollback 钩子
-        await transaction?.runAfterRollbackHandlers()
-        return err(error.error)
     }
 ```
 
-**重试策略（可复核）**：
+**重试策略（可复核，与源码完全一致）**：
 
 ```typescript
-// adapter-db-postgres-shared/src/unitOfWork.ts:128-191
-const MAX_RETRIES = 3;
+// adapter-db-postgres-shared/src/unitOfWork.ts:148-150
+// ⚠️  maxRetries 定义在 withTransaction 方法内部，不是外部常量
+const maxRetries = 3;
+let attempt = 0;
 
-const isRetryableTransactionAbort = (error: unknown): boolean => {
-  if (!(error instanceof PostgresDatabaseError)) return false;
-  // 40P01 = deadlock_detected
-  // 40001 = serialization_failure
-  return error.code === '40P01' || error.code === '40001';
+// adapter-db-postgres-shared/src/unitOfWork.ts:204-212
+// ⚠️  重试判定：检查 DomainError 的 'infrastructure' 标签 + 错误消息匹配
+const isRetryableTransactionAbort = (error: DomainError): boolean => {
+  // 步骤 1: 必须包含 'infrastructure' 标签
+  if (!error.tags.includes('infrastructure')) return false;
+
+  // 步骤 2: 错误消息必须包含以下关键词之一（大小写不敏感）
+  const message = error.message.toLowerCase();
+  return (
+    message.includes('deadlock detected') ||          // 死锁
+    message.includes('could not serialize access') ||  // 无法序列化访问
+    message.includes('serialization failure')          // 序列化失败
+  );
 };
 
+// adapter-db-postgres-shared/src/unitOfWork.ts:198-202
+// ⚠️  backoff 抖动范围是 [0, 9]ms，不是 [0, 5]ms
 const backoffMs = (attempt: number): number => {
-  // 指数退避 + 随机抖动：5ms, 10ms, 20ms + [0, 5]ms
-  const baseDelay = 5 * Math.pow(2, attempt);
-  const jitter = Math.floor(Math.random() * 6);
-  return baseDelay + jitter;
+  // 指数退避：attempt 0 → 5ms, attempt 1 → 10ms, attempt 2 → 20ms
+  const base = 5 * 2 ** attempt;
+  // 随机抖动：Math.floor(Math.random() * 10) → [0, 9]ms
+  const jitter = Math.floor(Math.random() * 10);
+  return base + jitter;
 };
 ```
 
@@ -2111,7 +2139,7 @@ const backoffMs = (attempt: number): number => {
 | 跨 scope 事务 | 检测到同一连接字符串时自动复用 | 天然复用 | 天然复用 |
 | 分布式事务 | 不支持（需要分别管理） | 单事务 | 单事务 |
 
-**事务复用逻辑**：
+**事务复用逻辑（可复核，与源码完全一致）**：
 
 ```typescript
 // adapter-db-postgres-shared/src/unitOfWork.ts:96-126
@@ -2133,23 +2161,29 @@ private reuseSiblingScopeTransaction(
   // 单数据库时，meta 和 data scope 共享同一事务
   const siblingScope: UnitOfWorkScope = scope === 'meta' ? 'data' : 'meta';
   const siblingTransaction = getUnitOfWorkTransaction(context, siblingScope);
-  if (siblingTransaction) {
-    return {
-      ...context,
-      transactions: {
-        ...context.transactions,
-        [scope]: siblingTransaction,  // 指向同一事务对象
-      },
-    };
+  if (!siblingTransaction) {
+    return null;
   }
-  return null;
+
+  // ⚠️  真实返回结构包含顶层 transaction 字段和 transactions 中的双 scope 绑定
+  return {
+    ...context,
+    transaction: siblingTransaction,  // 同步顶层 transaction 字段
+    transactions: {
+      ...(context.transactions ?? {}),
+      ...(siblingTransaction.scope
+        ? { [siblingTransaction.scope]: siblingTransaction }
+        : {}),
+      [scope]: siblingTransaction,  // 指向同一事务对象
+    },
+  };
 }
 ```
 
-#### 9.4.3 事务执行流程
+#### 9.4.3 事务执行流程（可复核，与源码完全一致）
 
 ```typescript
-// adapter-db-postgres-shared/src/unitOfWork.ts:128-191
+// adapter-db-postgres-shared/src/unitOfWork.ts:128-192
 async withTransaction<T>(
   context: IExecutionContext,
   work: UnitOfWorkOperation<T>,
@@ -2172,12 +2206,21 @@ async withTransaction<T>(
     return work(sharedTransactionContext);
   }
 
-  // 3. 新建事务（最多重试 3 次死锁）
+  // 3. 新建事务（最多重试 3 次可重试基础设施错误）
+  // ⚠️  maxRetries 定义在方法内部，紧挨着 while 循环
   const db = scope === 'meta' ? this.metaDb : this.dataDb;
+  const maxRetries = 3;
+  let attempt = 0;
+
+  // Retry only for top-level transactions, and only for retryable infra failures.
+  // Nested transactions must not retry because they share an outer transaction scope.
+  // Keep delays tiny because this is often used in request/response paths.
+  // eslint-disable-next-line no-constant-condition
   while (true) {
+    let transaction: PostgresUnitOfWorkTransaction<DB> | undefined;
     try {
       const transactionResult = await db.transaction().execute(async (trx) => {
-        const transaction = new PostgresUnitOfWorkTransaction(trx, scope);
+        transaction = new PostgresUnitOfWorkTransaction(trx, scope);
         const transactionContext = bindUnitOfWorkTransaction(context, transaction);
 
         const workResult = await work(transactionContext);
@@ -2190,17 +2233,26 @@ async withTransaction<T>(
       await transactionResult.transaction.runAfterCommitHandlers();
       return transactionResult.workResult;
     } catch (error) {
+      // ⚠️  区分 UnitOfWorkAbort（业务异常）和其他异常
       if (error instanceof UnitOfWorkAbort) {
-        // 死锁/序列化失败自动重试（指数退避 + 抖动）
+        // ⚠️  重试条件：attempt < maxRetries 且是可重试的基础设施错误
         if (attempt < maxRetries && isRetryableTransactionAbort(error.error)) {
-          const delayMs = backoffMs(attempt);  // 5ms, 10ms, 20ms + 随机抖动
+          const delayMs = backoffMs(attempt);  // 5ms, 10ms, 20ms + [0,9]ms 抖动
           attempt += 1;
           await sleep(delayMs);
           continue;
         }
+        // ⚠️  非重试场景：先执行回滚钩子，再返回错误
         await transaction?.runAfterRollbackHandlers();
         return err(error.error);
       }
+      // ⚠️  非 UnitOfWorkAbort 的异常（如 Kysely 内部错误）
+      await transaction?.runAfterRollbackHandlers();
+      return err(
+        domainError.unexpected({
+          message: `Unexpected unit of work error: ${describeError(error)}`,
+        })
+      );
     }
   }
 }
@@ -2215,7 +2267,7 @@ async withTransaction<T>(
 | **浏览器端运行** | ❌ | ✅ | ❌ |
 | **内存数据库** | ❌ | ✅ | ❌ |
 | **双数据库架构** | ✅ | ❌（总是单实例） | ❌（总是单实例） |
-| **死锁自动重试** | ✅（共享实现） | ✅（共享实现） | ✅（共享实现） |
+| **基础设施错误自动重试** | ✅（共享实现）<br>基于 DomainError `infrastructure` 标签 + 错误消息匹配<br>（死锁/序列化失败最多重试 3 次） | ✅（共享实现） | ✅（共享实现） |
 | **事务 scope 复用** | ✅（同连接字符串时） | ✅（天然） | ✅（天然） |
 | **afterCommit 钩子** | ✅ | ✅ | ✅ |
 | **undo capture** | ✅ | ✅ | ✅ |

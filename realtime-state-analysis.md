@@ -1356,6 +1356,408 @@ private onCommitLocal(fieldId: string, cellValue: unknown, undo?: boolean) {
 
 ---
 
+## 12-B. updateRecord 全链路执行路径与 mutationApplied 语义
+
+### 12-B.1 从 API 到 SQL 的完整调用链
+
+```
+前端 Record.updateCell(fieldId, cellValue)
+        │
+        ▼
+REST API: PATCH /api/table/{tableId}/record/{recordId}
+        │
+        ▼
+RecordOpenApiV2Service.updateRecord()
+        │  构建 UpdateRecordCommand
+        ▼
+CommandBus → UpdateRecordHandler.handle()
+        │
+        ├─► 1. FieldKeyResolverService.resolveFieldKeys() — 字段键解析
+        ├─► 2. RecordWritePluginRunner.prepare() — 写入插件守卫
+        ├─► 3. TableRecordQueryRepository.findOne() — 查询当前记录（获取旧值）
+        ├─► 4. RecordWriteSideEffectService.execute() — 侧效应处理
+        ├─► 5. Table.updateRecord() — 领域模型验证
+        ├─► 6. RecordMutationSpecResolver.resolveAndReplace() — 外键解析
+        │
+        ▼
+7. UnitOfWork.withTransaction() — 事务内执行
+        │
+        ├─► 7a. TableUpdateFlow.execute() — 表结构变更事件
+        ├─► 7b. pluginExecution.beforePersist()
+        ├─► 7c. ★ PostgresTableRecordRepository.updateOne() — 核心 SQL 执行
+        │       │
+        │       ├─► RecordUpdateBuilder.buildMutationPlan() — 构建 SET 子句
+        │       ├─► buildDistinctUserFieldWhere() — 构建 IS DISTINCT FROM 条件
+        │       ├─► UPDATE ... SET ... WHERE __id = ? AND (fld IS DISTINCT FROM ?)
+        │       ├─► 执行辅助语句（junction 表、FK 更新）
+        │       ├─► 快照捕获（before/after）
+        │       └─► runComputedUpdateById() — 计算字段更新
+        │
+        ├─► 7d. RecordOrderCalculator.calculateOrders() — 行排序计算（如需）
+        ▼
+8. 事务后：构建 changes → 发布 RecordUpdated 事件 → ShareDB 广播
+```
+
+### 12-B.2 `buildDistinctUserFieldWhere` — 幂等写入保护
+
+文件：`packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts:114-145`
+
+```typescript
+const buildDistinctUserFieldWhere = (table, setClauses) => {
+  const conditions: Expression<SqlBool>[] = [];
+
+  for (const field of table.getFields()) {
+    // 跳过 lastModifiedTime/lastModifiedBy 系统追踪字段
+    if (isTrackedLastModifiedField(field)) continue;
+
+    const dbFieldName = field.dbFieldName();
+    // 跳过系统列和不在 SET 子句中的字段
+    if (SYSTEM_UPDATE_COLUMNS.has(dbFieldName) || !(dbFieldName in setClauses)) continue;
+
+    // 核心条件：字段当前值 IS DISTINCT FROM 新值
+    conditions.push(sql`${sql.ref(dbFieldName)} IS DISTINCT FROM ${setClauses[dbFieldName]}`);
+  }
+
+  // 所有用户字段条件用 OR 连接：任意一个字段不同即允许更新
+  return conditions.length > 0
+    ? sql`(${sql.join(conditions, sql` OR `)})`
+    : undefined;
+};
+```
+
+**生成的 SQL（示例）：**
+
+```sql
+UPDATE "tbl_xxx"
+SET    "fld001" = 'new_value',
+       "__last_modified_time" = '2026-05-27T10:00:00Z',
+       "__last_modified_by" = 'usr123',
+       "__version" = "__version" + 1
+WHERE  "__id" = 'rec001'
+  AND  ("fld001" IS DISTINCT FROM 'new_value')
+RETURNING "fld001" AS "changed_fld001"
+```
+
+**`IS DISTINCT FROM` 的语义：**
+- `NULL IS DISTINCT FROM NULL` → `FALSE`（两个 NULL 被视为相同）
+- `'A' IS DISTINCT FROM 'A'` → `FALSE`（值相同，无需更新）
+- `'A' IS DISTINCT FROM 'B'` → `TRUE`（值不同，允许更新）
+- `'A' IS DISTINCT FROM NULL` → `TRUE`（值与 NULL 不同，允许更新）
+
+### 12-B.3 `mutationApplied = false` 的触发条件与语义
+
+文件：`packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts:1814-1831`
+
+```typescript
+let updateQuery = db
+  .updateTable(tableName)
+  .set(setClauses)
+  .where(RECORD_ID_COLUMN, '=', recordIdStr);
+
+if (distinctUserFieldWhere) {
+  updateQuery = updateQuery.where(distinctUserFieldWhere);
+}
+
+const updatedRow = changedFieldColumns.length > 0
+  ? await updateQuery
+      .returning(buildChangedFieldReturningSelects(changedFieldColumns))
+      .executeTakeFirst()
+  : (await updateQuery.executeTakeFirst(), undefined);
+
+// 关键分支：如果 added WHERE 条件后没有匹配行
+if (changedFieldColumns.length > 0 && !updatedRow) {
+  await snapshotCaptureSession.abort();
+  return ok({ mutationApplied: false });
+}
+```
+
+**触发 `mutationApplied = false` 的完整条件链：**
+
+```
+1. distinctUserFieldWhere 不为 undefined
+   → 存在至少一个用户字段在 SET 子句中
+
+2. changedFieldColumns.length > 0
+   → 需要追踪变更字段的返回值
+
+3. updatedRow 为 undefined
+   → UPDATE ... WHERE ... RETURNING ... 未返回任何行
+   → 意味着 WHERE 条件未匹配到记录
+
+这发生在：所有用户字段的新值都与数据库中的当前值相同
+```
+
+**时序场景：**
+
+```
+T1: 用户A读取记录 → fields.fld1 = "hello"
+T2: 用户B更新 fld1 = "world" → 成功（数据库值变为 "world"）
+T3: 用户A（基于旧快照）尝试更新 fld1 = "hello"
+    → SET "fld1" = 'hello'
+    → WHERE "__id" = 'rec001' AND ("fld1" IS DISTINCT FROM 'hello')
+    → 数据库中 fld1 = "world"，"world" IS DISTINCT FROM "hello" = TRUE
+    → 更新成功，mutationApplied = true ✓
+
+T1: 用户A读取记录 → fields.fld1 = "hello"
+T2: 用户B更新 fld1 = "world" → 成功
+T3: 另一操作将 fld1 改回 "hello"
+T4: 用户A（基于 T1 快照）尝试更新 fld1 = "hello"
+    → SET "fld1" = 'hello'
+    → WHERE "__id" = 'rec001' AND ("fld1" IS DISTINCT FROM 'hello')
+    → 数据库中 fld1 = "hello"，"hello" IS DISTINCT FROM "hello" = FALSE
+    → WHERE 条件不满足，0 行更新
+    → mutationApplied = false ✓
+```
+
+### 12-B.4 `mutationApplied = false` 时的返回数据结构
+
+文件：`packages/v2/core/src/commands/UpdateRecordHandler.ts:319-368`
+
+```typescript
+const mutationApplied = mutationResult.mutation.mutationApplied !== false;
+const changedFieldValues = new Map<string, unknown>(
+  mutationResult.mutation.changedFields ?? []
+);
+
+// 如果 mutationApplied = false：
+// - changedFieldValues 为空 Map（因为没有 changedFields）
+// - 跳过遍历 updatedRecord.fields() 收集额外变更
+// - changes 数组为空
+// - 不发布 RecordUpdated 事件
+if (mutationApplied) {
+  for (const entry of updatedRecord.fields().entries()) {
+    // ...收集变更字段
+  }
+}
+
+// 最终：changes.length === 0 → 不发布 RecordUpdated 事件
+if (changes.length > 0) {
+  events.push(RecordUpdated.create({ ... }));
+}
+```
+
+**返回给前端的数据（`mutationApplied = false` 时）：**
+
+```typescript
+// 仍然返回合并后的记录（包含请求的字段值）
+const mergedRecord = TableRecord.fromRawFieldValues({
+  id: recordId,
+  tableId,
+  fields: {
+    ...currentRecord.fields,           // 数据库中的当前值
+    ...updatedRecord.fieldValues(),    // 请求中的新值
+    ...updatedFieldValues,             // 装饰后的值
+  },
+});
+
+return ok(UpdateRecordResult.create(
+  mergedRecord,    // 包含请求的值（即使没实际写入）
+  events,          // 空数组（无 RecordUpdated 事件）
+  extendedFieldKeyMapping,
+  undefined        // 无 computedChanges
+));
+```
+
+### 12-B.5 前端在 `mutationApplied = false` 时的行为
+
+```
+前端 updateCell(fieldId, cellValue)
+        │
+        ▼
+步骤 1: onCommitLocal(fieldId, cellValue)
+        → 本地立即显示新值（乐观更新）
+        │
+        ▼
+步骤 2: REST API updateRecord → 返回 res.data
+        │
+        ├─► 前端不知道 mutationApplied 的值
+        │   API 总是返回完整的 IRecord（包含请求值）
+        │
+        ▼
+步骤 3: updateComputedField(fieldIds, res.data)
+        │
+        ├─► 如果计算字段值与本地相同 → 不更新
+        ├─► 如果计算字段值与本地不同 → 更新（通过 ShareDB op 广播给其他用户）
+        │
+        ▼
+步骤 4: ShareDB 侧
+        │
+        ├─► mutationApplied = true → RecordUpdated 事件 → ShareDB 广播 op
+        │   → 其他用户看到变更
+        │
+        └─► mutationApplied = false → 无 RecordUpdated 事件 → 无 ShareDB op
+            → 其他用户不收到通知
+            → 但操作者本人已经看到本地乐观更新的值
+```
+
+**关键推论：**
+
+| 场景 | mutationApplied | ShareDB 广播 | 操作者本地 | 其他用户 |
+|------|----------------|-------------|-----------|---------|
+| 正常更新（值确实变化） | `true` | ✅ 有 op | 乐观更新 + 计算字段同步 | 收到 op，值更新 |
+| 幂等重复（值未变化） | `false` | ❌ 无 op | 乐观更新（本地已显示） | 不收到通知 |
+| 他人已改回原值 | `false` | ❌ 无 op | 乐观更新 | 不收到通知 |
+
+### 12-B.6 `mutationApplied = false` 的潜在问题
+
+1. **版本号不递增**：由于没有实际写入，`__version` 不变，但前端 `onCommitLocal` 已经 `doc.version++`
+   - 后续的 ShareDB op 版本号可能跳变
+   - 前端可能在下次远程 op 时发现版本不一致
+
+2. **计算字段未更新**：`mutationApplied = false` 时 `computedChanges` 为 `undefined`
+   - 如果计算字段依赖的源字段被他人修改，计算结果不会同步到操作者
+
+3. **乐观更新的值可能与服务端不一致**：
+   - 操作者以为更新成功了，但实际数据库未变
+   - 在重连或刷新后，值会恢复为数据库中的实际值
+
+---
+
+## 12-C. 连接错误分支与重连监控
+
+### 12-C.1 ShareDB 连接错误处理
+
+文件：`packages/sdk/src/context/app/useConnection.tsx:15-30`
+
+```typescript
+const shareDbErrorHandler = (error: unknown) => {
+  const httpError = new HttpError(error as string, 500);
+  const { code, message } = httpError;
+
+  if (code === HttpErrorCode.UNAUTHORIZED) {
+    window.location.href = `/auth/login?redirect=...`;
+    return;
+  }
+  if (code === HttpErrorCode.UNAUTHORIZED_SHARE) {
+    window.location.reload();
+    return;
+  }
+  if (ignoreErrorCodes) {
+    return;  // 静默忽略 VIEW_NOT_FOUND 等错误
+  }
+  toast({ title: 'Socket Error', variant: 'destructive', description: `${code}: ${message}` });
+};
+```
+
+**错误处理分支分析：**
+
+| 错误码 | 处理方式 | 对重连的影响 |
+|--------|---------|-------------|
+| `UNAUTHORIZED` | 重定向到登录页 | 终止重连（页面跳转） |
+| `UNAUTHORIZED_SHARE` | 刷新页面 | 重新初始化连接 |
+| `VIEW_NOT_FOUND` | 静默忽略 | 不影响重连 |
+| 其他错误 | Toast 提示 | **不影响重连**，连接继续运行 |
+
+### 12-C.2 连接状态监听
+
+```typescript
+connection.on('connected', onConnected);
+connection.on('disconnected', onDisconnected);
+connection.on('closed', onDisconnected);
+connection.on('error', shareDbErrorHandler);
+connection.on('receive', onReceive);
+```
+
+**关键发现**：`error` 事件和 `receive` 中的错误**不会触发断开重连**：
+- `error` 事件只是调用 `shareDbErrorHandler` 显示 Toast
+- ShareDB Connection 本身仍然保持连接状态
+- 只有 `disconnected`/`closed` 事件才会设置 `connected = false`
+
+### 12-C.3 ReconnectingSockJS 的重连行为
+
+文件：`packages/sdk/src/utils/reconnectingSockJS.ts`
+
+```
+handleClose 事件触发
+        │
+        ├─► forcedClose = true（用户主动关闭）→ 不重连
+        │
+        └─► forcedClose = false（异常断开）→ scheduleReconnect()
+                │
+                ▼
+            指数退避计算
+                delay = min(1000 × 1.5^attempts, 30000)
+                │
+                ▼
+            setTimeout → connect()
+                │
+                ▼
+            新 SockJS 连接
+                │
+                ├─► 成功 → handleOpen → reconnectAttempts = 0
+                └─► 失败 → handleClose → 继续退避重连
+```
+
+**重连不中断的场景：**
+
+| 场景 | Socket 状态 | 重连行为 |
+|------|------------|---------|
+| 网络断开 | `CLOSED` | 自动指数退避重连 |
+| 服务器重启 | `CLOSED` | 自动指数退避重连 |
+| SockJS 超时 | `CLOSED` | 自动指数退避重连 |
+| `UNAUTHORIZED` 错误 | 可能仍 `OPEN` | **页面跳转**，终止一切 |
+| 其他 `error` 事件 | 仍 `OPEN` | **仅 Toast**，不重连 |
+| 页面不可见 > 10min | 主动 `close()` | `forcedClose=true`，**不自动重连** |
+| 页面恢复可见 | `CLOSED` | `useConnectionAutoManage` 触发 2s 后重连 |
+
+### 12-C.4 页面可见性驱动的重连管理
+
+文件：`packages/sdk/src/context/app/useConnectionAutoManage.ts`
+
+```
+页面状态变化
+        │
+        ├─► 变为可见 + 连接断开
+        │   → setTimeout(reconnectDelay=2000ms)
+        │   → reconnect() 或 currentConnection.reconnect()
+        │
+        └─► 变为不可见 + 连接打开
+            → setTimeout(inactiveTimeout=600000ms)
+            → connection.close()
+            → forcedClose = true → 不会自动重连
+```
+
+**`isConnected` 的定义（注意包含 CONNECTING 状态）：**
+
+```typescript
+export const isConnected = (socket: ReconnectingSockJS) => {
+  return [ReadyState.OPEN, ReadyState.CONNECTING].includes(socket.readyState);
+};
+```
+
+这意味着正在连接中的 Socket 也被视为"已连接"，不会触发重连。
+
+### 12-C.5 重连后的数据恢复
+
+```
+重连成功
+    │
+    ▼
+ShareDB Connection 'connected' 事件
+    │
+    ▼
+ShareDB 自动重新订阅所有 Query
+    │
+    ▼
+服务器发送最新快照或增量 ops
+    │
+    ├─► 版本连续 → 应用增量 ops
+    └─► 版本跳变 → 重新 fetch 快照
+    │
+    ▼
+Query 'ready' 事件
+    │
+    ▼
+dispatch({ type: 'ready', results, extra })
+    │
+    ▼
+UI 全量更新为最新状态
+```
+
+**注意**：重连后前端**不重新发送**未成功的 REST API 请求。如果 `updateCell` 的 REST API 在断连期间失败，本地乐观更新的值会被回滚（catch 块中的 `onCommitLocal(fieldId, oldCellValue, true)`）。但如果 REST API 已发送但响应丢失，操作可能已成功但前端不知道——此时重连后的 ShareDB 快照会包含最新值，自动修正。
+
+---
+
 ## 13. OT 操作构建器与路径匹配
 
 ### 13.1 IOtOperation 类型定义
@@ -1695,6 +2097,16 @@ useEffect(() => {
 |------|------|
 | `packages/sdk/src/model/record/record.ts` | 记录模型（含乐观更新、REST updateCell） |
 | `packages/sdk/src/model/record/factory.ts` | 记录实例工厂 |
+
+### 16.5-B V2 后端 — 记录更新链路
+
+| 文件 | 职责 |
+|------|------|
+| `apps/nestjs-backend/src/features/record/open-api/record-open-api-v2.service.ts` | V2 记录更新 API 入口 |
+| `packages/v2/core/src/commands/UpdateRecordHandler.ts` | 记录更新命令处理器（mutationApplied 逻辑） |
+| `packages/v2/core/src/commands/UpdateRecordCommand.ts` | 记录更新命令定义 |
+| `packages/v2/core/src/ports/TableRecordRepository.ts` | 仓储接口（含 RecordMutationResult） |
+| `packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts` | PostgreSQL 仓储实现（含 distinctUserFieldWhere） |
 
 ### 16.6 前端 SDK — 虚拟滚动与缓存
 

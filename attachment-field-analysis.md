@@ -39,7 +39,7 @@
 
 ### 2.1 上传入口
 
-系统存在 **三条上传通道**，由 `UploadType` 枚举区分（`packages/openapi/src/attachment/signature.ts:6-21`）：
+系统存在 **多条上传通道**，由 `UploadType` 枚举区分（`packages/openapi/src/attachment/signature.ts:6-21`）：
 
 | UploadType | 用途 | 存储 bucket |
 |---|---|---|
@@ -133,46 +133,69 @@ Token 是一次性的临时凭证，有效期由 `storageConfig.tokenExpireIn` �
 
 ## 三、字段关联与行绑定
 
-### 3.1 数据模型设计
+### 3.1 数据模型设计（真实 Schema）
 
-附件关联存储在两个层面：
+基于 `packages/db-main-prisma/prisma/postgres/schema.prisma:428-463` 的真实定义：
 
-#### 3.1.1 attachments 表（文件元数据）
+#### 3.1.1 Attachments 表（文件元数据）
 
-```sql
-CREATE TABLE attachments (
-  token         VARCHAR PRIMARY KEY,   -- 上传时生成的唯一 token
-  path          VARCHAR NOT NULL,      -- 对象存储路径
-  hash          VARCHAR,               -- 文件哈希
-  size          BIGINT,                -- 文件大小
-  mimetype      VARCHAR,               -- MIME 类型
-  width         INT,                   -- 图片宽度
-  height        INT,                   -- 图片高度
-  thumbnail_path VARCHAR,              -- 缩略图路径 (JSON: {sm, lg})
-  created_by    VARCHAR,               -- 上传者 user ID
-  created_time  TIMESTAMPTZ,
-  deleted_time  TIMESTAMPTZ            -- 软删除
-);
+```prisma
+model Attachments {
+  id             String    @id @default(cuid())    // 主键，cuid 格式
+  token          String    @unique                  // 上传 token，唯一索引
+  hash           String                              // 文件哈希
+  size           BigInt                              // 文件大小
+  mimetype       String                              // MIME 类型
+  path           String                              // 对象存储路径
+  width          Int?                                 // 图片宽度
+  height         Int?                                 // 图片高度
+  deletedTime    DateTime? @map("deleted_time")     // 软删除时间
+  createdTime    DateTime  @default(now()) @map("created_time")
+  createdBy      String    @map("created_by")       // 上传者 user ID
+  lastModifiedBy String?   @map("last_modified_by")
+  thumbnailPath  String?   @map("thumbnail_path")   // 缩略图路径 (JSON: {sm, lg})
+
+  @@map("attachments")
+}
 ```
 
-#### 3.1.2 attachments_table 表（行-列绑定）
+**主键与约束**：
+- 主键：`id`（cuid 格式，非 token）
+- 唯一约束：`token` 上有唯一索引
+- 软删除：通过 `deletedTime` 字段实现，无外键级联删除
 
-```sql
-CREATE TABLE attachments_table (
-  id            BIGSERIAL PRIMARY KEY,
-  table_id      VARCHAR NOT NULL,      -- 表 ID
-  record_id     VARCHAR NOT NULL,      -- 行 (记录) ID
-  field_id      VARCHAR NOT NULL,      -- 列 (字段) ID
-  attachment_id VARCHAR NOT NULL,      -- 附件 ID (actxxx 格式)
-  token         VARCHAR NOT NULL,      -- 附件 token (关联 attachments 表)
-  name          VARCHAR,               -- 文件名
-  created_by    VARCHAR,
-  created_time  TIMESTAMPTZ,
-  deleted_time  TIMESTAMPTZ
-);
+#### 3.1.2 AttachmentsTable 表（行-列绑定）
+
+```prisma
+model AttachmentsTable {
+  id               String    @id @default(cuid())    // 主键，cuid 格式
+  attachmentId     String    @map("attachment_id")   // 附件 ID (actxxx 格式)
+  name             String                             // 文件名
+  token            String                             // 附件 token (关联 attachments.token)
+  tableId          String    @map("table_id")        // 表 ID
+  recordId         String    @map("record_id")       // 行 (记录) ID
+  fieldId          String    @map("field_id")        // 列 (字段) ID
+  createdTime      DateTime  @default(now()) @map("created_time")
+  createdBy        String    @map("created_by")
+  lastModifiedBy   String?   @map("last_modified_by")
+  lastModifiedTime DateTime? @updatedAt @map("last_modified_time")
+
+  @@index([tableId, recordId])
+  @@index([tableId, fieldId])
+  @@index([attachmentId])
+  @@map("attachments_table")
+}
 ```
 
-**关键点**：`attachments` 表以 `token` 为主键存储文件元数据，`attachments_table` 通过 `table_id + record_id + field_id + attachment_id` 四元组将文件与具体单元格绑定。
+**主键与约束**：
+- 主键：`id`（cuid 格式，前缀 `attt`）
+- 索引：`(tableId, recordId)`、`(tableId, fieldId)`、`(attachmentId)`
+- **无外键约束**：`token` 字段逻辑关联 `attachments.token`，但无数据库级外键
+- **无软删除字段**：物理删除
+
+**删除行为**：
+- 删除记录/字段/表时，通过应用层代码调用 `deleteRecords()` / `deleteFields()` / `deleteTable()` 物理删除 `attachments_table` 中的绑定行
+- `attachments` 表的元数据不会被级联删除（可能产生孤立文件）
 
 ### 3.2 附件字段类型
 
@@ -187,7 +210,7 @@ interface AttachmentItem {
   id: string;           // 附件 ID (actxxx 格式)
   name: string;         // 文件名
   path: string;         // 存储路径
-  token: string;        // 附件 token (关联 attachments 表)
+  token: string;        // 附件 token (关联 attachments.token)
   size: number;         // 文件大小
   mimetype: string;     // MIME 类型
   presignedUrl?: string;  // 预签名访问 URL
@@ -200,50 +223,162 @@ interface AttachmentItem {
 
 单元格值为 `AttachmentItem[]` 数组，支持同一单元格存储多个附件。
 
-### 3.4 绑定写入流程
+### 3.4 绑定写入的两条路径（真实模型）
 
-#### 3.4.1 v1 路径（ShareDB 实时协作）
+#### 3.4.1 v1 路径：事件驱动的异步绑定（ShareDB 实时协作）
 
-`apps/nestjs-backend/src/features/attachments/attachments-table.service.ts`：
+**触发链路**：
+
+```
+ShareDB 操作提交
+    │
+    ▼
+event-emitter.service.ts: ops2Event()
+    │  ├─ 解析 RawOp (Create/Edit/Del)
+    │  ├─ 通过 eventNameMapping 映射到事件
+    │  └─ emitAsync(Events.TABLE_RECORD_*)
+    │
+    ▼
+attachment.listener.ts: 事件监听器（async: true）
+    ├─ @OnEvent(Events.TABLE_RECORD_CREATE) → createRecords()
+    ├─ @OnEvent(Events.TABLE_RECORD_UPDATE) → updateRecords()
+    └─ @OnEvent(Events.TABLE_RECORD_DELETE) → deleteRecords()
+```
+
+**关键代码**：
+
+`apps/nestjs-backend/src/event-emitter/event-emitter.service.ts:85-101` — `ops2Event()`：
+
+1. 从 `rawOpMaps` 收集事件（`collectEventsFromRawOpMap()`）
+2. 按 `tableId + eventName` 分组聚合
+3. 通过 RxJS 流式处理并触发 `handleEventResult()` → `emitAsync()`
+
+`apps/nestjs-backend/src/event-emitter/listeners/attachment.listener.ts:16-63` — 四个监听点：
+
+```typescript
+@OnEvent(Events.TABLE_RECORD_CREATE, { async: true })
+  → attachmentsTableService.createRecords()
+
+@OnEvent(Events.TABLE_RECORD_UPDATE, { async: true })
+  → attachmentsTableService.updateRecords()
+
+@OnEvent(Events.TABLE_RECORD_DELETE, { async: true })
+  → attachmentsTableService.deleteRecords()
+
+@OnEvent(Events.TABLE_FIELD_DELETE, { async: true })
+  → attachmentsTableService.deleteFields()
+```
+
+**核心服务**：`apps/nestjs-backend/src/features/attachments/attachments-table.service.ts`
 
 - `createRecords()`：创建记录时，扫描所有 `Attachment` 类型字段，将附件项批量写入 `attachments_table`
-- `updateRecords()`：更新记录时，对比 oldValue/newValue，计算需要删除和新增的绑定
-- `deleteRecords()` / `deleteFields()` / `deleteTable()`：级联清理绑定关系
+- `updateRecords()`：更新记录时，对比 oldValue/newValue，计算需要删除和新增的绑定（通过 `tableId-fieldId-recordId-attachmentId` 四元组做 diff）
+- `deleteRecords()`：按 recordId 删除绑定
+- `deleteFields()`：按 fieldId 删除绑定
+- `deleteTable()`：按 tableId 删除所有绑定
 
-```typescript
-// attachments-table.service.ts:12-19
-createUniqueKey(tableId, fieldId, recordId, attachmentId) {
-  return `${tableId}-${fieldId}-${recordId}-${attachmentId}`;
-}
+**重要特性**：
+- `{ async: true }`：事件异步处理，不阻塞主流程
+- 事件合并：`combineEvents()` 将同 tableId 同类型的事件批量处理
+- 最终一致性：绑定写入与记录写入异步，可能存在短暂延迟
+
+#### 3.4.2 v2 路径：同步的绑定落库（领域模型 + Kysely）
+
+**触发边界**：
+
+v2 路径的绑定写入是**同步**的，发生在 SQL 事务内，由 `CellValueMutateVisitor` 和 `RecordInsertBuilder` 在构建 SQL 时直接生成。
+
+**调用链**：
+
+```
+TableRecordRepository.createMany() / update()
+    │
+    ▼
+RecordInsertBuilder / RecordUpdateBuilder
+    │
+    ├─ 构建主表 INSERT/UPDATE 语句
+    │
+    ▼  (插入时)
+RecordInsertBuilder.ts:384-395
+    │  遍历字段，遇到 Attachment 类型时
+    │  调用 buildAttachmentTableInsertQuery()
+    │  生成附加的 INSERT 语句
+    │
+    ▼  (更新时)
+CellValueMutateVisitor.visitSetAttachmentValueSpec()
+    │  CellValueMutateVisitor.ts:496-523
+    │  调用 buildAttachmentTableReplaceQueries()
+    │  生成 DELETE + INSERT 语句
+    │
+    ▼
+attachmentTableMutations.ts: buildAttachmentTableReplaceQueries()
+    ├─ DELETE FROM attachments_table
+    │     WHERE table_id=? AND record_id=? AND field_id=?
+    └─ INSERT INTO attachments_table (...) VALUES (...)
 ```
 
-使用四元组生成唯一键，用于 diff 计算。
+**关键代码**：
 
-#### 3.4.2 v2 路径（领域模型）
-
-`packages/v2/core/src/domain/table/fields/visitors/FieldToSpecVisitor.ts:470-495`：
+`packages/v2/adapter-table-repository-postgres/src/record/attachments/attachmentTableMutations.ts:74-94` — `buildAttachmentTableReplaceQueries()`：
 
 ```typescript
-visitAttachmentField(field: AttachmentField): Result<ICellValueSpec, DomainError> {
-  // 1. null → SetAttachmentValueSpec(null)
-  // 2. 解析 AttachmentItem[] 数组格式
-  // 3. typecast 模式下支持 "actxxx,actyyy" 字符串格式
-  // 4. 返回 SetAttachmentValueSpec(fieldId, CellValue<AttachmentItem[]>)
-}
+export const buildAttachmentTableReplaceQueries = (db, params) => {
+  // 1. 先删除该单元格的所有旧绑定
+  const deleteQuery = db
+    .deleteFrom('attachments_table')
+    .where('table_id', '=', params.tableId)
+    .where('record_id', '=', params.recordId)
+    .where('field_id', '=', params.fieldId)
+    .compile();
+
+  // 2. 再插入新绑定（如果有值）
+  const insertQuery = buildAttachmentTableInsertQuery(db, params);
+
+  // 3. 返回查询数组，将在同一事务中执行
+  return insertQuery ? [deleteQuery, insertQuery] : [deleteQuery];
+};
 ```
 
-`packages/v2/core/src/domain/table/fields/visitors/SetFieldValueSpecFactoryVisitor.ts:127-132`：
+`packages/v2/adapter-table-repository-postgres/src/record/visitors/CellValueMutateVisitor.ts:496-523` — `visitSetAttachmentValueSpec()`：
 
 ```typescript
-visitAttachmentField(field: AttachmentField): Result<ICellValueSpec, DomainError> {
-  const cellValue = CellValue.fromValidated<AttachmentItem[]>(
-    this.value as AttachmentItem[] | null
+visitSetAttachmentValueSpec(spec: SetAttachmentValueSpec) {
+  // ... 验证字段存在且类型正确 ...
+
+  // 将附件绑定 SQL 添加到 additionalStatements
+  this.additionalStatements.push(
+    ...buildAttachmentTableReplaceQueries(this.db, {
+      actorId: this.ctx.actorId,
+      tableId: this.table.id().toString(),
+      recordId: this.ctx.recordId,
+      fieldId: spec.fieldId.toString(),
+      value: spec.value.toValue(),
+    })
   );
-  return ok(new SetAttachmentValueSpec(field.id(), cellValue));
+
+  return ok(undefined);
 }
 ```
 
-`SetAttachmentValueSpec.mutate()` 最终调用 `TableRecord.setFieldValue()` 将值写入领域模型的记录中。
+**v2 触发边界总结**：
+
+| 触发场景 | 触发点 | 执行方式 |
+|---|---|---|
+| 创建记录 | `RecordInsertBuilder.build()` 中检测到 Attachment 字段 | 同步，事务内 |
+| 更新记录 | `CellValueMutateVisitor.visitSetAttachmentValueSpec()` | 同步，事务内 |
+| 删除记录 | 主表记录删除后无自动清理，需显式调用 | N/A |
+| 删除字段 | 无自动清理 | N/A |
+| 删除表 | 无自动清理 | N/A |
+
+**v1 vs v2 对比**：
+
+| 维度 | v1 (事件驱动) | v2 (同步 SQL) |
+|---|---|---|
+| 执行时机 | 异步，事件监听 | 同步，SQL 构建时 |
+| 一致性 | 最终一致 | 强一致（事务内） |
+| 触发方式 | ShareDB op → 事件 → 监听器 | 领域模型 → SQL 构建 |
+| 删除处理 | 支持记录/字段/表删除的级联清理 | 仅支持创建/更新时的绑定 |
+| 批量处理 | 支持事件合并批量 | 单条记录处理 |
 
 ### 3.5 附件值装饰（URL 签名）
 
@@ -369,18 +504,19 @@ async uploadAttachment(...) {
          ├─ attachmentsCropQueueProcessor.add()  ← 图片裁剪
          └─ return { token, size, mimetype, url, presignedUrl }
 
-4. 前端调用 uploadAttachment(tableId, recordId, fieldId, file)
-   └─ POST /api/table/{tableId}/record/{recordId}/{fieldId}/uploadAttachment
-      ├─ @Permissions('record|update') 校验
-      └─ RecordOpenApiService.uploadAttachment()
-         ├─ getValidateAttachmentRecord() 校验字段和记录
-         ├─ attachmentsService.uploadFile() 或 uploadFromUrl()
-         │  ├─ signature() 获得上传凭证
-         │  └─ uploadStreamToStorage() 上传到存储
-         ├─ 构造 { fieldId: [oldAttachments..., newAttachmentItem] }
-         └─ updateRecord() 写入行数据
-            ├─ v1: ShareDB op → repairAttachmentOp → attachmentsTable.createMany()
-            └─ v2: SetAttachmentValueSpec → TableRecord.setFieldValue() → attachments_table
+4. 前端构造 AttachmentItem，调用更新记录 API
+   └─ 更新记录字段值
+      ├─ v1 路径:
+      │   └─ ShareDB op
+      │       └─ ops2Event() → Events.TABLE_RECORD_UPDATE
+      │           └─ AttachmentListener.recordUpdateListener()
+      │               └─ attachmentsTableService.updateRecords()  ← 异步写入绑定
+      └─ v2 路径:
+          └─ TableRecordRepository.update()
+              └─ CellValueMutateVisitor.visitSetAttachmentValueSpec()
+                  └─ buildAttachmentTableReplaceQueries()
+                      ├─ DELETE FROM attachments_table
+                      └─ INSERT INTO attachments_table  ← 同步写入绑定（事务内）
 ```
 
 ---
@@ -389,17 +525,18 @@ async uploadAttachment(...) {
 
 | 文件 | 作用 |
 |---|---|
+| `packages/db-main-prisma/prisma/postgres/schema.prisma` | 数据库真实 Schema 定义 |
 | `apps/nestjs-backend/src/features/attachments/attachments.controller.ts` | 附件 HTTP 端点 |
 | `apps/nestjs-backend/src/features/attachments/attachments.service.ts` | 核心上传/签名/通知逻辑 |
-| `apps/nestjs-backend/src/features/attachments/attachments-table.service.ts` | 附件-行-列绑定写入 |
+| `apps/nestjs-backend/src/features/attachments/attachments-table.service.ts` | v1 事件驱动的绑定写入 |
 | `apps/nestjs-backend/src/features/attachments/attachments-storage.service.ts` | 预签名 URL 生成与缓存 |
 | `apps/nestjs-backend/src/features/attachments/guard/auth.guard.ts` | 动态鉴权（登录/分享） |
-| `apps/nestjs-backend/src/features/attachments/plugins/adapter.ts` | 存储适配器抽象 |
-| `apps/nestjs-backend/src/features/attachments/plugins/local.ts` | 本地存储实现 |
-| `apps/nestjs-backend/src/features/attachments/plugins/s3.ts` | S3 存储实现 |
-| `apps/nestjs-backend/src/features/record/open-api/record-open-api.controller.ts` | 记录级上传端点 |
-| `apps/nestjs-backend/src/features/record/open-api/record-open-api.service.ts` | 记录级上传服务 |
+| `apps/nestjs-backend/src/event-emitter/event-emitter.service.ts` | ShareDB op → 事件转换 |
+| `apps/nestjs-backend/src/event-emitter/listeners/attachment.listener.ts` | 事件监听器，触发绑定写入 |
 | `apps/nestjs-backend/src/share-db/repair-attachment-op/repair-attachment-op.service.ts` | ShareDB 操作附件修复 |
+| `packages/v2/adapter-table-repository-postgres/src/record/attachments/attachmentTableMutations.ts` | v2 绑定 SQL 构建 |
+| `packages/v2/adapter-table-repository-postgres/src/record/visitors/CellValueMutateVisitor.ts` | v2 更新时的绑定触发 |
+| `packages/v2/adapter-table-repository-postgres/src/record/query-builder/insert/RecordInsertBuilder.ts` | v2 插入时的绑定触发 |
 | `packages/v2/core/src/domain/table/fields/types/AttachmentField.ts` | v2 附件字段领域模型 |
 | `packages/v2/core/src/domain/table/records/specs/values/SetAttachmentValueSpec.ts` | 附件值规格定义 |
 | `packages/v2/core/src/domain/table/fields/visitors/FieldToSpecVisitor.ts` | 原始值→规格的转换 |

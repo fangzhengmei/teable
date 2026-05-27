@@ -254,6 +254,169 @@ newAttachments.push({
 - v2 是新架构，使用统一的前缀 ID 生成策略（与 `RecordId`/`FieldId`/`ViewId` 保持一致）
 - 目前处于双轨运行阶段，未来可能统一到 v2 的前缀格式
 
+### 3.1.4 Record OpenAPI 入口分流与 ID 形态对应
+
+**四个核心入口**：
+
+| 端点 | 方法 | @UseV2Feature | 内部调用 |
+|---|---|---|---|
+| `POST :recordId/:fieldId/uploadAttachment` | `uploadAttachment()` | ❌ 无 | 调用 `RecordOpenApiService.uploadAttachment()` |
+| `POST :recordId/:fieldId/insertAttachment` | `insertAttachment()` | ❌ 无 | 调用 `RecordOpenApiService.insertAttachment()` |
+| `PATCH :recordId` | `updateRecord()` | ✅ `updateRecord` | 检查 `cls.get('useV2')` 分流 |
+| `POST /` | `createRecords()` | ✅ `createRecord` | 检查 `cls.get('useV2')` 分流 |
+
+**@UseV2Feature 装饰器的作用**：
+`V2FeatureGuard.canActivate()` 会根据 `@UseV2Feature('xxx')` 装饰器标记的 feature 名，调用 `CanaryService.shouldUseV2ForBaseWithReason()` 判断是否走 v2 逻辑，结果存入 CLS 的 `useV2` 变量。
+
+**Canary 决策优先级**（`canary.service.ts:156-165`）：
+1. `FORCE_V2_ALL` 环境变量（最高）
+2. 全局 canary 开关是否关闭
+3. 数据库配置的 `forceV2All`
+4. `x-canary` 请求头覆盖
+5. 空间在 canary 列表中（全量 v2）
+6. 新创建的 Base（`base.v2Enabled = true`）自动走 v2
+
+**不支持的 payload 回退**：
+`V2FeatureGuard.isUnsupportedV2Payload()` 中，如果 `updateRecord` 请求只有 `order` 没有 `fields`，则强制回退到 v1。
+
+---
+
+### 3.1.5 分流决策与 ID 形态的完整映射
+
+```
+                      ┌───────────────────────────────────┐
+                      │   四个 OpenAPI 入口               │
+                      └───────────────┬───────────────────┘
+                                      │
+            ┌─────────────────────────┼─────────────────────────┐
+            ▼                         ▼                         ▼
+┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+│ uploadAttachment     │  │ insertAttachment     │  │ updateRecord /       │
+│ (无 @UseV2Feature)   │  │ (无 @UseV2Feature)   │  │ createRecords        │
+│                      │  │                      │  │ (@UseV2Feature)      │
+└───────────┬──────────┘  └───────────┬──────────┘  └──────────┬───────────┘
+            │                          │                         │
+            │ V2FeatureGuard           │ V2FeatureGuard          │ V2FeatureGuard
+            │ feature=undefined        │ feature=undefined       │ feature='updateRecord'
+            │ useV2 = false            │ useV2 = false           │ / 'createRecord'
+            │                          │                         │ useV2 = ? (canary)
+            ▼                          ▼                         │
+┌────────────────────────────────────────────────────┐          │
+│ RecordOpenApiService.uploadAttachment()            │          │
+│ RecordOpenApiService.insertAttachment()            │          │
+│   ├─ 上传文件 / 校验附件                           │          │
+│   └─ 构造 updateRecordRo，调用 this.updateRecord() │          │
+└──────────────────────────────┬─────────────────────┘          │
+                               │                                    │
+                               └───────────────┬────────────────────┘
+                                               │
+                                               ▼
+                        ┌───────────────────────────────────┐
+                        │ updateRecord() 内部调用           │
+                        │ if (cls.useV2)                   │
+                        │   ├─ YES → v2 路径               │
+                        │   └─ NO  → v1 路径               │
+                        └───────────────┬───────────────────┘
+                                        │
+                    ┌───────────────────┴───────────────────┐
+                    ▼                                       ▼
+            ┌──────────────────┐                   ┌──────────────────┐
+            │ v1 路径          │                   │ v2 路径          │
+            │                  │                   │                  │
+            │ ShareDB op →     │                   │ 领域模型 →       │
+            │   event-emitter  │                   │   Kysely SQL     │
+            │   → listener →   │                   │   → attachment   │
+            │   Prisma         │                   │   TableMutations  │
+            │   createMany     │                   │                  │
+            │ (不提供 id)      │                   │ (显式提供 id)    │
+            └─────────┬────────┘                   └─────────┬────────┘
+                      ▼                                       ▼
+            ┌──────────────────┐                   ┌──────────────────┐
+            │ ID 形态          │                   │ ID 形态          │
+            │ Prisma cuid()    │                   │ generatePrefixed │
+            │ 25 字符          │                   │ Id('attt', 16)   │
+            │ c 开头           │                   │ 20 字符          │
+            │ 示例:            │                   │ 示例:            │
+            │ ckz4xj3l5...     │                   │ attt7xJ3kL...    │
+            └──────────────────┘                   └──────────────────┘
+```
+
+**四个入口的分流与 ID 形态对应表**：
+
+| API 入口 | @UseV2Feature | canary useV2 | 最终路径 | AttachmentsTable ID 形态 |
+|---|---|---|---|---|
+| `POST uploadAttachment` | ❌ 无 | `false` (固定) | **v1** | Prisma cuid，25 字符，`c` 开头 |
+| `POST insertAttachment` | ❌ 无 | `false` (固定) | **v1** | Prisma cuid，25 字符，`c` 开头 |
+| `PATCH :recordId` (updateRecord) | ✅ `updateRecord` | `false` | **v1** | Prisma cuid，25 字符，`c` 开头 |
+| `PATCH :recordId` (updateRecord) | ✅ `updateRecord` | `true` | **v2** | `attt` 前缀 + nanoid，20 字符 |
+| `POST /` (createRecords) | ✅ `createRecord` | `false` | **v1** | Prisma cuid，25 字符，`c` 开头 |
+| `POST /` (createRecords) | ✅ `createRecord` | `true` | **v2** | `attt` 前缀 + nanoid，20 字符 |
+
+**关键发现**：`uploadAttachment` 和 `insertAttachment` **没有 @UseV2Feature 装饰器**，因此 `V2FeatureGuard` 中 `feature` 为 `undefined`，`useV2` 被强制设为 `false`，**永远走 v1 路径**。这两个方法内部调用 `this.updateRecord()` 时，虽然 `updateRecord` 方法本身有 `@UseV2Feature('updateRecord')` 装饰器，但**装饰器仅在 HTTP 请求入口生效**，内部方法调用不会再次经过 Guard，因此 `useV2` 仍然是 `false`。
+
+**ID 形态出现差异的场景**：
+
+| 场景 | 触发方式 | ID 形态 |
+|---|---|---|
+| 前端拖拽上传文件到附件列 | `POST /uploadAttachment` | **cuid** (`c` 开头) |
+| OpenAPI 调用 `insertAttachment` | `POST /insertAttachment` | **cuid** (`c` 开头) |
+| OpenAPI 调用 `updateRecord` 更新附件列（非 canary 空间） | `PATCH :recordId` | **cuid** (`c` 开头) |
+| OpenAPI 调用 `updateRecord` 更新附件列（canary 空间 / 新 Base） | `PATCH :recordId` | **attt 前缀** |
+| OpenAPI 调用 `createRecords` 创建带附件的记录（非 canary） | `POST /` | **cuid** (`c` 开头) |
+| OpenAPI 调用 `createRecords` 创建带附件的记录（canary / 新 Base） | `POST /` | **attt 前缀** |
+| ShareDB 实时协作编辑附件列 | WebSocket → op → event | **cuid** (`c` 开头) |
+| v2 领域模型内部更新（单元测试 / 后端 Job） | 直接调用 v2 Repository | **attt 前缀** |
+
+**v1 内部调用链**（以 `uploadAttachment` 为例）：
+`record-open-api.service.ts:381-412`
+
+```typescript
+async uploadAttachment(tableId, recordId, fieldId, file, fileUrl) {
+  // 1. 校验
+  const record = await this.getValidateAttachmentRecord(...);
+
+  // 2. 上传文件到对象存储，得到 attachmentItem
+  const attachmentItem = file
+    ? await this.attachmentsService.uploadFile(file)
+    : await this.attachmentsService.uploadFromUrl(fileUrl);
+
+  // 3. 构造更新 payload
+  const updateRecordRo = {
+    fieldKeyType: FieldKeyType.Id,
+    record: {
+      fields: {
+        [fieldId]: [...(record.fields[fieldId] || []), attachmentItem],
+      },
+    },
+  };
+
+  // 4. 调用 this.updateRecord() —— 注意：内部调用不会触发 Guard！
+  //    此时 cls.get('useV2') 仍为 false（uploadAttachment 无 @UseV2Feature）
+  return await this.updateRecord(tableId, recordId, updateRecordRo);
+}
+```
+
+**v1 updateRecord 调用链**：
+```
+uploadAttachment() → updateRecord() → updateRecords() → 
+recordModifyService.updateRecords() → ShareDB op → 
+event-emitter ops2Event() → TABLE_RECORD_UPDATE → 
+attachment.listener → attachmentsTableService.updateRecords() →
+prisma.attachmentsTable.createMany()  (不提供 id → cuid)
+```
+
+**v2 updateRecord 调用链**：
+```
+PATCH :recordId (useV2=true) → recordOpenApiV2Service.updateRecord() →
+commandBus.execute(new UpdateRecordCommand(...)) →
+UpdateRecordHandler.handle() →
+TableRecordRepository.update() →
+CellValueMutateVisitor.visitSetAttachmentValueSpec() →
+buildAttachmentTableReplaceQueries() →
+INSERT INTO attachments_table (id, ...)
+  VALUES (generatePrefixedId('attt', 16), ...)  (显式提供 id → attt 前缀)
+```
+
 ### 3.2 附件字段类型
 
 `packages/v2/core/src/domain/table/fields/types/AttachmentField.ts` — `AttachmentField` 继承自 `Field`，类型为 `FieldType.attachment()`，无额外配置选项。

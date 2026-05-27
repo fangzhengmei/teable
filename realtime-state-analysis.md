@@ -1204,99 +1204,207 @@ dispatch ready 事件，UI 全量更新
 
 ### 11.4 Presence 通道的批量操作通知
 
-文件：`packages/sdk/src/context/use-instances/useInstances.ts:532-595`
+文件：`packages/sdk/src/context/use-instances/useInstances.ts:548-578`
 
-通过 ShareDB Presence 通道传递批量操作通知：
+通过 ShareDB Presence 通道传递批量操作通知，**按优先级顺序匹配**：
 
 ```typescript
-const presence: Presence = connection.getPresence(
-  getActionTriggerChannel(schemaRefreshCollectionTableId)
-);
+const receiveListener = (_id: string, batch: unknown) => {
+  // 优先级 1: 删除记录（最高优先级，匹配即返回）
+  const deletedRecordIds = getProjectedDeleteRecordIds(tableId, batch);
+  if (deletedRecordIds?.length) {
+    removeProjectedRecordsByIds(deletedRecordIds);
+    return;
+  }
 
-presence.subscribe();
-presence.addListener('receive', receiveListener);
+  // 优先级 2: 大批量记录更新/创建 → 全量刷新（匹配即返回）
+  if (
+    shouldRefreshAfterProjectedMutation(tableId, batch, 'setRecord') ||
+    shouldRefreshAfterProjectedMutation(tableId, batch, 'addRecord')
+  ) {
+    setSchemaRefreshToken((current) => current + 1);
+    return;
+  }
+
+  // 优先级 3: 非 Schema 刷新动作 → 忽略
+  if (!isSchemaRefreshAction(tableId, batch)) {
+    return;
+  }
+
+  // 优先级 4: 字段更新 → 尝试增量刷新，失败降级全量
+  const fieldIds = getSchemaRefreshRecordFieldIds(tableId, batch);
+  if (fieldIds?.length) {
+    void refreshProjectedRecordFields(fieldIds).then((handled) => {
+      if (!handled) {
+        setSchemaRefreshToken((current) => current + 1);  // 增量失败，全量刷新
+      }
+    });
+    return;
+  }
+
+  // 优先级 5: 其他 Schema 刷新情况 → 直接全量刷新
+  setSchemaRefreshToken((current) => current + 1);
+};
 ```
 
-**通知类型：**
-1. `setField` — 字段更新，触发计算字段刷新
-2. `setRecord` — 记录批量更新，触发刷新
-3. `addRecord` — 记录批量创建，触发刷新
-4. `deleteRecord` — 记录批量删除，增量移除
+**执行优先级总结：**
+1. **删除记录** → 立即从本地移除，最快响应
+2. **大批量更新/创建** → 触发全量刷新（`skipRealtime: true` 的操作）
+3. **字段更新** → 尝试增量刷新指定字段，失败才降级全量
+4. **其他情况** → 直接全量刷新
 
 ---
 
-## 12. 前端冲突解决机制
+## 12. 本地编辑的实现机制 — 不是 ShareDB pendingOps
 
-### 12.1 乐观更新与服务器最终一致
+### 12.1 澄清：本地编辑不使用 ShareDB submitOp / pendingOps
 
-#### 12.1.1 本地优先策略
+**关键发现**：前端本地编辑**完全绕过了 ShareDB 的 OT 提交机制**，而是采用：
+- ✅ REST API `updateRecord` 发送到后端
+- ✅ 本地 `doc.emit('op batch', [op], false)` 模拟操作事件
+- ✅ 手动调整 `doc.version` 保持一致性
+- ❌ **不调用** `doc.submitOp()` → 没有 `pendingOps` 队列
+- ❌ **不经过** ShareDB 的 OT 转换
 
-用户编辑采用**本地优先**的乐观更新：
-1. UI 立即响应（无需等待服务器）
-2. 后台异步发送 API 请求
-3. 成功时用服务器返回的权威数据修正本地
-4. 失败时回滚本地状态并提示用户
+### 12.2 完整的本地编辑流程
 
-#### 12.1.2 冲突场景：同时编辑同一单元格
-
-```
-用户A编辑字段 fld1 → 本地更新值为 "A" → API 发送中...
-用户B编辑字段 fld1 → 本地更新值为 "B" → API 发送成功 → ShareDB 广播 op(v=6)
-
-用户A收到远程 op(v=6)
-    │
-    ├─► 本地 pendingOp 基于 v=5
-    │
-    ├─► ShareDB OT 转换：将 pendingOp 转换为基于 v=6
-    │
-    └─► 最终值取决于：
-        ├─► 后提交者覆盖先提交者（默认 json0 行为）
-        └─► 或 API 层进行值比较（业务逻辑决定）
-```
-
-### 12.2 操作构建器与路径匹配
-
-文件：`packages/core/src/op-builder/record/set-record.ts`
-
-`IOtOperation` 是 ShareDB json0 类型的标准格式：
+文件：`packages/sdk/src/model/record/record.ts:98-168`
 
 ```typescript
-interface IOtOperation {
-  p: (string | number)[];  // JSON 路径
-  oi?: unknown;             // object insert
-  od?: unknown;             // object delete
-  li?: unknown;             // list insert
-  ld?: unknown;             // list delete
-  na?: number;              // number add
-  si?: string;              // string insert
-  sd?: string;              // string delete
+async updateCell(fieldId: string, cellValue: unknown) {
+  const oldCellValue = this.fields[fieldId];
+  try {
+    // ────────── 步骤 1: 本地乐观更新（瞬时响应 UI）──────────
+    this.onCommitLocal(fieldId, cellValue);
+
+    // ────────── 步骤 2: REST API 发送到后端 ──────────
+    const [, tableId] = this.doc.collection.split('_');
+    const res = await updateRecord(tableId, this.doc.id, {
+      fieldKeyType: FieldKeyType.Id,
+      record: {
+        fields: {
+          [fieldId]: cellValue === undefined ? null : cellValue,
+        },
+      },
+    });
+
+    // ────────── 步骤 3: 成功后同步计算字段 ──────────
+    const computedFieldIds = Object.keys(this.fieldMap).filter(
+      (fId) => this.fieldMap[fId].type === FieldType.Link || this.fieldMap[fId].isComputed
+    );
+    const fieldsToSync = new Set(computedFieldIds);
+    if (this.fieldMap[fieldId]?.type === FieldType.Attachment) {
+      fieldsToSync.add(fieldId);  // 附件字段需要服务器补充 presignedUrl
+    }
+    this.updateComputedField([...fieldsToSync], res.data);
+
+  } catch (error) {
+    // ────────── 步骤 4: 失败时回滚本地状态 ──────────
+    this.onCommitLocal(fieldId, oldCellValue, true);  // undo = true
+    toast.error(getHttpErrorMessage(error));
+    return error;
+  }
 }
 ```
 
-#### 12.2.1 SetRecord 操作构建
+### 12.3 onCommitLocal — 本地状态回放
+
+```typescript
+private onCommitLocal(fieldId: string, cellValue: unknown, undo?: boolean) {
+  const oldCellValue = this.fields[fieldId];
+  const operation = RecordOpBuilder.editor.setRecord.build({
+    fieldId,
+    newCellValue: cellValue,
+    oldCellValue,
+  });
+
+  // 1. 直接修改 ShareDB 文档的 data（绕过 submitOp）
+  this.doc.data.fields[fieldId] = cellValue;
+
+  // 2. 触发 'op batch' 事件，通知 useInstances 更新 UI
+  //    第三个参数 source=false 表示这是本地操作，不是来自服务器
+  this.doc.emit('op batch', [operation], false);
+
+  // 3. 手动调整版本号（模拟操作已提交）
+  if (this.doc.version) {
+    undo ? this.doc.version-- : this.doc.version++;
+  }
+
+  // 4. 更新模型实例字段缓存
+  this.fields[fieldId] = cellValue;
+}
+```
+
+### 12.4 设计意图与权衡
+
+| 设计选择 | 优点 | 缺点 |
+|---------|------|------|
+| **绕过 ShareDB submitOp** | 1. 后端可以进行完整的权限校验<br>2. 支持复杂的业务逻辑（计算字段、审计等）<br>3. REST API 有统一的错误处理 | 1. 无法利用 ShareDB 的 OT 并发解决<br>2. 需要手动管理本地状态回滚 |
+| **本地 emit('op batch')** | UI 瞬时响应，用户体验好 | 如果 API 失败，需要手动 undo |
+| **手动维护 doc.version** | 避免与服务器版本号跳变 | 增加了状态不一致的风险 |
+
+### 12.5 并发冲突的实际解决方式
+
+由于不使用 ShareDB OT，**冲突解决发生在后端数据库层面**：
+
+```
+用户A编辑记录 → REST updateRecord → 后端事务 → 版本号 +1 → ShareDB 广播 op
+用户B编辑记录 → REST updateRecord → 后端事务（基于新版本）→ 版本号 +1 → ShareDB 广播 op
+
+最终一致性：后提交者覆盖先提交者（数据库最后写入获胜）
+```
+
+---
+
+## 13. OT 操作构建器与路径匹配
+
+### 13.1 IOtOperation 类型定义
+
+文件：`packages/core/src/models/op.ts`
+
+这是 ShareDB json0 类型的标准格式，用于表示 JSON 文档的增量变更：
+
+```typescript
+interface IOtOperation {
+  p: (string | number)[];  // JSON 路径（必需）
+  oi?: unknown;             // object insert — 插入对象键
+  od?: unknown;             // object delete — 删除对象键
+  li?: unknown;             // list insert — 插入数组元素
+  ld?: unknown;             // list delete — 删除数组元素
+  na?: number;              // number add — 数值增减
+  si?: string;              // string insert — 字符串插入
+  sd?: string;              // string delete — 字符串删除
+}
+```
+
+### 13.2 SetRecord 操作构建
+
+文件：`packages/core/src/op-builder/record/set-record.ts`
 
 ```typescript
 class SetRecordBuilder {
   build({ fieldId, newCellValue, oldCellValue }): IOtOperation {
-    // null/空数组 → 删除键
+    // 情况 1: null/空数组 → 删除键（od = 旧值, oi = null）
     if (newCellValue == null || (Array.isArray(newCellValue) && newCellValue.length === 0)) {
       return { p: ['fields', fieldId], od: oldCellValue, oi: null };
     }
 
-    // 旧值为空 → 插入键
+    // 情况 2: 旧值为空 → 插入新键（只有 oi，没有 od）
     if (oldCellValue == null) {
       return { p: ['fields', fieldId], oi: newCellValue };
     }
 
-    // 替换键
+    // 情况 3: 替换键（od = 旧值, oi = 新值）
     return { p: ['fields', fieldId], od: oldCellValue, oi: newCellValue };
   }
 }
 ```
 
-#### 12.2.2 操作检测与路径匹配
+### 13.3 路径匹配算法
 
 文件：`packages/core/src/op-builder/common.ts`
+
+用于从操作路径中提取参数（如 fieldId）：
 
 ```typescript
 function pathMatcher<T>(path: (string | number)[], matchList: string[]): T | null {
@@ -1304,85 +1412,207 @@ function pathMatcher<T>(path: (string | number)[], matchList: string[]): T | nul
 
   const res: Record<string, string | number> = {};
   for (let i = 0; i < matchList.length; i++) {
-    if (matchList[i].startsWith(':')) {          // :fieldId → 捕获参数
+    if (matchList[i].startsWith(':')) {          // :fieldId → 捕获为参数
       res[matchList[i].slice(1)] = path[i];
       continue;
     }
-    if (matchList[i] === '*') continue;           // * → 跳过匹配
+    if (matchList[i] === '*') continue;           // * → 跳过，匹配任意值
     if (path[i] !== matchList[i]) return null;    // 精确匹配
   }
   return res as T;
 }
 
-// 示例：匹配 ['fields', 'fld123']
+// 示例：匹配路径 ['fields', 'fld123']
 pathMatcher(op.p, ['fields', ':fieldId']);
 // → { fieldId: 'fld123' }
 ```
 
-### 12.3 OT 转换原理（ShareDB 内置）
+### 13.4 冲突解决矩阵（修正版）
 
-json0 类型的操作转换遵循以下规则：
-
-#### 12.3.1 并发插入同一对象的不同键
-
-```
-op1: { p: ['fields', 'a'], oi: 1 }
-op2: { p: ['fields', 'b'], oi: 2 }
-
-转换结果：两个操作都保留，最终 { a: 1, b: 2 }
-```
-
-#### 12.3.2 并发插入同一对象的相同键
-
-```
-op1: { p: ['fields', 'a'], oi: 1 }  // 先到达服务器
-op2: { p: ['fields', 'a'], oi: 2 }  // 后到达
-
-转换结果：后提交者获胜，最终值为 2
-```
-
-#### 12.3.3 删除与修改冲突
-
-```
-op1: { p: ['fields', 'a'], od: 1 }        // 删除 a
-op2: { p: ['fields', 'a'], od: 1, oi: 2 } // 修改 a 为 2
-
-转换结果：删除优先，a 不存在
-```
-
-### 12.4 字段类型特殊处理
-
-#### 12.4.1 附件字段 — 服务器补充签名 URL
-
-文件：`packages/sdk/src/model/record/record.ts:154-158`
-
-```typescript
-// 附件字段需要同步（服务器补充 presignedUrl）
-if (this.fieldMap[fieldId]?.type === FieldType.Attachment) {
-  fieldsToSync.add(fieldId);
-}
-```
-
-#### 12.4.2 计算字段 — 异步更新
-
-- **公式、查找、汇总字段**：服务器异步计算
-- **本地不覆盖**：`updateComputedField` 中跳过 `undefined` 值
-- **通过实时通道更新**：计算完成后通过 ShareDB op 推送
-
-### 12.5 冲突解决矩阵
-
-| 冲突场景 | 解决策略 | 代码位置 |
+| 冲突场景 | 实际解决策略 | 代码位置 |
 |---------|---------|---------|
-| 两人编辑同一记录不同字段 | ShareDB OT 自动合并，互不影响 | `SetRecordBuilder.build()` |
-| 两人编辑同一记录同一字段 | 后提交者覆盖先提交者（服务器时序） | ShareDB json0 内置 |
+| 两人编辑同一记录不同字段 | REST API 串行执行，数据库最终一致 | 后端 `updateRecord` API |
+| 两人编辑同一记录同一字段 | **后提交者覆盖先提交者**（数据库最后写入获胜） | 后端数据库事务 |
 | 本地编辑与远程计算字段更新 | 本地手动编辑优先，计算字段通过 op 更新 | `updateComputedField` |
-| 字段类型变更后记录编辑 | 实时推送字段更新通知，前端刷新 schema | `schemaRefreshToken` |
-| 记录删除后编辑 | ShareDB 操作失败，前端重新拉取 | ShareDB 内置 |
-| 重连后状态不一致 | Query 重新订阅，拉取最新快照 | ShareDB Query 内置 |
+| 字段类型变更后记录编辑 | Presence 通知刷新 schema，前端重新拉取 | `schemaRefreshToken` |
+| 记录删除后编辑 | REST API 返回 404，前端提示错误 | `Record.updateCell` catch 块 |
+| 重连后状态不一致 | ShareDB Query 重新订阅，自动拉取最新快照 | ShareDB 内置 |
 
 ---
 
-## 13. 关键设计决策总结
+## 14. useRecords → useGridAsyncRecords 状态继承与缓存窗口
+
+### 14.1 状态继承链路
+
+```
+useInstances (ShareDB 实时订阅)
+        │
+        ▼
+useRecords (封装 useInstances，注入 fieldMap)
+        │
+        ▼
+useGridAsyncRecords (虚拟滚动 + 滑动窗口缓存)
+```
+
+#### 14.1.1 useRecords — 实时数据层
+
+文件：`packages/sdk/src/hooks/use-records.ts`
+
+```typescript
+export const useRecords = (query?: IGetRecordsRo, initData?: IRecord[]) => {
+  const tableId = useTableId();
+  const viewId = useViewId();
+  const fields = useFields();
+  const { searchQuery } = useSearch();
+
+  // 构造查询参数（viewId + search + 自定义参数）
+  const queryParams = useMemo(() => ({
+    viewId,
+    search: searchQuery,
+    ...query,
+    type: IdPrefix.Record,
+  }), [query, searchQuery, viewId]);
+
+  // 调用 useInstances 进行 ShareDB 订阅
+  const { instances, extra } = useInstances({
+    collection: `${IdPrefix.Record}_${tableId}`,
+    factory: createRecordInstance,
+    queryParams,
+    initData,
+  });
+
+  // 注入 fieldMap，返回最终记录
+  return useMemo(() => {
+    const fieldMap = keyBy(fields, 'id');
+    return {
+      records: instances.map(instance => recordInstanceFieldMap(instance, fieldMap)),
+      extra,
+    };
+  }, [instances, fields, extra]);
+};
+```
+
+#### 14.1.2 useGridAsyncRecords — 虚拟滚动缓存层
+
+文件：`packages/sdk/src/components/grid-enhancements/hooks/use-grid-async-records.ts:78-242`
+
+### 14.2 滑动窗口缓存机制
+
+#### 14.2.1 核心概念
+
+```
+LOAD_PAGE_SIZE = 300  // 每页加载 300 条记录
+cacheLen = take * 2   // 缓存窗口 = 当前页面 × 2（前后各 1 页）
+
+当用户滚动时，保持 600 条记录的滑动窗口在内存中
+```
+
+#### 14.2.2 onForceUpdate — 缓存窗口更新逻辑
+
+```typescript
+const onForceUpdate = useCallback(() => {
+  const startIndex = queryRef.current.skip ?? 0;
+  const take = queryRef.current.take ?? LOAD_PAGE_SIZE;
+
+  setLoadedRecordMap((preLoadedRecords) => {
+    const cacheLen = take * 2;  // 600 条
+    // 缓存窗口范围：[startIndex - 300, startIndex + 300 + 300]
+    const [cacheStartIndex, cacheEndIndex] = [
+      Math.max(startIndex - cacheLen / 2, 0),      // 向前保留 300 条
+      startIndex + records.length + cacheLen / 2,  // 向后保留 300 条
+    ];
+
+    const newRecordsState: IRecordIndexMap = {};
+    for (let i = cacheStartIndex; i < cacheEndIndex; i++) {
+      // 在当前查询范围内的记录，用最新值更新
+      if (startIndex <= i && i < startIndex + records.length) {
+        newRecordsState[i] = records[i - startIndex];
+        continue;
+      }
+      // 不在查询范围内但在缓存窗口内，保留旧值
+      newRecordsState[i] = preLoadedRecords[i];
+    }
+    return newRecordsState;
+  });
+
+  // 同时更新搜索命中索引和分组信息...
+}, [records, extra]);
+```
+
+#### 14.2.3 缓存更新流程
+
+```
+用户滚动 → visiblePages 变化（防抖 30ms）
+    │
+    ▼
+检查可视区域是否在当前查询范围内
+    │
+    ├─► 在范围内 → 不做任何事
+    │
+    └─► 超出范围 → 计算新的 skip，更新 query
+        │
+        ▼
+useRecords 检测到 query 变化
+        │
+        ▼
+useInstances 重新订阅（或从缓存获取）
+        │
+        ▼
+records 更新 → 触发 onForceUpdate
+        │
+        ▼
+新记录合并到滑动窗口缓存
+        │
+        ▼
+loadedRecordMap 更新 → Grid 渲染新数据
+```
+
+### 14.3 可见区域驱动的分页加载
+
+```typescript
+useEffect(() => {
+  const { y, height } = visiblePages;
+  setQuery((cv) => {
+    if (cv.skip === undefined) return cv;
+
+    const take = initQuery?.take ?? cv.take ?? LOAD_PAGE_SIZE;  // 300
+    const pageOffsetSize = take / 3;  // 100
+    const pageGap = take / 3;         // 100
+
+    // 可视区域范围（偏移 100 条）
+    const visibleStartIndex = cv.skip - pageOffsetSize;
+    const visibleEndIndex = visibleStartIndex + take;
+
+    // 检查可视区域是否在当前"安全区"内
+    const viewInRange =
+      inRange(y, visibleStartIndex, visibleEndIndex) &&
+      inRange(y + height, visibleStartIndex, visibleEndIndex);
+
+    if (!viewInRange) {
+      // 超出范围，计算新的 skip（按 pageGap=100 对齐）
+      const skip = Math.floor(y / pageGap) * pageGap - pageGap;
+      return {
+        take: cv.take,
+        ...initQuery,
+        skip: Math.max(0, skip),
+      };
+    }
+    return cv;  // 在范围内，不更新
+  });
+}, [visiblePages, initQuery]);
+```
+
+### 14.4 状态继承总结
+
+| 层级 | Hook | 职责 | 数据来源 |
+|------|------|------|---------|
+| L1 | `useInstances` | ShareDB 实时订阅、查询缓存、事件分发 | ShareDB WebSocket |
+| L2 | `useRecords` | 封装 L1，注入 fieldMap，提供统一接口 | L1 + fields context |
+| L3 | `useGridAsyncRecords` | 虚拟滚动、滑动窗口缓存、可见区域分页 | L2 + 滚动事件 |
+
+---
+
+## 15. 关键设计决策总结
 
 | 决策 | 理由 | 代码位置 |
 |------|------|---------|
@@ -1395,18 +1625,20 @@ if (this.fieldMap[fieldId]?.type === FieldType.Attachment) {
 | RealtimeDocId 使用 collection/docId 格式 | 兼容 ShareDB 的 collection + docId 模型 | `RealtimeDocId.fromParts()` |
 | BroadcastChannel 维护内存快照 | 浏览器端无需服务器即可实现标签间同步 | `BroadcastChannelRealtimeHub` |
 | **查询缓存与引用计数** | 避免重复订阅，减少服务器压力 | `useInstances.acquireQuery()` |
-| **本地乐观更新** | UI 瞬时响应，提升用户体验 | `Record.onCommitLocal()` |
+| **REST + 本地回放（非 ShareDB submitOp）** | 后端权限校验 + 业务逻辑完整，UI 瞬时响应 | `Record.updateCell()` |
+| **Presence 通知优先级匹配** | 删除 > 批量刷新 > 字段增量 > 全量刷新 | `useInstances.receiveListener` |
 | **指数退避重连** | 网络波动时自动恢复，避免服务器压力 | `ReconnectingSockJS` |
 | **页面可见性管理** | 后台页面自动释放连接，节省资源 | `useConnectionAutoManage` |
 | **增量刷新优先，失败降级全量** | 平衡实时性与性能 | `refreshProjectedRecordFields()` |
-| **Presence 通道传递批量通知** | 大批量操作跳过实时推送但通知前端刷新 | `useInstances.receiveListener` |
-| **版本号驱动的 OT 转换** | 乱序操作自动排序和去重 | ShareDB 内置 |
+| **三层状态继承（useInstances → useRecords → useGridAsyncRecords）** | 关注点分离，每层职责单一 | 三个 Hook 协作 |
+| **滑动窗口缓存（take × 2）** | 虚拟滚动流畅，内存占用可控 | `useGridAsyncRecords.onForceUpdate()` |
+| **可见区域驱动分页（按 pageGap 对齐）** | 预加载数据，滚动无白屏 | `useGridAsyncRecords visiblePages effect` |
 
 ---
 
-## 14. 文件索引
+## 16. 文件索引
 
-### 14.1 V2 核心架构
+### 16.1 V2 核心架构
 
 | 文件 | 职责 |
 |------|------|
@@ -1425,7 +1657,7 @@ if (this.fieldMap[fieldId]?.type === FieldType.Attachment) {
 | `packages/v2/core/src/application/projections/FieldUpdatedRealtimeProjection.ts` | 字段更新投影 |
 | `packages/v2/core/src/application/projections/BatchRecordRefreshPolicy.ts` | 批量刷新策略 |
 
-### 14.2 实时引擎适配器
+### 16.2 实时引擎适配器
 
 | 文件 | 职责 |
 |------|------|
@@ -1436,14 +1668,14 @@ if (this.fieldMap[fieldId]?.type === FieldType.Attachment) {
 | `packages/v2/adapter-realtime-broadcastchannel/src/BroadcastChannelRealtimeEngine.ts` | BroadcastChannel 引擎 |
 | `packages/v2/core/src/ports/defaults/NoopRealtimeEngine.ts` | 空实现引擎 |
 
-### 14.3 V1 后端集成
+### 16.3 V1 后端集成
 
 | 文件 | 职责 |
 |------|------|
 | `apps/nestjs-backend/src/share-db/share-db.service.ts` | V1 ShareDB 服务 |
 | `apps/nestjs-backend/src/event-emitter/event-emitter.service.ts` | V1 事件发射器 |
 
-### 14.4 前端 SDK
+### 16.4 前端 SDK — 连接与订阅
 
 | 文件 | 职责 |
 |------|------|
@@ -1454,12 +1686,25 @@ if (this.fieldMap[fieldId]?.type === FieldType.Attachment) {
 | `packages/sdk/src/context/use-instances/reducer.ts` | 实例状态 Reducer |
 | `packages/sdk/src/context/use-instances/opListener.ts` | 单文档操作监听器管理 |
 | `packages/sdk/src/hooks/use-record.ts` | 单记录订阅 Hook |
-| `packages/sdk/src/model/record/record.ts` | 记录模型（含乐观更新） |
-| `packages/sdk/src/model/record/factory.ts` | 记录实例工厂 |
 | `packages/sdk/src/context/app/ConnectionContext.tsx` | 连接 Context |
 | `packages/sdk/src/hooks/use-connection.ts` | 连接 Hook |
 
-### 14.5 OT 操作构建器
+### 16.5 前端 SDK — 记录模型与编辑
+
+| 文件 | 职责 |
+|------|------|
+| `packages/sdk/src/model/record/record.ts` | 记录模型（含乐观更新、REST updateCell） |
+| `packages/sdk/src/model/record/factory.ts` | 记录实例工厂 |
+
+### 16.6 前端 SDK — 虚拟滚动与缓存
+
+| 文件 | 职责 |
+|------|------|
+| `packages/sdk/src/hooks/use-records.ts` | useInstances 封装，注入 fieldMap |
+| `packages/sdk/src/components/grid-enhancements/hooks/use-grid-async-records.ts` | 虚拟滚动、滑动窗口缓存、分页加载 |
+| `packages/sdk/src/components/grid-enhancements/hooks/use-grid-async-records-query.ts` | 网格异步记录查询 |
+
+### 16.7 OT 操作构建器
 
 | 文件 | 职责 |
 |------|------|
@@ -1469,7 +1714,7 @@ if (this.fieldMap[fieldId]?.type === FieldType.Attachment) {
 | `packages/core/src/op-builder/record/set-record.ts` | SetRecord 操作构建 |
 | `packages/core/src/op-builder/common.ts` | 路径匹配工具函数 |
 
-### 14.6 测试资源
+### 16.8 测试资源
 
 | 文件 | 职责 |
 |------|------|

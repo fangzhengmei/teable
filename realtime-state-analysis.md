@@ -705,7 +705,684 @@ export const registerV2BrowserPgliteDependencies = async (container, options) =>
 
 ---
 
-## 10. 关键设计决策总结
+## 10. 前端实时订阅入口与状态更新路径
+
+### 10.1 连接建立与管理
+
+#### 10.1.1 WebSocket 连接初始化
+
+文件：`packages/sdk/src/context/app/useConnection.tsx`
+
+前端使用 **SockJS** + **ShareDB Connection** 建立实时连接，支持自动重连：
+
+```typescript
+export const useConnection = (path?: string) => {
+  const [connected, setConnected] = useState(false);
+  const [connection, setConnection] = useState<Connection>();
+  const [socket, setSocket] = useState<ReconnectingSockJS | null>(null);
+
+  useEffect(() => {
+    const newSocket = new ReconnectingSockJS(path || getWsPath());
+    setSocket(newSocket);
+    return () => newSocket.destroy();
+  }, [path]);
+
+  useConnectionAutoManage(socket, undefined, {
+    inactiveTimeout: 10 * 60 * 1000,  // 页面不可见10分钟后关闭连接
+    reconnectDelay: 2000,              // 页面恢复后2秒重连
+  });
+
+  useEffect(() => {
+    const connection = new Connection(socket as Socket);
+    setConnection(connection);
+
+    const onConnected = () => {
+      setConnected(true);
+      pingInterval = setInterval(() => connection.ping(), 1000 * 10);
+    };
+
+    connection.on('connected', onConnected);
+    connection.on('disconnected', onDisconnected);
+    connection.on('error', shareDbErrorHandler);
+  }, [path, socket]);
+};
+```
+
+**连接生命周期：**
+1. 组件挂载时创建 `ReconnectingSockJS` 实例
+2. 建立 ShareDB Connection 并监听连接状态
+3. 每 10 秒发送 ping 保活
+4. 页面不可见 10 分钟后自动关闭连接
+5. 页面恢复可见时自动重连
+
+#### 10.1.2 自动重连策略
+
+文件：`packages/sdk/src/utils/reconnectingSockJS.ts`
+
+采用**指数退避**的重连策略：
+
+```typescript
+class ReconnectingSockJS {
+  private calculateDelay(): number {
+    return Math.min(
+      this.reconnectInterval * Math.pow(this.reconnectDecay, this.reconnectAttempts),
+      this.maxReconnectInterval
+    );
+  }
+}
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `reconnectInterval` | 1000ms | 初始重连间隔 |
+| `reconnectDecay` | 1.5 | 间隔衰减系数 |
+| `maxReconnectInterval` | 30000ms | 最大重连间隔 |
+
+#### 10.1.3 页面可见性管理
+
+文件：`packages/sdk/src/context/app/useConnectionAutoManage.ts`
+
+```
+页面可见 → 检查连接状态 → 断开则启动重连定时器（2s后重连）
+页面不可见 → 启动关闭定时器（10min后关闭连接）
+```
+
+### 10.2 订阅入口 — `useInstances` Hook
+
+文件：`packages/sdk/src/context/use-instances/useInstances.ts`
+
+这是前端实时订阅的核心入口，管理：
+- ShareDB Query 的创建与销毁
+- 查询结果缓存与去重
+- 操作监听与状态更新
+
+#### 10.2.1 查询缓存与去重
+
+```typescript
+// 全局查询缓存，跨 Hook 实例复用相同的订阅查询
+const subscribeQueryCache = new Map<string, CachedQuery>();
+
+const makeQueryKey = (collection: string, queryParams: unknown, refreshToken = 0) =>
+  `${collection}|${JSON.stringify(normalizeForKey(queryParams))}|refresh:${refreshToken}`;
+
+const acquireQuery = <T>(collection, connection, queryParams, refreshToken = 0) => {
+  const key = makeQueryKey(collection, queryParams, refreshToken);
+  const cached = subscribeQueryCache.get(key);
+  if (cached) {
+    cached.refCount += 1;
+    return { key, query: cached.query };
+  }
+  const query = connection!.createSubscribeQuery<T>(collection, queryParams);
+  subscribeQueryCache.set(key, { query, refCount: 1 });
+  return { key, query };
+};
+```
+
+**缓存策略关键点：**
+1. `queryParams` 递归排序后序列化，保证语义相同的查询生成相同的 key
+2. 引用计数（`refCount`）管理共享查询的生命周期
+3. 最后一个使用者释放时销毁查询和相关文档
+
+#### 10.2.2 订阅流程
+
+```
+useInstances 挂载
+    │
+    ├─► 计算 queryKey
+    │
+    ├─► acquireQuery() — 从缓存获取或创建新查询
+    │
+    ├─► 监听 Query 事件
+    │   ├─► ready   — 初始数据加载完成
+    │   ├─► insert  — 文档插入
+    │   ├─► remove  — 文档删除
+    │   ├─► move    — 文档移动
+    │   └─► extra   — 额外元数据
+    │
+    └─► 监听单个文档 'op batch' 事件
+        └─► 文档更新时触发 re-render
+```
+
+### 10.3 状态更新路径
+
+#### 10.3.1 Query 事件 → Reducer → React 状态
+
+文件：`packages/sdk/src/context/use-instances/reducer.ts`
+
+```typescript
+type IInstanceAction<T> =
+  | { type: 'update'; doc: Doc<T> }
+  | { type: 'ready'; results: Doc<T>[]; extra: unknown }
+  | { type: 'insert'; docs: Doc<T>[]; index: number }
+  | { type: 'remove'; docs: Doc<T>[]; index: number }
+  | { type: 'removeByIds'; ids: string[] }
+  | { type: 'move'; docs: Doc<T>[]; from: number; to: number }
+  | { type: 'clear' }
+  | { type: 'extra'; extra: unknown };
+```
+
+**状态更新流程：**
+
+```
+ShareDB Query 事件 (insert/remove/move)
+        │
+        ▼
+useInstances 事件处理器
+        │
+        ▼
+dispatch({ type, ...payload })
+        │
+        ▼
+instanceReducer — 不可变更新 instances 数组
+        │
+        ▼
+useReducer 返回新状态
+        │
+        ▼
+React 触发 re-render
+        │
+        ▼
+factory(doc.data, doc) — 创建模型实例
+        │
+        ▼
+组件使用最新数据
+```
+
+#### 10.3.2 单文档 'op batch' 事件监听
+
+文件：`packages/sdk/src/context/use-instances/opListener.ts`
+
+```typescript
+class OpListenersManager<T> {
+  private opListeners: Map<string, () => void> = new Map();
+
+  add(doc: Doc<T>, handler: (op: unknown[]) => void) {
+    if (this.opListeners.has(doc.id)) return;
+    doc.on('op batch', handler);
+    this.opListeners.set(doc.id, () => {
+      doc.removeListener('op batch', handler);
+      doc.listenerCount('op batch') === 0 && doc.destroy();
+    });
+  }
+}
+```
+
+**关键点：**
+- 每个文档只注册一个监听器，避免重复监听
+- 文档销毁前检查监听计数，确保没有其他使用者
+- 监听器清理时自动销毁无监听的文档
+
+#### 10.3.3 本地乐观更新
+
+文件：`packages/sdk/src/model/record/record.ts:98-111`
+
+用户编辑时先**本地提交**，再发送 API 请求：
+
+```typescript
+private onCommitLocal(fieldId: string, cellValue: unknown, undo?: boolean) {
+  const oldCellValue = this.fields[fieldId];
+  const operation = RecordOpBuilder.editor.setRecord.build({
+    fieldId,
+    newCellValue: cellValue,
+    oldCellValue,
+  });
+
+  // 1. 更新本地 ShareDB 文档数据
+  this.doc.data.fields[fieldId] = cellValue;
+
+  // 2. 触发 'op batch' 事件，通知订阅者更新
+  this.doc.emit('op batch', [operation], false);
+
+  // 3. 调整本地版本号（模拟操作已提交）
+  if (this.doc.version) {
+    undo ? this.doc.version-- : this.doc.version++;
+  }
+
+  // 4. 更新模型实例字段
+  this.fields[fieldId] = cellValue;
+}
+```
+
+**乐观更新流程：**
+
+```
+用户编辑单元格
+        │
+        ▼
+onCommitLocal() — 立即更新本地状态（UI 瞬时响应）
+        │
+        ├─► doc.data.fields[fieldId] = newValue
+        ├─► emit('op batch', [op], false)  — 触发 UI 更新
+        └─► doc.version++  — 保持版本号一致
+        │
+        ▼
+API 请求发送到后端
+        │
+        ├─► 成功：后端返回最新数据（含计算字段），updateComputedField 同步
+        │
+        └─► 失败：onCommitLocal(oldValue, true) — 回滚本地状态，显示错误
+```
+
+#### 10.3.4 计算字段同步
+
+文件：`packages/sdk/src/model/record/record.ts:113-129`
+
+```typescript
+private updateComputedField = async (fieldIds: string[], record: IRecord) => {
+  const changeCellFieldIds = fieldIds.filter((fieldId) => {
+    // 跳过 undefined 值 — 计算字段尚未更新（V2 异步）
+    if (record.fields[fieldId] === undefined) return false;
+    return !isEqual(this.fields[fieldId], record.fields[fieldId]);
+  });
+
+  if (!changeCellFieldIds.length) return;
+
+  changeCellFieldIds.forEach((fieldId) => {
+    this.doc.data.fields[fieldId] = record.fields[fieldId];
+  });
+
+  this.doc.emit('op batch', [], false);  // 触发更新，不传具体 op
+};
+```
+
+### 10.4 单记录订阅 — `useRecord` Hook
+
+文件：`packages/sdk/src/hooks/use-record.ts`
+
+用于单个记录的细粒度订阅：
+
+```typescript
+export const useRecord = (recordId: string | undefined, initData?: IRecord) => {
+  useEffect(() => {
+    if (!connection || !recordId) return;
+
+    const doc = connection.get(`${IdPrefix.Record}_${tableId}`, recordId);
+
+    // 1. 拉取当前快照
+    doc.fetch((err) => {
+      if (!err) setInstance(createRecordInstance(doc.data, doc));
+    });
+
+    // 2. 订阅后续更新
+    doc.subscribe(() => {
+      doc.on('op batch', () => {
+        setInstance(createRecordInstance(doc.data, doc));
+      });
+    });
+
+    return () => {
+      doc.removeListener('op batch', listeners);
+      doc.listenerCount('op batch') === 0 && doc.unsubscribe();
+      doc.listenerCount('op batch') === 0 && doc.destroy();
+    };
+  }, [connection, recordId, tableId]);
+};
+```
+
+---
+
+## 11. 乱序事件与重连回放处理
+
+### 11.1 ShareDB 内置的乱序处理机制
+
+ShareDB 客户端自动处理乱序和重复操作：
+
+#### 11.1.1 版本号驱动的操作排序
+
+每个 ShareDB 文档维护单调递增的 `version`：
+
+```
+本地文档版本: v=5
+收到远程操作1: v=6  → 立即应用
+收到远程操作2: v=5  → 已应用，跳过（去重）
+收到远程操作3: v=8  → 版本跳变，等待中间操作或触发 fetch
+```
+
+#### 11.1.2 待确认操作队列
+
+本地提交的操作进入**待确认队列**，收到服务器确认后移除：
+
+```
+用户提交本地操作 op1 (v=5)
+    │
+    ▼
+pendingOps = [op1]
+    │
+    ▼
+发送到服务器
+    │
+    ├─► 成功：服务器返回 ack → 移除 pendingOps[0]
+    │
+    └─► 失败或超时：重新提交或回滚
+```
+
+### 11.2 重连回放机制
+
+#### 11.2.1 ShareDB 自动重连与状态恢复
+
+当 WebSocket 断开重连后，ShareDB 自动：
+
+1. **重新建立连接**：`Connection` 自动重新握手
+2. **重新订阅查询**：Query 自动重新执行 `subscribe`
+3. **快照拉取与差异合并**：
+   - 发送当前版本号 `v` 到服务器
+   - 服务器返回快照或增量 ops
+   - 客户端应用差异，恢复到最新状态
+
+#### 11.2.2 页面恢复时的连接管理
+
+文件：`packages/sdk/src/context/app/useConnectionAutoManage.ts`
+
+```typescript
+useEffect(() => {
+  if (visible && !isConnected(connection)) {
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnect ? reconnect() : currentConnection.reconnect();
+    }, reconnectDelay);
+  }
+  if (!visible && isConnected(connection)) {
+    inactiveTimerRef.current = setTimeout(() => {
+      currentConnection.close();
+    }, inactiveTimeout);
+  }
+}, [visible, ...]);
+```
+
+**状态转换：**
+
+```
+页面可见
+    │
+    ▼
+检查连接状态
+    │
+    ├─► 已连接 → 保持
+    │
+    └─► 未连接 → 2秒后启动重连
+        │
+        ▼
+ReconnectingSockJS 指数退避重连
+        │
+        ▼
+连接成功
+        │
+        ▼
+ShareDB Query 自动重新订阅
+        │
+        ▼
+查询结果 ready → dispatch ready 事件
+        │
+        ▼
+UI 恢复到最新状态
+```
+
+### 11.3 大批量操作的刷新策略
+
+文件：`packages/sdk/src/context/use-instances/useInstances.ts:79-87`
+
+**schemaRefreshToken** 机制处理跳过实时推送的大批量操作：
+
+```typescript
+const [schemaRefreshToken, setSchemaRefreshToken] = useState(0);
+
+// 监听 Presence 通道中的 schema refresh 通知
+const receiveListener = (_id: string, batch: unknown) => {
+  // 1. 处理计算字段刷新
+  const fieldIds = getSchemaRefreshRecordFieldIds(tableId, batch);
+  if (fieldIds?.length) {
+    refreshProjectedRecordFields(fieldIds).then((handled) => {
+      if (!handled) setSchemaRefreshToken(t => t + 1);  // 增量失败，全量刷新
+    });
+    return;
+  }
+
+  // 2. 处理批量删除
+  const deletedRecordIds = getProjectedDeleteRecordIds(tableId, batch);
+  if (deletedRecordIds?.length) {
+    removeProjectedRecordsByIds(deletedRecordIds);
+    return;
+  }
+
+  // 3. 其他情况全量刷新
+  setSchemaRefreshToken(t => t + 1);
+};
+```
+
+#### 11.3.1 计算字段增量刷新
+
+文件：`packages/sdk/src/context/use-instances/useInstances.ts:428-503`
+
+```typescript
+const refreshProjectedRecordFields = async (fieldIds: string[]) => {
+  // 1. API 拉取指定字段的最新值
+  const { data } = await getRecords(tableId, {
+    ...queryParams,
+    projection: fieldIds,  // 只拉取需要刷新的字段
+  });
+
+  // 2. 验证记录集合未变化（顺序和 ID 一致）
+  if (currentDocIds.length !== fetchedRecordIds.length) return false;
+  if (currentDocIds.some((id, i) => id !== fetchedRecordIds[i])) return false;
+
+  // 3. 增量更新文档数据
+  currentDocs.forEach((doc) => {
+    fieldIds.forEach((fieldId) => {
+      if (!isEqual(doc.data.fields?.[fieldId], nextValue)) {
+        doc.data.fields![fieldId] = nextValue;
+        changed = true;
+      }
+    });
+    if (changed) notifyProjectedRecordDocUpdate(doc, dispatch);
+  });
+
+  return true;
+};
+```
+
+#### 11.3.2 刷新失败降级
+
+增量刷新失败时（如记录集合已变化），通过递增 `schemaRefreshToken` 触发查询重建：
+
+```
+schemaRefreshToken 变化
+    │
+    ▼
+useEffect 依赖检测到变化
+    │
+    ▼
+releaseQuery(previousKey) — 释放旧查询
+    │
+    ▼
+acquireQuery() — 创建新查询，参数相同但 refreshToken 不同
+    │
+    ▼
+新查询从服务器拉取完整快照
+    │
+    ▼
+dispatch ready 事件，UI 全量更新
+```
+
+### 11.4 Presence 通道的批量操作通知
+
+文件：`packages/sdk/src/context/use-instances/useInstances.ts:532-595`
+
+通过 ShareDB Presence 通道传递批量操作通知：
+
+```typescript
+const presence: Presence = connection.getPresence(
+  getActionTriggerChannel(schemaRefreshCollectionTableId)
+);
+
+presence.subscribe();
+presence.addListener('receive', receiveListener);
+```
+
+**通知类型：**
+1. `setField` — 字段更新，触发计算字段刷新
+2. `setRecord` — 记录批量更新，触发刷新
+3. `addRecord` — 记录批量创建，触发刷新
+4. `deleteRecord` — 记录批量删除，增量移除
+
+---
+
+## 12. 前端冲突解决机制
+
+### 12.1 乐观更新与服务器最终一致
+
+#### 12.1.1 本地优先策略
+
+用户编辑采用**本地优先**的乐观更新：
+1. UI 立即响应（无需等待服务器）
+2. 后台异步发送 API 请求
+3. 成功时用服务器返回的权威数据修正本地
+4. 失败时回滚本地状态并提示用户
+
+#### 12.1.2 冲突场景：同时编辑同一单元格
+
+```
+用户A编辑字段 fld1 → 本地更新值为 "A" → API 发送中...
+用户B编辑字段 fld1 → 本地更新值为 "B" → API 发送成功 → ShareDB 广播 op(v=6)
+
+用户A收到远程 op(v=6)
+    │
+    ├─► 本地 pendingOp 基于 v=5
+    │
+    ├─► ShareDB OT 转换：将 pendingOp 转换为基于 v=6
+    │
+    └─► 最终值取决于：
+        ├─► 后提交者覆盖先提交者（默认 json0 行为）
+        └─► 或 API 层进行值比较（业务逻辑决定）
+```
+
+### 12.2 操作构建器与路径匹配
+
+文件：`packages/core/src/op-builder/record/set-record.ts`
+
+`IOtOperation` 是 ShareDB json0 类型的标准格式：
+
+```typescript
+interface IOtOperation {
+  p: (string | number)[];  // JSON 路径
+  oi?: unknown;             // object insert
+  od?: unknown;             // object delete
+  li?: unknown;             // list insert
+  ld?: unknown;             // list delete
+  na?: number;              // number add
+  si?: string;              // string insert
+  sd?: string;              // string delete
+}
+```
+
+#### 12.2.1 SetRecord 操作构建
+
+```typescript
+class SetRecordBuilder {
+  build({ fieldId, newCellValue, oldCellValue }): IOtOperation {
+    // null/空数组 → 删除键
+    if (newCellValue == null || (Array.isArray(newCellValue) && newCellValue.length === 0)) {
+      return { p: ['fields', fieldId], od: oldCellValue, oi: null };
+    }
+
+    // 旧值为空 → 插入键
+    if (oldCellValue == null) {
+      return { p: ['fields', fieldId], oi: newCellValue };
+    }
+
+    // 替换键
+    return { p: ['fields', fieldId], od: oldCellValue, oi: newCellValue };
+  }
+}
+```
+
+#### 12.2.2 操作检测与路径匹配
+
+文件：`packages/core/src/op-builder/common.ts`
+
+```typescript
+function pathMatcher<T>(path: (string | number)[], matchList: string[]): T | null {
+  if (path.length !== matchList.length) return null;
+
+  const res: Record<string, string | number> = {};
+  for (let i = 0; i < matchList.length; i++) {
+    if (matchList[i].startsWith(':')) {          // :fieldId → 捕获参数
+      res[matchList[i].slice(1)] = path[i];
+      continue;
+    }
+    if (matchList[i] === '*') continue;           // * → 跳过匹配
+    if (path[i] !== matchList[i]) return null;    // 精确匹配
+  }
+  return res as T;
+}
+
+// 示例：匹配 ['fields', 'fld123']
+pathMatcher(op.p, ['fields', ':fieldId']);
+// → { fieldId: 'fld123' }
+```
+
+### 12.3 OT 转换原理（ShareDB 内置）
+
+json0 类型的操作转换遵循以下规则：
+
+#### 12.3.1 并发插入同一对象的不同键
+
+```
+op1: { p: ['fields', 'a'], oi: 1 }
+op2: { p: ['fields', 'b'], oi: 2 }
+
+转换结果：两个操作都保留，最终 { a: 1, b: 2 }
+```
+
+#### 12.3.2 并发插入同一对象的相同键
+
+```
+op1: { p: ['fields', 'a'], oi: 1 }  // 先到达服务器
+op2: { p: ['fields', 'a'], oi: 2 }  // 后到达
+
+转换结果：后提交者获胜，最终值为 2
+```
+
+#### 12.3.3 删除与修改冲突
+
+```
+op1: { p: ['fields', 'a'], od: 1 }        // 删除 a
+op2: { p: ['fields', 'a'], od: 1, oi: 2 } // 修改 a 为 2
+
+转换结果：删除优先，a 不存在
+```
+
+### 12.4 字段类型特殊处理
+
+#### 12.4.1 附件字段 — 服务器补充签名 URL
+
+文件：`packages/sdk/src/model/record/record.ts:154-158`
+
+```typescript
+// 附件字段需要同步（服务器补充 presignedUrl）
+if (this.fieldMap[fieldId]?.type === FieldType.Attachment) {
+  fieldsToSync.add(fieldId);
+}
+```
+
+#### 12.4.2 计算字段 — 异步更新
+
+- **公式、查找、汇总字段**：服务器异步计算
+- **本地不覆盖**：`updateComputedField` 中跳过 `undefined` 值
+- **通过实时通道更新**：计算完成后通过 ShareDB op 推送
+
+### 12.5 冲突解决矩阵
+
+| 冲突场景 | 解决策略 | 代码位置 |
+|---------|---------|---------|
+| 两人编辑同一记录不同字段 | ShareDB OT 自动合并，互不影响 | `SetRecordBuilder.build()` |
+| 两人编辑同一记录同一字段 | 后提交者覆盖先提交者（服务器时序） | ShareDB json0 内置 |
+| 本地编辑与远程计算字段更新 | 本地手动编辑优先，计算字段通过 op 更新 | `updateComputedField` |
+| 字段类型变更后记录编辑 | 实时推送字段更新通知，前端刷新 schema | `schemaRefreshToken` |
+| 记录删除后编辑 | ShareDB 操作失败，前端重新拉取 | ShareDB 内置 |
+| 重连后状态不一致 | Query 重新订阅，拉取最新快照 | ShareDB Query 内置 |
+
+---
+
+## 13. 关键设计决策总结
 
 | 决策 | 理由 | 代码位置 |
 |------|------|---------|
@@ -717,10 +1394,19 @@ export const registerV2BrowserPgliteDependencies = async (container, options) =>
 | 操作来源过滤 | 防止 V2 Projection → ShareDB → 领域事件 的无限循环 | `ShareDbService.onSubmit()` |
 | RealtimeDocId 使用 collection/docId 格式 | 兼容 ShareDB 的 collection + docId 模型 | `RealtimeDocId.fromParts()` |
 | BroadcastChannel 维护内存快照 | 浏览器端无需服务器即可实现标签间同步 | `BroadcastChannelRealtimeHub` |
+| **查询缓存与引用计数** | 避免重复订阅，减少服务器压力 | `useInstances.acquireQuery()` |
+| **本地乐观更新** | UI 瞬时响应，提升用户体验 | `Record.onCommitLocal()` |
+| **指数退避重连** | 网络波动时自动恢复，避免服务器压力 | `ReconnectingSockJS` |
+| **页面可见性管理** | 后台页面自动释放连接，节省资源 | `useConnectionAutoManage` |
+| **增量刷新优先，失败降级全量** | 平衡实时性与性能 | `refreshProjectedRecordFields()` |
+| **Presence 通道传递批量通知** | 大批量操作跳过实时推送但通知前端刷新 | `useInstances.receiveListener` |
+| **版本号驱动的 OT 转换** | 乱序操作自动排序和去重 | ShareDB 内置 |
 
 ---
 
-## 11. 文件索引
+## 14. 文件索引
+
+### 14.1 V2 核心架构
 
 | 文件 | 职责 |
 |------|------|
@@ -738,12 +1424,53 @@ export const registerV2BrowserPgliteDependencies = async (container, options) =>
 | `packages/v2/core/src/application/projections/TableCreatedRealtimeProjection.ts` | 表创建投影 |
 | `packages/v2/core/src/application/projections/FieldUpdatedRealtimeProjection.ts` | 字段更新投影 |
 | `packages/v2/core/src/application/projections/BatchRecordRefreshPolicy.ts` | 批量刷新策略 |
+
+### 14.2 实时引擎适配器
+
+| 文件 | 职责 |
+|------|------|
 | `packages/v2/adapter-realtime-sharedb/src/ShareDbRealtimeEngine.ts` | ShareDB 引擎实现 |
 | `packages/v2/adapter-realtime-sharedb/src/ShareDbBackendPublisher.ts` | ShareDB 后端发布器 |
 | `packages/v2/adapter-realtime-sharedb/src/di/register.ts` | ShareDB DI 注册 |
 | `packages/v2/adapter-realtime-broadcastchannel/src/BroadcastChannelRealtimeHub.ts` | BroadcastChannel 枢纽 |
 | `packages/v2/adapter-realtime-broadcastchannel/src/BroadcastChannelRealtimeEngine.ts` | BroadcastChannel 引擎 |
 | `packages/v2/core/src/ports/defaults/NoopRealtimeEngine.ts` | 空实现引擎 |
+
+### 14.3 V1 后端集成
+
+| 文件 | 职责 |
+|------|------|
 | `apps/nestjs-backend/src/share-db/share-db.service.ts` | V1 ShareDB 服务 |
 | `apps/nestjs-backend/src/event-emitter/event-emitter.service.ts` | V1 事件发射器 |
+
+### 14.4 前端 SDK
+
+| 文件 | 职责 |
+|------|------|
+| `packages/sdk/src/context/app/useConnection.tsx` | ShareDB 连接管理 Hook |
+| `packages/sdk/src/context/app/useConnectionAutoManage.ts` | 页面可见性驱动的连接管理 |
+| `packages/sdk/src/utils/reconnectingSockJS.ts` | 自动重连的 SockJS 封装 |
+| `packages/sdk/src/context/use-instances/useInstances.ts` | **核心**：批量订阅与状态更新 Hook |
+| `packages/sdk/src/context/use-instances/reducer.ts` | 实例状态 Reducer |
+| `packages/sdk/src/context/use-instances/opListener.ts` | 单文档操作监听器管理 |
+| `packages/sdk/src/hooks/use-record.ts` | 单记录订阅 Hook |
+| `packages/sdk/src/model/record/record.ts` | 记录模型（含乐观更新） |
+| `packages/sdk/src/model/record/factory.ts` | 记录实例工厂 |
+| `packages/sdk/src/context/app/ConnectionContext.tsx` | 连接 Context |
+| `packages/sdk/src/hooks/use-connection.ts` | 连接 Hook |
+
+### 14.5 OT 操作构建器
+
+| 文件 | 职责 |
+|------|------|
+| `packages/core/src/models/op.ts` | OT 操作类型定义 |
+| `packages/core/src/op-builder/op-builder.abstract.ts` | 操作构建器抽象基类 |
+| `packages/core/src/op-builder/record/record-op-builder.ts` | 记录操作构建器 |
+| `packages/core/src/op-builder/record/set-record.ts` | SetRecord 操作构建 |
+| `packages/core/src/op-builder/common.ts` | 路径匹配工具函数 |
+
+### 14.6 测试资源
+
+| 文件 | 职责 |
+|------|------|
 | `packages/v2/e2e/src/realtimeShareDb.e2e.spec.ts` | 端到端测试（最佳学习资源） |

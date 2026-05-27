@@ -188,7 +188,7 @@ model AttachmentsTable {
 ```
 
 **主键与约束**：
-- 主键：`id`（cuid 格式，前缀 `attt`）
+- 主键：`id`（String 类型，默认值由 Prisma 的 `cuid()` 生成）
 - 索引：`(tableId, recordId)`、`(tableId, fieldId)`、`(attachmentId)`
 - **无外键约束**：`token` 字段逻辑关联 `attachments.token`，但无数据库级外键
 - **无软删除字段**：物理删除
@@ -196,6 +196,63 @@ model AttachmentsTable {
 **删除行为**：
 - 删除记录/字段/表时，通过应用层代码调用 `deleteRecords()` / `deleteFields()` / `deleteTable()` 物理删除 `attachments_table` 中的绑定行
 - `attachments` 表的元数据不会被级联删除（可能产生孤立文件）
+
+### 3.1.3 AttachmentsTable ID 生成的双重机制
+
+**Schema 层面的默认值**：
+Prisma Schema 中定义 `id String @id @default(cuid())`，表示如果 INSERT 时不提供 `id` 字段，则由数据库层（通过 Prisma 客户端）自动生成 **标准 cuid 格式**（长度 25，以 `c` 开头，如 `ckz4xj3l5000008l5d3x7a1b2`）。
+
+**v2 代码层的显式生成**：
+`packages/v2/adapter-table-repository-postgres/src/record/attachments/attachmentTableMutations.ts:6-7, 42-44`：
+
+```typescript
+const ATTACHMENT_TABLE_ROW_ID_PREFIX = 'attt';
+const ATTACHMENT_TABLE_ROW_ID_LENGTH = 16;
+
+// ...
+return {
+  id: generatePrefixedId(ATTACHMENT_TABLE_ROW_ID_PREFIX, ATTACHMENT_TABLE_ROW_ID_LENGTH),
+  // ...
+};
+```
+
+`generatePrefixedId()` 来自 `packages/v2/core/src/domain/shared/IdGenerator.ts:31-33`，使用 `nanoid` 生成：
+- 格式：`attt` 前缀 + 16 位字母数字随机字符
+- 示例：`attt7xJ3kLmNpQrStUvWxYz1`
+- 总长度：20
+
+**v1 代码层的行为**：
+`apps/nestjs-backend/src/features/attachments/attachments-table.service.ts:36-44, 104-112` — Prisma `createMany` 时**不提供 `id` 字段**：
+
+```typescript
+newAttachments.push({
+  tableId,
+  recordId,
+  name: attachment.name,
+  fieldId: id,
+  token: attachment.token,
+  attachmentId: attachment.id,
+  createdBy: userId,
+  // 无 id 字段！
+});
+```
+
+**生效条件与 ID 形态对比**：
+
+| 写入路径 | 是否提供 id | ID 生成方式 | ID 格式 | 示例 |
+|---|---|---|---|---|
+| **v1 (Prisma)** | ❌ 不提供 | Prisma `cuid()` | 标准 cuid，25 字符，`c` 开头 | `ckz4xj3l5000008l5d3x7a1b2` |
+| **v2 (Kysely)** | ✅ 显式提供 | `generatePrefixedId('attt', 16)` | 前缀 `attt` + 16 位 nanoid，共 20 字符 | `attt7xJ3kLmNpQrStUvWxYz1` |
+
+**何时出现差异**：
+- 通过 ShareDB 实时协作写入 → **v1 路径** → cuid 格式
+- 通过 v2 API / 领域模型写入 → **v2 路径** → `attt` 前缀格式
+- 两种 ID 格式在同一数据库表中共存，逻辑上不冲突（都是唯一字符串），但形态不一致
+
+**设计意图推测**：
+- v1 是遗留路径，依赖 Prisma 默认行为
+- v2 是新架构，使用统一的前缀 ID 生成策略（与 `RecordId`/`FieldId`/`ViewId` 保持一致）
+- 目前处于双轨运行阶段，未来可能统一到 v2 的前缀格式
 
 ### 3.2 附件字段类型
 

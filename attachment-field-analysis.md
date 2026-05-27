@@ -254,168 +254,153 @@ newAttachments.push({
 - v2 是新架构，使用统一的前缀 ID 生成策略（与 `RecordId`/`FieldId`/`ViewId` 保持一致）
 - 目前处于双轨运行阶段，未来可能统一到 v2 的前缀格式
 
-### 3.1.4 Record OpenAPI 入口分流与 ID 形态对应
+### 3.1.4 v2 API 判定规则（固定顺序）
 
-**四个核心入口**：
+所有 Record OpenAPI 入口的 v1/v2 分流遵循以下**固定三步判定顺序**，结果一次性确定，不可变更：
 
-| 端点 | 方法 | @UseV2Feature | 内部调用 |
-|---|---|---|---|
-| `POST :recordId/:fieldId/uploadAttachment` | `uploadAttachment()` | ❌ 无 | 调用 `RecordOpenApiService.uploadAttachment()` |
-| `POST :recordId/:fieldId/insertAttachment` | `insertAttachment()` | ❌ 无 | 调用 `RecordOpenApiService.insertAttachment()` |
-| `PATCH :recordId` | `updateRecord()` | ✅ `updateRecord` | 检查 `cls.get('useV2')` 分流 |
-| `POST /` | `createRecords()` | ✅ `createRecord` | 检查 `cls.get('useV2')` 分流 |
+```
+Step 1: @UseV2Feature 声明检查
+        ├─ 方法有 @UseV2Feature('xxx') → 进入 Step 2
+        └─ 方法无 @UseV2Feature → useV2 = false，结束（固定 v1）
 
-**@UseV2Feature 装饰器的作用**：
-`V2FeatureGuard.canActivate()` 会根据 `@UseV2Feature('xxx')` 装饰器标记的 feature 名，调用 `CanaryService.shouldUseV2ForBaseWithReason()` 判断是否走 v2 逻辑，结果存入 CLS 的 `useV2` 变量。
+Step 2: Payload 支持性检查（仅 updateRecord）
+        ├─ feature='updateRecord' 且 只有 order 无 fields
+        │  → useV2 = false，结束（强制 v1）
+        └─ 其他情况 → 进入 Step 3
 
-**Canary 决策优先级**（`canary.service.ts:156-165`）：
-1. `FORCE_V2_ALL` 环境变量（最高）
+Step 3: Canary 金丝雀判定
+        ├─ CanaryService.shouldUseV2ForBaseWithReason()
+        ├─ 优先级：FORCE_V2_ALL > 全局开关 > 数据库配置
+        │           > x-canary 头 > 空间白名单 > 新 Base
+        └─ useV2 = decision.useV2，结束
+```
+
+**判定结果的存储与读取**：
+- `V2FeatureGuard` 仅在 HTTP 请求入口执行一次，结果写入 CLS（`cls.useV2`）
+- Controller 内通过 `this.cls.get('useV2')` 读取
+- 内部方法调用（如 `this.updateRecord()`）**不会重新触发 Guard**，沿用入口处的判定结果
+
+---
+
+### 3.1.5 四个入口的逐项校正结论
+
+#### 入口 1：`POST :recordId/:fieldId/uploadAttachment`
+
+- **Controller 代码**：`record-open-api.controller.ts:162-179`
+- **@UseV2Feature**：❌ 无
+- **Step 1 判定**：`feature = undefined` → `useV2 = false`
+- **实际服务调用**：`RecordOpenApiService.uploadAttachment()`
+- **调用链**：
+  ```
+  uploadAttachment() → this.updateRecord() → updateRecords() →
+  recordModifyService.updateRecords() → ShareDB op →
+  event-emitter ops2Event() → TABLE_RECORD_UPDATE →
+  attachment.listener → attachmentsTableService.updateRecords() →
+  prisma.attachmentsTable.createMany()
+  ```
+- **AttachmentsTable ID 形态**：✅ **Prisma cuid**（25 字符，`c` 开头，如 `ckz4xj3l5000008l5d3x7a1b2`）
+- **结论**：**永远走 v1**，与 canary 配置无关
+
+#### 入口 2：`POST :recordId/:fieldId/insertAttachment`
+
+- **Controller 代码**：`record-open-api.controller.ts:181-196`
+- **@UseV2Feature**：❌ 无
+- **Step 1 判定**：`feature = undefined` → `useV2 = false`
+- **实际服务调用**：`RecordOpenApiService.insertAttachment()`
+- **调用链**：与 `uploadAttachment` 完全相同，内部同样调用 `this.updateRecord()`
+- **AttachmentsTable ID 形态**：✅ **Prisma cuid**（25 字符，`c` 开头）
+- **结论**：**永远走 v1**，与 canary 配置无关
+
+#### 入口 3：`PATCH :recordId` (updateRecord)
+
+- **Controller 代码**：`record-open-api.controller.ts:138-160`
+- **@UseV2Feature**：✅ `updateRecord`
+- **Step 1 判定**：有 feature，进入 Step 2
+- **Step 2 判定**：
+  - 只有 `order` 无 `fields` → `useV2 = false`（强制 v1）
+  - 其他情况 → 进入 Step 3
+- **Step 3 判定**：`CanaryService.shouldUseV2ForBaseWithReason()`
+  - canary 通过 → `useV2 = true` → `RecordOpenApiV2Service.updateRecord()`
+  - canary 不通过 → `useV2 = false` → `RecordOpenApiService.updateRecord()`
+- **v2 调用链**（canary 通过时）：
+  ```
+  recordOpenApiV2Service.updateRecord() →
+  executeUpdateRecordEndpoint() →
+  commandBus.execute(new UpdateRecordCommand(...)) →
+  UpdateRecordHandler.handle() →
+  TableRecordRepository.update() →
+  CellValueMutateVisitor.visitSetAttachmentValueSpec() →
+  buildAttachmentTableReplaceQueries() →
+  INSERT INTO attachments_table (id, ...)
+    VALUES (generatePrefixedId('attt', 16), ...)
+  ```
+- **AttachmentsTable ID 形态**：
+  - canary 不通过 → ✅ **Prisma cuid**（`c` 开头）
+  - canary 通过 → ✅ **`attt` 前缀**（20 字符，如 `attt7xJ3kLmNpQrStUvWxYz1`）
+
+#### 入口 4：`POST /` (createRecords)
+
+- **Controller 代码**：`record-open-api.controller.ts:221-245`
+- **@UseV2Feature**：✅ `createRecord`
+- **Step 1 判定**：有 feature，进入 Step 2
+- **Step 2 判定**：feature ≠ `updateRecord`，跳过，进入 Step 3
+- **Step 3 判定**：`CanaryService.shouldUseV2ForBaseWithReason()`
+  - canary 通过 → `useV2 = true` → `RecordOpenApiV2Service.createRecords()`
+  - canary 不通过 → `useV2 = false` → `RecordOpenApiService.multipleCreateRecords()`
+- **v2 调用链**（canary 通过时）：
+  ```
+  recordOpenApiV2Service.createRecords() →
+  executeCreateRecordsEndpoint() →
+  commandBus.execute(new CreateRecordsCommand(...)) →
+  CreateRecordsHandler.handle() →
+  TableRecordRepository.createMany() →
+  RecordInsertBuilder.build() →
+  buildAttachmentTableInsertQuery() →
+  INSERT INTO attachments_table (id, ...)
+    VALUES (generatePrefixedId('attt', 16), ...)
+  ```
+- **AttachmentsTable ID 形态**：
+  - canary 不通过 → ✅ **Prisma cuid**（`c` 开头）
+  - canary 通过 → ✅ **`attt` 前缀**（20 字符）
+
+---
+
+### 3.1.6 分流与 ID 形态总表（无歧义版本）
+
+| API 入口 | @UseV2Feature | Step 1<br>useV2 | Step 2<br>回退 | Step 3<br>canary | 实际服务调用 | ID 形态 |
+|---|---|---|---|---|---|---|
+| `POST uploadAttachment` | ❌ 无 | `false` | - | - | `RecordOpenApiService` | **cuid** |
+| `POST insertAttachment` | ❌ 无 | `false` | - | - | `RecordOpenApiService` | **cuid** |
+| `PATCH updateRecord` | ✅ `updateRecord` | `true` | ❌ 无回退 | ❌ 不通过 | `RecordOpenApiService` | **cuid** |
+| `PATCH updateRecord` | ✅ `updateRecord` | `true` | ❌ 无回退 | ✅ 通过 | `RecordOpenApiV2Service` | **attt 前缀** |
+| `PATCH updateRecord` | ✅ `updateRecord` | `true` | ✅ 只有 order | - | `RecordOpenApiService` | **cuid** |
+| `POST createRecords` | ✅ `createRecord` | `true` | - | ❌ 不通过 | `RecordOpenApiService` | **cuid** |
+| `POST createRecords` | ✅ `createRecord` | `true` | - | ✅ 通过 | `RecordOpenApiV2Service` | **attt 前缀** |
+
+**Canary 判定优先级**（`canary.service.ts:156-165`）：
+1. `FORCE_V2_ALL` 环境变量（最高优先级）
 2. 全局 canary 开关是否关闭
 3. 数据库配置的 `forceV2All`
 4. `x-canary` 请求头覆盖
 5. 空间在 canary 列表中（全量 v2）
 6. 新创建的 Base（`base.v2Enabled = true`）自动走 v2
 
-**不支持的 payload 回退**：
-`V2FeatureGuard.isUnsupportedV2Payload()` 中，如果 `updateRecord` 请求只有 `order` 没有 `fields`，则强制回退到 v1。
-
 ---
 
-### 3.1.5 分流决策与 ID 形态的完整映射
+### 3.1.7 常见场景 ID 形态速查
 
-```
-                      ┌───────────────────────────────────┐
-                      │   四个 OpenAPI 入口               │
-                      └───────────────┬───────────────────┘
-                                      │
-            ┌─────────────────────────┼─────────────────────────┐
-            ▼                         ▼                         ▼
-┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
-│ uploadAttachment     │  │ insertAttachment     │  │ updateRecord /       │
-│ (无 @UseV2Feature)   │  │ (无 @UseV2Feature)   │  │ createRecords        │
-│                      │  │                      │  │ (@UseV2Feature)      │
-└───────────┬──────────┘  └───────────┬──────────┘  └──────────┬───────────┘
-            │                          │                         │
-            │ V2FeatureGuard           │ V2FeatureGuard          │ V2FeatureGuard
-            │ feature=undefined        │ feature=undefined       │ feature='updateRecord'
-            │ useV2 = false            │ useV2 = false           │ / 'createRecord'
-            │                          │                         │ useV2 = ? (canary)
-            ▼                          ▼                         │
-┌────────────────────────────────────────────────────┐          │
-│ RecordOpenApiService.uploadAttachment()            │          │
-│ RecordOpenApiService.insertAttachment()            │          │
-│   ├─ 上传文件 / 校验附件                           │          │
-│   └─ 构造 updateRecordRo，调用 this.updateRecord() │          │
-└──────────────────────────────┬─────────────────────┘          │
-                               │                                    │
-                               └───────────────┬────────────────────┘
-                                               │
-                                               ▼
-                        ┌───────────────────────────────────┐
-                        │ updateRecord() 内部调用           │
-                        │ if (cls.useV2)                   │
-                        │   ├─ YES → v2 路径               │
-                        │   └─ NO  → v1 路径               │
-                        └───────────────┬───────────────────┘
-                                        │
-                    ┌───────────────────┴───────────────────┐
-                    ▼                                       ▼
-            ┌──────────────────┐                   ┌──────────────────┐
-            │ v1 路径          │                   │ v2 路径          │
-            │                  │                   │                  │
-            │ ShareDB op →     │                   │ 领域模型 →       │
-            │   event-emitter  │                   │   Kysely SQL     │
-            │   → listener →   │                   │   → attachment   │
-            │   Prisma         │                   │   TableMutations  │
-            │   createMany     │                   │                  │
-            │ (不提供 id)      │                   │ (显式提供 id)    │
-            └─────────┬────────┘                   └─────────┬────────┘
-                      ▼                                       ▼
-            ┌──────────────────┐                   ┌──────────────────┐
-            │ ID 形态          │                   │ ID 形态          │
-            │ Prisma cuid()    │                   │ generatePrefixed │
-            │ 25 字符          │                   │ Id('attt', 16)   │
-            │ c 开头           │                   │ 20 字符          │
-            │ 示例:            │                   │ 示例:            │
-            │ ckz4xj3l5...     │                   │ attt7xJ3kL...    │
-            └──────────────────┘                   └──────────────────┘
-```
+| 场景 | 触发入口 | Canary 状态 | ID 形态 |
+|---|---|---|---|
+| 前端拖拽上传文件到附件列 | `POST uploadAttachment` | - | **cuid** |
+| OpenAPI 调用 `insertAttachment` | `POST insertAttachment` | - | **cuid** |
+| OpenAPI 调用 `updateRecord` 更新附件（普通空间） | `PATCH :recordId` | 不通过 | **cuid** |
+| OpenAPI 调用 `updateRecord` 更新附件（canary 空间 / 新 Base） | `PATCH :recordId` | 通过 | **attt 前缀** |
+| OpenAPI 调用 `createRecords` 创建带附件记录（普通空间） | `POST /` | 不通过 | **cuid** |
+| OpenAPI 调用 `createRecords` 创建带附件记录（canary / 新 Base） | `POST /` | 通过 | **attt 前缀** |
+| ShareDB 实时协作编辑附件列 | WebSocket op → event | - | **cuid** |
+| v2 领域模型内部更新（单元测试 / Job） | 直接调用 v2 Repository | - | **attt 前缀** |
 
-**四个入口的分流与 ID 形态对应表**：
-
-| API 入口 | @UseV2Feature | canary useV2 | 最终路径 | AttachmentsTable ID 形态 |
-|---|---|---|---|---|
-| `POST uploadAttachment` | ❌ 无 | `false` (固定) | **v1** | Prisma cuid，25 字符，`c` 开头 |
-| `POST insertAttachment` | ❌ 无 | `false` (固定) | **v1** | Prisma cuid，25 字符，`c` 开头 |
-| `PATCH :recordId` (updateRecord) | ✅ `updateRecord` | `false` | **v1** | Prisma cuid，25 字符，`c` 开头 |
-| `PATCH :recordId` (updateRecord) | ✅ `updateRecord` | `true` | **v2** | `attt` 前缀 + nanoid，20 字符 |
-| `POST /` (createRecords) | ✅ `createRecord` | `false` | **v1** | Prisma cuid，25 字符，`c` 开头 |
-| `POST /` (createRecords) | ✅ `createRecord` | `true` | **v2** | `attt` 前缀 + nanoid，20 字符 |
-
-**关键发现**：`uploadAttachment` 和 `insertAttachment` **没有 @UseV2Feature 装饰器**，因此 `V2FeatureGuard` 中 `feature` 为 `undefined`，`useV2` 被强制设为 `false`，**永远走 v1 路径**。这两个方法内部调用 `this.updateRecord()` 时，虽然 `updateRecord` 方法本身有 `@UseV2Feature('updateRecord')` 装饰器，但**装饰器仅在 HTTP 请求入口生效**，内部方法调用不会再次经过 Guard，因此 `useV2` 仍然是 `false`。
-
-**ID 形态出现差异的场景**：
-
-| 场景 | 触发方式 | ID 形态 |
-|---|---|---|
-| 前端拖拽上传文件到附件列 | `POST /uploadAttachment` | **cuid** (`c` 开头) |
-| OpenAPI 调用 `insertAttachment` | `POST /insertAttachment` | **cuid** (`c` 开头) |
-| OpenAPI 调用 `updateRecord` 更新附件列（非 canary 空间） | `PATCH :recordId` | **cuid** (`c` 开头) |
-| OpenAPI 调用 `updateRecord` 更新附件列（canary 空间 / 新 Base） | `PATCH :recordId` | **attt 前缀** |
-| OpenAPI 调用 `createRecords` 创建带附件的记录（非 canary） | `POST /` | **cuid** (`c` 开头) |
-| OpenAPI 调用 `createRecords` 创建带附件的记录（canary / 新 Base） | `POST /` | **attt 前缀** |
-| ShareDB 实时协作编辑附件列 | WebSocket → op → event | **cuid** (`c` 开头) |
-| v2 领域模型内部更新（单元测试 / 后端 Job） | 直接调用 v2 Repository | **attt 前缀** |
-
-**v1 内部调用链**（以 `uploadAttachment` 为例）：
-`record-open-api.service.ts:381-412`
-
-```typescript
-async uploadAttachment(tableId, recordId, fieldId, file, fileUrl) {
-  // 1. 校验
-  const record = await this.getValidateAttachmentRecord(...);
-
-  // 2. 上传文件到对象存储，得到 attachmentItem
-  const attachmentItem = file
-    ? await this.attachmentsService.uploadFile(file)
-    : await this.attachmentsService.uploadFromUrl(fileUrl);
-
-  // 3. 构造更新 payload
-  const updateRecordRo = {
-    fieldKeyType: FieldKeyType.Id,
-    record: {
-      fields: {
-        [fieldId]: [...(record.fields[fieldId] || []), attachmentItem],
-      },
-    },
-  };
-
-  // 4. 调用 this.updateRecord() —— 注意：内部调用不会触发 Guard！
-  //    此时 cls.get('useV2') 仍为 false（uploadAttachment 无 @UseV2Feature）
-  return await this.updateRecord(tableId, recordId, updateRecordRo);
-}
-```
-
-**v1 updateRecord 调用链**：
-```
-uploadAttachment() → updateRecord() → updateRecords() → 
-recordModifyService.updateRecords() → ShareDB op → 
-event-emitter ops2Event() → TABLE_RECORD_UPDATE → 
-attachment.listener → attachmentsTableService.updateRecords() →
-prisma.attachmentsTable.createMany()  (不提供 id → cuid)
-```
-
-**v2 updateRecord 调用链**：
-```
-PATCH :recordId (useV2=true) → recordOpenApiV2Service.updateRecord() →
-commandBus.execute(new UpdateRecordCommand(...)) →
-UpdateRecordHandler.handle() →
-TableRecordRepository.update() →
-CellValueMutateVisitor.visitSetAttachmentValueSpec() →
-buildAttachmentTableReplaceQueries() →
-INSERT INTO attachments_table (id, ...)
-  VALUES (generatePrefixedId('attt', 16), ...)  (显式提供 id → attt 前缀)
-```
+> **重要提示**：由于 `uploadAttachment` 和 `insertAttachment` 没有 `@UseV2Feature` 装饰器，即使所在空间配置了 canary，也**永远走 v1 路径**，生成 cuid 格式的 ID。只有通过 `updateRecord` 或 `createRecords` 入口且 canary 通过时，才会生成 `attt` 前缀的 ID。
 
 ### 3.2 附件字段类型
 

@@ -1615,40 +1615,64 @@ return ok(UpdateRecordResult.create(
 
 ## 12-C. 连接错误分支与重连监控
 
-### 12-C.1 ShareDB 连接错误处理
+### 12-C.1 `shareDbErrorHandler` 的实际执行逻辑
 
-文件：`packages/sdk/src/context/app/useConnection.tsx:15-30`
+文件：`packages/sdk/src/context/app/useConnection.tsx:14-30`
 
 ```typescript
+const ignoreErrorCodes = [HttpErrorCode.VIEW_NOT_FOUND];
 const shareDbErrorHandler = (error: unknown) => {
   const httpError = new HttpError(error as string, 500);
   const { code, message } = httpError;
-
   if (code === HttpErrorCode.UNAUTHORIZED) {
-    window.location.href = `/auth/login?redirect=...`;
+    window.location.href = `/auth/login?redirect=${encodeURIComponent(window.location.href)}`;
     return;
   }
   if (code === HttpErrorCode.UNAUTHORIZED_SHARE) {
     window.location.reload();
     return;
   }
-  if (ignoreErrorCodes) {
-    return;  // 静默忽略 VIEW_NOT_FOUND 等错误
+  if (ignoreErrorCodes) {   // ← ⚠️ 此处存在 Bug
+    return;
   }
   toast({ title: 'Socket Error', variant: 'destructive', description: `${code}: ${message}` });
 };
 ```
 
-**错误处理分支分析：**
+#### ⚠️ `ignoreErrorCodes` 条件的实际效果 — 存在逻辑 Bug
 
-| 错误码 | 处理方式 | 对重连的影响 |
-|--------|---------|-------------|
-| `UNAUTHORIZED` | 重定向到登录页 | 终止重连（页面跳转） |
-| `UNAUTHORIZED_SHARE` | 刷新页面 | 重新初始化连接 |
-| `VIEW_NOT_FOUND` | 静默忽略 | 不影响重连 |
-| 其他错误 | Toast 提示 | **不影响重连**，连接继续运行 |
+**代码意图**：当错误码属于 `ignoreErrorCodes` 列表时，静默忽略，不显示 Toast。
 
-### 12-C.2 连接状态监听
+**实际执行**：`if (ignoreErrorCodes)` 检查的是**数组本身的真值**，而非错误码是否在数组中。
+
+- `ignoreErrorCodes = [HttpErrorCode.VIEW_NOT_FOUND]` — 永远为 truthy（非空数组）
+- 因此 `if (ignoreErrorCodes) return;` **无条件执行**
+- **所有非 UNAUTHORIZED / 非 UNAUTHORIZED_SHARE 的错误都被静默忽略**，包括原本应该显示 Toast 的错误
+- Toast 提示**永远不会显示**
+
+**正确的实现应为**：
+
+```typescript
+// 应该检查 code 是否在 ignoreErrorCodes 中
+if (ignoreErrorCodes.includes(code)) {
+  return;
+}
+```
+
+**实际错误处理行为：**
+
+| 错误码 | 代码路径 | 实际效果 | 预期效果 |
+|--------|---------|---------|---------|
+| `UNAUTHORIZED` | `if (code === UNAUTHORIZED) → redirect` | ✅ 跳转登录 | ✅ 跳转登录 |
+| `UNAUTHORIZED_SHARE` | `if (code === UNAUTHORIZED_SHARE) → reload` | ✅ 刷新页面 | ✅ 刷新页面 |
+| `VIEW_NOT_FOUND` | `if (ignoreErrorCodes) → return` | ✅ 静默忽略 | ✅ 静默忽略 |
+| `INTERNAL_SERVER_ERROR` | `if (ignoreErrorCodes) → return` | ❌ **静默忽略** | ❌ 应显示 Toast |
+| `NOT_FOUND` | `if (ignoreErrorCodes) → return` | ❌ **静默忽略** | ❌ 应显示 Toast |
+| 任何其他错误 | `if (ignoreErrorCodes) → return` | ❌ **静默忽略** | ❌ 应显示 Toast |
+
+**结论**：由于 `ignoreErrorCodes` 数组始终为 truthy，Toast 错误提示行实际上是不可达代码（dead code）。所有非认证类错误都被静默吞掉，用户不会收到任何 Socket 错误的可视反馈。
+
+### 12-C.2 四类事件的完整状态变更与 UI 反馈
 
 ```typescript
 connection.on('connected', onConnected);
@@ -1658,10 +1682,74 @@ connection.on('error', shareDbErrorHandler);
 connection.on('receive', onReceive);
 ```
 
-**关键发现**：`error` 事件和 `receive` 中的错误**不会触发断开重连**：
-- `error` 事件只是调用 `shareDbErrorHandler` 显示 Toast
-- ShareDB Connection 本身仍然保持连接状态
-- 只有 `disconnected`/`closed` 事件才会设置 `connected = false`
+#### 事件 → 状态变更 → UI 反馈映射表
+
+| 事件 | 触发条件 | React 状态变更 | ShareDB 内部状态 | UI 反馈 |
+|------|---------|---------------|-----------------|---------|
+| `connected` | WebSocket 握手成功 | `setConnected(true)` | 连接就绪 | 无直接反馈；查询自动重新订阅 |
+| `disconnected` | 连接意外断开 | `setConnected(false)` + `clearInterval(ping)` | 连接断开，查询暂停 | **无直接反馈**；数据停止更新 |
+| `closed` | 连接被主动关闭 | `setConnected(false)` + `clearInterval(ping)` | 连接关闭 | **无直接反馈** |
+| `error` | ShareDB 协议级错误 | **无状态变更** | 连接可能仍 OPEN | **静默忽略**（因 Bug） |
+| `receive` (含 error) | 服务器返回错误响应 | **无状态变更** | 连接仍 OPEN | **静默忽略**（因 Bug） |
+| `receive` (无 error) | 服务器返回正常数据 | **无状态变更** | 正常处理 | 数据更新 |
+
+#### 各事件详细分析
+
+**`connected` 事件：**
+```
+WebSocket 连接成功
+    │
+    ├─► setConnected(true) → React 状态更新
+    │   → 消费者可通过 useConnection().connected 感知
+    │
+    └─► setInterval(ping, 10000) → 启动心跳保活
+```
+
+**`disconnected` 事件：**
+```
+连接意外断开（网络问题、服务器关闭等）
+    │
+    ├─► setConnected(false) → React 状态更新
+    │   → 消费者可感知断连
+    │
+    ├─► clearInterval(ping) → 停止心跳
+    │
+    └─► ReconnectingSockJS 自动重连（如果非 forcedClose）
+        → 重连成功后触发 connected 事件
+```
+**注意**：断连时**没有用户可见的 UI 反馈**（无 Toast、无状态栏提示）。只有依赖 `connected` 状态的组件会感知到变化。
+
+**`closed` 事件：**
+```
+连接被主动关闭（用户离开页面 >10min）
+    │
+    ├─► setConnected(false) → React 状态更新
+    │
+    └─► clearInterval(ping)
+```
+与 `disconnected` 处理相同，但 `ReconnectingSockJS` 的 `forcedClose=true` 不会自动重连。
+
+**`error` 事件：**
+```
+ShareDB 协议级错误
+    │
+    └─► shareDbErrorHandler(error)
+        │
+        ├─► UNAUTHORIZED → 页面跳转
+        ├─► UNAUTHORIZED_SHARE → 页面刷新
+        └─► 其他 → return（静默忽略，因 ignoreErrorCodes Bug）
+            │
+            └─► 连接状态不变（仍 OPEN），数据流继续
+```
+
+**`receive` 事件（含 error）：**
+```
+服务器响应中包含错误
+    │
+    └─► shareDbErrorHandler(request.data.error)
+        │
+        └─► 同上：静默忽略或页面跳转/刷新
+```
 
 ### 12-C.3 ReconnectingSockJS 的重连行为
 
@@ -1688,17 +1776,18 @@ handleClose 事件触发
                 └─► 失败 → handleClose → 继续退避重连
 ```
 
-**重连不中断的场景：**
+**重连场景完整矩阵：**
 
-| 场景 | Socket 状态 | 重连行为 |
-|------|------------|---------|
-| 网络断开 | `CLOSED` | 自动指数退避重连 |
-| 服务器重启 | `CLOSED` | 自动指数退避重连 |
-| SockJS 超时 | `CLOSED` | 自动指数退避重连 |
-| `UNAUTHORIZED` 错误 | 可能仍 `OPEN` | **页面跳转**，终止一切 |
-| 其他 `error` 事件 | 仍 `OPEN` | **仅 Toast**，不重连 |
-| 页面不可见 > 10min | 主动 `close()` | `forcedClose=true`，**不自动重连** |
-| 页面恢复可见 | `CLOSED` | `useConnectionAutoManage` 触发 2s 后重连 |
+| 场景 | Socket 状态 | ShareDB 事件 | 重连行为 | UI 反馈 |
+|------|------------|-------------|---------|---------|
+| 网络断开 | `CLOSED` | `disconnected` | 自动指数退避重连 | 无 |
+| 服务器重启 | `CLOSED` | `disconnected` | 自动指数退避重连 | 无 |
+| SockJS 超时 | `CLOSED` | `disconnected` | 自动指数退避重连 | 无 |
+| `UNAUTHORIZED` 错误 | 可能仍 `OPEN` | `error` | **页面跳转**，终止一切 | 跳转登录页 |
+| `UNAUTHORIZED_SHARE` | 可能仍 `OPEN` | `error` | **页面刷新** | 刷新 |
+| 其他 `error` 事件 | 仍 `OPEN` | `error` | **静默忽略**，不重连 | **无**（Bug） |
+| 页面不可见 > 10min | `CLOSED` | `closed` | `forcedClose=true`，不自动重连 | 无 |
+| 页面恢复可见 | `CLOSED` | — | `useConnectionAutoManage` 2s 后重连 | 无 |
 
 ### 12-C.4 页面可见性驱动的重连管理
 
@@ -1835,10 +1924,57 @@ pathMatcher(op.p, ['fields', ':fieldId']);
 |---------|---------|---------|
 | 两人编辑同一记录不同字段 | REST API 串行执行，数据库最终一致 | 后端 `updateRecord` API |
 | 两人编辑同一记录同一字段 | **后提交者覆盖先提交者**（数据库最后写入获胜） | 后端数据库事务 |
+| 编辑值与数据库当前值相同 | `IS DISTINCT FROM` 条件不满足 → `mutationApplied=false` → 无 ShareDB op | `buildDistinctUserFieldWhere` |
 | 本地编辑与远程计算字段更新 | 本地手动编辑优先，计算字段通过 op 更新 | `updateComputedField` |
 | 字段类型变更后记录编辑 | Presence 通知刷新 schema，前端重新拉取 | `schemaRefreshToken` |
-| 记录删除后编辑 | REST API 返回 404，前端提示错误 | `Record.updateCell` catch 块 |
+| 记录删除后编辑 | V2: `findOne` 返回 `domainError.notFound` → HTTP 404 → 前端 catch 块回滚乐观更新 + Toast 错误 | `UpdateRecordHandler` + `Record.updateCell` |
 | 重连后状态不一致 | ShareDB Query 重新订阅，自动拉取最新快照 | ShareDB 内置 |
+
+#### "记录删除后编辑" 的完整返回语义
+
+```
+用户A编辑已被删除的记录
+        │
+        ▼
+前端: onCommitLocal(fieldId, cellValue) — 乐观更新本地状态
+        │
+        ▼
+REST API: PATCH /api/table/{tableId}/record/{recordId}
+        │
+        ▼
+RecordOpenApiV2Service.updateRecord()
+        │
+        ▼
+UpdateRecordHandler.handle()
+        │
+        ├─► TableRecordQueryRepository.findOne(recordId)
+        │   → SELECT ... WHERE __id = 'rec_xxx'
+        │   → 0 行返回 → err(domainError.notFound({ code: 'record.not_found' }))
+        │
+        ▼
+executeUpdateRecordEndpoint 检测到 result.isErr()
+        │
+        ▼
+mapDomainErrorToHttpStatus(error) → isNotFoundError → 404
+        │
+        ▼
+HTTP 404 { ok: false, error: { code: 'record.not_found', message: 'Record not found' } }
+        │
+        ▼
+RecordOpenApiV2Service.throwV2Error() → CustomHttpException(404)
+        │
+        ▼
+前端 updateCell catch 块:
+        │
+        ├─► onCommitLocal(fieldId, oldCellValue, undo=true) — 回滚乐观更新
+        └─► toast.error(getHttpErrorMessage(error)) — 显示错误提示
+```
+
+**关键点**：
+1. 后端返回 **HTTP 404**（`not_found`），不是 500
+2. 前端 catch 块**自动回滚**本地乐观更新
+3. 用户看到 Toast 错误提示，值恢复为删除前的旧值
+4. 旧值在下次 ShareDB 数据同步时会被覆盖为最新状态
 
 ---
 

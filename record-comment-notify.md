@@ -397,14 +397,73 @@ model CommentSubscription {
 }
 ```
 
-### 6.2 订阅的唯一约束语义
+### 6.2 订阅的唯一约束语义与重复订阅行为
 
-`@@unique([tableId, recordId])` 意味着 **同一 (tableId, recordId) 组合只能有一条订阅记录**。这隐含了一个重要设计决策：
+`@@unique([tableId, recordId])` 意味着 **同一 (tableId, recordId) 组合只能有一条订阅记录**。`createdBy` 不在唯一约束中，因此同一记录只允许存在一条订阅行。
 
-- 一条记录只允许**一个人**订阅（`createdBy` 记录谁订阅了这条记录的评论）
-- 这**不是**一个"多用户可以同时订阅同一记录"的设计——否则唯一约束应该是 `(tableId, recordId, createdBy)`
+**重复订阅时的实际行为：报错，而非覆盖。**
 
-实际上从 Prisma schema 来看，`createdBy` 不在唯一约束中，因此同一记录只能存在一条订阅行。这意味着**同一记录的评论订阅只能由最后订阅的人独占**，之前的订阅者会被覆盖。这看起来像是一个设计上的特殊点：订阅可能是"记录级开关"而非"用户-记录级关系"。
+代码证据——`subscribeComment` 使用的是 `prismaService.commentSubscription.create()`，而非 `upsert`：
+
+```typescript
+// comment-open-api.service.ts:531
+async subscribeComment(tableId: string, recordId: string) {
+  await this.prismaService.commentSubscription.create({  // ← create，不是 upsert
+    data: {
+      tableId,
+      recordId,
+      createdBy: this.cls.get('user.id'),
+    },
+  });
+}
+```
+
+当同一 `(tableId, recordId)` 已存在记录时，Prisma 会抛出 `P2002` 唯一约束冲突错误，转化为 HTTP 500 返回给前端。**不会覆盖之前的订阅者**。
+
+**前端防护机制**：
+
+```typescript
+// CommentHeader.tsx:55-61
+const subscribeHandler = () => {
+  if (!subscribeStatus) {          // ← 检查是否已有订阅
+    createSubscribe({ tableId: tableId!, recordId: recordId! });
+  } else {
+    deleteSubscribeFn({ tableId: tableId!, recordId: recordId! });
+  }
+};
+
+const subscribeComment = () => {
+  if (!subscribeStatus) {          // ← 同样的检查
+    createSubscribe({ tableId: tableId!, recordId: recordId! });
+  }
+};
+```
+
+前端先通过 `getCommentSubscribe` API 查询当前订阅状态。如果 `subscribeStatus` 非空，`subscribeComment` 会直接跳过，不会尝试重复创建。
+
+**但这里存在一个跨用户问题**：`getSubscribeDetail` 返回的是 `(tableId, recordId)` 对应的**唯一一条订阅记录**，无论 `createdBy` 是谁。这意味着：
+
+1. 用户 A 订阅了记录 X → `comment_subscription` 中存在 `(tableX, recordX, createdBy: userA)`
+2. 用户 B 打开记录 X 的评论面板 → `getSubscribeDetail` 返回 `{ tableId: 'tableX', recordId: 'recordX', createdBy: 'userA' }` （非 null）
+3. 用户 B 看到 `subscribeStatus` 非空 → UI 显示"通知全部"（已订阅状态）
+4. 但实际上**只有 userA 会收到订阅通知**，userB 的 `subscribeStatus` 是 userA 的订阅
+
+同时，`unsubscribeComment` 按 `(tableId, recordId)` 删除，**不校验 createdBy**：
+
+```typescript
+// comment-open-api.service.ts:541
+async unsubscribeComment(tableId: string, recordId: string) {
+  await this.prismaService.commentSubscription.delete({
+    where: {
+      tableId_recordId: { tableId, recordId },  // ← 无 createdBy 条件
+    },
+  });
+}
+```
+
+所以用户 B 点击"取消订阅"时，实际删除的是用户 A 的订阅。
+
+**结论**：订阅模型是一个**记录级开关**（per-record toggle），而非用户-记录级关系。同一记录只能由一个人"持有"订阅，其他人看到的是这个人的订阅状态。这在多人协作场景下会导致误判——用户以为自己订阅了，实际通知只会发给记录中存储的那个 `createdBy`。
 
 ### 6.3 订阅 CRUD
 
@@ -585,13 +644,13 @@ updateComment (comment-open-api.service.ts:384)
 
 ### 9.1 await 语义分析
 
-`createComment` 中的调用顺序：
+`createComment` 中的调用顺序（`comment-open-api.service.ts:355`）：
 
 ```typescript
 // 1. 写 DB —— 必须等
 const result = await this.prismaService.comment.create({ ... });
 
-// 2. 通知分发 —— 必须等
+// 2. 通知分发 —— await 但只等查询阶段
 await this.sendCommentNotify(tableId, recordId, id, { ... });
 
 // 3. 评论实时推送 —— 不等（fire-and-forget）
@@ -601,72 +660,153 @@ this.sendCommentPatch(tableId, recordId, CommentPatchType.CreateComment, result)
 this.sendTableCommentPatch(tableId, recordId, CommentPatchType.CreateComment);
 ```
 
-| 步骤 | await | 含义 |
+| 步骤 | await | 实际等待范围 |
 |------|:---:|------|
-| `comment.create` | ✅ | DB 写入是主操作，必须等，失败则整体报错 |
-| `sendCommentNotify` | ✅ | 通知写入 DB + 推送 + 发邮件全部完成后才返回 |
-| `sendCommentPatch` | ❌ | 实时推送 fire-and-forget，失败不影响主流程 |
-| `sendTableCommentPatch` | ❌ | 表级计数推送 fire-and-forget |
+| `comment.create` | ✅ | DB 写入完成，失败则整体报错 |
+| `sendCommentNotify` | ✅ | **仅等待内部查询阶段**，不等待通知 DB 写入、推送或邮件 |
+| `sendCommentPatch` | ❌ | 完全 fire-and-forget |
+| `sendTableCommentPatch` | ❌ | 完全 fire-and-forget |
 
-**`sendCommentNotify` 是 await 的**，意味着：如果通知写入 DB 失败、ShareDB 推送失败或邮件发送失败，`createComment` 整体会抛出异常——**评论创建成功但通知失败时，API 会返回 500**，但评论已经写入了 DB。
+**关键纠正**：虽然 `createComment` 中对 `sendCommentNotify` 使用了 `await`，但这并不意味着等待通知全部完成。详见 9.2 的逐行追踪。
 
-### 9.2 sendCommentNotify 内部的 await 链
+### 9.2 sendCommentNotify 内部的完整 await 链——逐行追踪
 
 ```typescript
-private async sendCommentNotify(...) {
-  // 1. 查 quoteId 的 createdBy           ← await
-  // 2. getMentionUserByContent(content)   ← 同步
-  // 3. 查 tableMeta                       ← await
-  // 4. 查 primary field                   ← await
-  // 5. 查 baseName                        ← await
-  // 6. 查 recordName                      ← await
-  // 7. 查 commentSubscription             ← await
-  // 8. 构造消息
-  // 9. for each userId:
-  //      this.notificationService.sendCommentNotify(...)  ← 同步调用（无 await）
+// comment-open-api.service.ts:603
+private async sendCommentNotify(
+  tableId: string, recordId: string, commentId: string,
+  notifyVo: { quoteId: string | null; content: string | null }
+) {
+  // ── 阶段 A：查询阶段（被外层 await 等待）──
+
+  // A1. 查被引用评论作者
+  if (quoteId) {
+    const { createdBy: quoteCommentCreator } =
+      (await this.prismaService.comment.findUnique({ ... })) || {};  // ← await ✅
+    quoteCommentCreator && relativeUsers.push(quoteCommentCreator);
+  }
+
+  // A2. 提取 @提及用户（纯同步计算）
+  const mentionUsers = this.getMentionUserByContent(content);        // ← 同步
+
+  // A3. 查 tableMeta
+  const { baseId, name: tableName } =
+    (await this.prismaService.tableMeta.findFirst({ ... })) || {};   // ← await ✅
+
+  // A4. 查 primary field
+  const { id: fieldId } =
+    (await this.prismaService.field.findFirst({ ... })) || {};      // ← await ✅
+
+  if (!baseId || !fieldId) { return; }                              // 提前退出
+
+  // A5. 查 baseName
+  const { name: baseName } = await this.prismaService.base
+    .findUniqueOrThrow({ ... });                                    // ← await ✅
+
+  // A6. 查 recordName
+  const recordName = await this.recordService
+    .getCellValue(tableId, recordId, fieldId);                      // ← await ✅
+
+  // A7. 查 commentSubscription
+  const notifyUsers = await this.prismaService.commentSubscription
+    .findMany({ where: { tableId, recordId }, ... });               // ← await ✅
+
+  // A8. 合并去重
+  const subscribeUsersIds = Array.from(new Set([...])).filter(...); // ← 同步
+
+  // A9. 构造 i18n 消息
+  const message: ILocalization<I18nPath> = { i18nKey: '...', context: {...} };  // ← 同步
+
+  // ── 阶段 B：通知分发阶段（不被外层 await 等待）──
+
+  // B1. forEach 遍历收件人 —— 同步循环，异步操作未被 await
+  subscribeUsersIds.forEach((userId) => {
+    this.notificationService.sendCommentNotify({                     // ← 无 await ❌
+      baseId, tableId, recordId, commentId,
+      toUserId: userId, message, fromUserId,
+    });
+    // 返回的 Promise 被丢弃，无人 await 或 catch
+  });
+  // forEach 循环本身同步完成 → sendCommentNotify 的 async 函数体结束
+  // → 外层的 await resolve → createComment 继续执行后续代码
 }
 ```
 
-关键点：步骤 9 中对 `subscribeUsersIds` 的遍历调用 `notificationService.sendCommentNotify` **没有 await**——这是一个**同步循环中发起多个异步操作**的模式。由于 `sendCommentNotify` 返回 `Promise<void>` 但在循环中未被 await，这些通知操作会**并发执行**，而 `sendCommentNotify` 外部的 await 只等到了循环本身（同步代码）完成，不等每个通知操作完成。
+**分界线**：A1-A9 是查询阶段，B1 是分发阶段。`createComment` 中的 `await this.sendCommentNotify(...)` **只等待阶段 A 完成**。阶段 B 的所有异步操作（通知 DB 写入、WebSocket 推送、邮件发送）全部在后台执行，不被等待。
 
-**含义**：`createComment` 中的 `await this.sendCommentNotify(...)` 实际上只等待了查询阶段（步骤 1-7），并没有等待通知真正写入 DB 或推送完成。通知操作是**半 fire-and-forget** 的。
+### 9.3 NotificationService.sendCommentNotify 内部的二次无 await
 
-### 9.3 sendCommonNotify 内部的可靠性
+即使 `forEach` 中对 `notificationService.sendCommentNotify` 加了 `await`，仍然不会等待通知完成，因为它**内部也没有 await `sendCommonNotify`**：
 
 ```typescript
+// notification.service.ts:452
+async sendCommentNotify(params: {...}) {
+  const { toUserId, tableId, message, baseId, commentId, recordId, fromUserId } = params;
+  const toUser = await this.userService.getUserById(toUserId);      // ← await ✅
+  if (!toUser) { return; }
+
+  const type = NotificationTypeEnum.Comment;
+  const urlMeta = notificationUrlSchema.parse({...});
+  const notifyPath = this.generateNotifyPath(type, urlMeta);
+
+  this.sendCommonNotify(                                             // ← 无 await ❌
+    { path: notifyPath, fromUserId, toUserId, message, ... },
+    type
+  );
+  // sendCommonNotify 返回的 Promise 被丢弃
+}
+```
+
+**双重无 await**：`forEach` 无 await → `sendCommentNotify` 内部也无 await `sendCommonNotify` → 即使外层修了 forEach，仍然等不到通知完成。
+
+### 9.4 sendCommonNotify 内部的可靠性
+
+```typescript
+// notification.service.ts:305
 async sendCommonNotify(...) {
-  const notifyData = await this.createNotify(data);       // ① 写 DB — await
-  const unreadCount = (await this.unreadCount(...));       // ② 查未读数 — await
-  this.sendNotifyBySocket(toUserId, socketNotification);   // ③ WebSocket 推送 — 无 await
-  if (emailEnabled) {
-    this.mailSenderService.sendMail(...)                   // ④ 邮件 — 无 await
+  const notifyData = await this.createNotify(data);                  // ① 写 DB — await ✅
+  const unreadCount = (await this.unreadCount(...)).unreadCount;     // ② 查未读数 — await ✅
+  // ... 构造 socketNotification（同步）...
+  this.sendNotifyBySocket(toUser.id, socketNotification);            // ③ WebSocket 推送 — 无 await ❌
+  if (emailConfig && toUser.notifyMeta && toUser.notifyMeta.email) {
+    const emailOptions = await this.mailSenderService               // ④ 构造邮件模板 — await ✅
+      .commonEmailOptions({...});
+    this.mailSenderService.sendMail({...}, {...});                   // ⑤ 发送邮件 — 无 await ❌
   }
 }
 ```
 
-| 步骤 | await | 失败影响 |
-|------|:---:|---------|
-| ① `notification.create` | ✅ | DB 写入失败 → `sendCommonNotify` 抛异常 → 但外层没有 await 它 |
-| ② `unreadCount` | ✅ | 查询失败 → 同上 |
-| ③ `sendNotifyBySocket` | ❌ | 推送失败 → 仅 console.error |
-| ④ `mailSenderService.sendMail` | ❌ | 邮件失败 → catch 后 log error，返回 false |
+| 步骤 | await | 失败时行为 | 是否影响接口返回 |
+|------|:---:|---------|:---:|
+| ① `notification.create` | ✅ | DB 写入失败 → Promise reject | ❌ 不影响 |
+| ② `unreadCount` | ✅ | 查询失败 → Promise reject | ❌ 不影响 |
+| ③ `sendNotifyBySocket` | ❌ | 推送失败 → resolve（不 reject），仅记日志 | ❌ 不影响 |
+| ④ `commonEmailOptions` | ✅ | 构造失败 → Promise reject | ❌ 不影响 |
+| ⑤ `mailSenderService.sendMail` | ❌ | 邮件失败 → catch 后 log error，返回 false | ❌ 不影响 |
 
-**WebSocket 推送失败**：
+**为什么全部不影响接口返回？** 因为从 `createComment` 到 `sendCommonNotify` 之间有**两层无 await**：`forEach` 无 await + `sendCommentNotify` 内部无 await `sendCommonNotify`。所有从 `sendCommonNotify` 抛出的异常都会变成**unhandled Promise rejection**，不会被 NestJS 的 `GlobalExceptionFilter` 捕获（它只处理请求上下文内的异常），也不会传播到 `createComment`。
+
+**WebSocket 推送失败的具体行为**：
 
 ```typescript
+// notification.service.ts:707
 private async sendNotifyBySocket(toUserId: string, data: INotificationBuffer) {
+  const channel = getUserNotificationChannel(toUserId);
+  const presence = this.shareDbService.connect().getPresence(channel);
+  const localPresence = presence.create(data.notification.id);
+
   return new Promise((resolve) => {
     localPresence.submit(data, (error) => {
       error && this.logger.error(error);  // 只记日志
-      resolve(data);                       // 无论成功失败都 resolve
+      resolve(data);                       // 无论成功失败都 resolve（永不 reject）
     });
   });
 }
 ```
 
-即使 ShareDB Presence submit 失败，Promise 也会 resolve（不会 reject）。通知已经写入了 DB，用户下次刷新页面仍可从通知列表 API 获取。
+即使 ShareDB Presence submit 失败，Promise 也会 resolve。通知已经写入了 DB，用户下次刷新页面仍可从通知列表 API 获取。
 
-**邮件发送失败**：
+**邮件发送失败的具体行为**：
 
 ```typescript
 // mail-sender.service.ts:248
@@ -679,30 +819,68 @@ return sender.catch((reason) => {
 });
 ```
 
-邮件发送是**最大努力交付**：失败只记日志，不重试，不回滚通知记录。
+邮件发送是**最大努力交付**：失败只记日志，不重试，不回滚通知记录，不向调用方抛出异常。
 
-### 9.4 失败场景汇总
+### 9.5 完整异步调用链路图
 
-| 失败点 | 时机 | 影响 | 可恢复性 |
-|--------|------|------|---------|
-| 评论 DB 写入失败 | 主操作 | 评论不存在，API 返回错误 | 用户可重试 |
-| 通知 DB 写入失败 | `sendCommonNotify` 内 | 该收件人无通知记录，但评论已创建 | 不可自动恢复，需手动补偿 |
-| ShareDB 评论推送失败 | `sendCommentPatch` | 其他在线用户看不到实时更新 | 刷新页面可恢复（从 API 拉取） |
-| ShareDB 通知推送失败 | `sendNotifyBySocket` | 在线用户收不到实时通知弹窗 | 刷新页面后从通知列表可恢复 |
-| 邮件发送失败 | `mailSenderService.sendMail` | 收件人收不到邮件 | 不可自动恢复，无重试机制 |
-| `sendCommentNotify` 的循环无 await | 通知写入阶段 | 如果第一个通知写入失败抛异常，后续通知不会发出 | 部分收件人丢失通知 |
+```
+createComment()                                              ← API 入口
+  ├── await prismaService.comment.create()                   ← 等待 ✅ ── 阶段1: 主操作
+  ├── await sendCommentNotify()                              ← 等待 ✅ ── 阶段2: 查询
+  │     ├── await comment.findUnique()                       ← 等待 ✅    (查被引用作者)
+  │     ├── getMentionUserByContent()                        ← 同步       (提取@提及)
+  │     ├── await tableMeta.findFirst()                      ← 等待 ✅    (查baseId)
+  │     ├── await field.findFirst()                          ← 等待 ✅    (查primaryField)
+  │     ├── await base.findUniqueOrThrow()                   ← 等待 ✅    (查baseName)
+  │     ├── await recordService.getCellValue()               ← 等待 ✅    (查recordName)
+  │     ├── await commentSubscription.findMany()             ← 等待 ✅    (查订阅者)
+  │     ├── 合并去重                                         ← 同步
+  │     └── forEach(userId =>                                ← 同步循环 ── 分界线
+  │           notificationService.sendCommentNotify()        ← 无await ❌ 🔥 fire-and-forget
+  │             ├── await userService.getUserById()          ← await ✅   但Promise被丢弃
+  │             └── sendCommonNotify()                       ← 无await ❌ 🔥 二次fire-and-forget
+  │                   ├── await createNotify()               ← await ✅   但Promise被丢弃
+  │                   ├── await unreadCount()                ← await ✅   但Promise被丢弃
+  │                   ├── sendNotifyBySocket()               ← 无await ❌  🔥
+  │                   │     └── localPresence.submit()       ← 永远resolve
+  │                   └── mailSenderService.sendMail()       ← 无await ❌  🔥
+  │                         └── sender.catch(() => false)    ← 吞掉错误
+  │         )                                                ← forEach 结束
+  │     ← sendCommentNotify 的 Promise resolve（只等了查询阶段）
+  ├── sendCommentPatch()                                     ← 无await ❌ 🔥 ── 阶段3: 实时推送
+  └── sendTableCommentPatch()                                ← 无await ❌ 🔥 ── 阶段4: 计数推送
 
-### 9.5 可靠性评估
+返回评论数据给前端
+```
+
+**结论**：`createComment` 的 `await sendCommentNotify` 实际只等待了收件人查询阶段。所有通知写入、推送、邮件均为 fire-and-forget。这些操作的失败**不会导致 API 返回错误**，而是变成 unhandled Promise rejection。
+
+### 9.6 失败场景汇总
+
+| 失败点 | 时机 | 是否影响 API 返回 | 影响 | 可恢复性 |
+|--------|------|:---:|------|---------|
+| 评论 DB 写入失败 | 阶段1 | ✅ 影响 | API 返回错误，评论不存在 | 用户可重试 |
+| sendCommentNotify 查询阶段失败 | 阶段2 | ✅ 影响 | API 返回错误，但评论已写入 DB ⚠️ | 评论已存在，通知未发 |
+| 通知 DB 写入失败 (createNotify) | 阶段2 之后的 FAF | ❌ 不影响 | 该收件人无通知记录 | 不可自动恢复 |
+| WebSocket 评论推送失败 | 阶段3 FAF | ❌ 不影响 | 其他在线用户看不到实时更新 | 刷新页面可恢复 |
+| WebSocket 通知推送失败 | 阶段2 之后的 FAF | ❌ 不影响 | 在线用户收不到实时通知弹窗 | 刷新页面后从通知列表可恢复 |
+| 邮件发送失败 | 阶段2 之后的 FAF | ❌ 不影响 | 收件人收不到邮件 | 不可自动恢复，无重试机制 |
+
+**⚠️ 注意**：阶段 2（查询阶段）的失败**会影响 API 返回**，因为 `createComment` 中 `await sendCommentNotify` 会等待这些查询。如果查询阶段抛出异常（如 `base.findUniqueOrThrow` 找不到记录），评论已经写入了 DB，但 API 返回 500——**用户看到的是创建失败，但评论实际上已经存在**。
+
+### 9.7 可靠性评估
 
 1. **评论写入**：强一致，失败即回滚，用户感知明确。
 
-2. **通知持久化**：最终一致但非原子——评论写入成功后，通知写入可能部分失败。由于 `sendCommonNotify` 的调用在循环中无 await，某个收件人的通知失败不会阻断其余收件人，但也无法保证全部送达。
+2. **sendCommentNotify 查询阶段**：与评论写入非原子。查询失败时评论已入库但 API 报错，用户可能重试导致重复评论。
 
-3. **实时推送**：尽力交付（best-effort）。ShareDB Presence 没有持久化保证，断线期间的消息不会重放。但评论和通知已写入 DB，刷新页面即可恢复。
+3. **通知持久化**：完全 fire-and-forget。`sendCommonNotify` 中的 `createNotify` 虽然用了 `await`，但因为外层两层无 await，其 Promise 被丢弃。通知 DB 写入失败不会影响任何人——不会报错、不会重试、不会补偿。但由于同一评论多次调用会生成不同 `notificationId`，不具幂等性。
 
-4. **邮件通知**：尽力交付，无重试。SMTP 发送失败后仅记日志，不会重发。
+4. **实时推送**：尽力交付（best-effort）。ShareDB Presence 没有持久化保证，断线期间的消息不会重放。但评论和通知已写入 DB，刷新页面即可恢复。
 
-5. **幂等性**：`createComment` 每次调用都生成新的 `commentId`，所以天然幂等。但 `sendCommentNotify` 中对每个 `userId` 调用 `sendCommonNotify` 也生成新的 `notificationId`，如果被多次调用（如网络超时后重试），可能导致**同一评论对同一用户产生多条通知**。
+5. **邮件通知**：尽力交付，无重试。SMTP 发送失败后仅记日志，不会重发。
+
+6. **幂等性**：`createComment` 每次调用都生成新的 `commentId`，所以天然幂等。但 `sendCommentNotify` 中对每个 `userId` 调用 `sendCommonNotify` 也生成新的 `notificationId`，如果被多次调用（如网络超时后重试），可能导致**同一评论对同一用户产生多条通知**。
 
 ---
 
@@ -713,12 +891,14 @@ return sender.catch((reason) => {
 | 前端评论编辑器 | `packages/sdk/src/components/comment/comment-editor/CommentEditor.tsx` |
 | 前端评论列表 + 实时监听 | `packages/sdk/src/components/comment/comment-list/CommentList.tsx` |
 | 前端评论 Presence 监听 hook | `packages/sdk/src/components/comment/comment-list/useCommentPatchListener.ts` |
+| 前端订阅管理 | `packages/sdk/src/components/comment/CommentHeader.tsx` |
 | 前端评论计数 hook | `packages/sdk/src/hooks/use-comment-count-map.ts` |
 | 前端通知 Provider | `packages/sdk/src/context/notification/NotificationProvider.tsx` |
 | 后端评论 Controller | `apps/nestjs-backend/src/features/comment/comment-open-api.controller.ts` |
 | 后端评论 Service | `apps/nestjs-backend/src/features/comment/comment-open-api.service.ts` |
 | 后端通知 Service | `apps/nestjs-backend/src/features/notification/notification.service.ts` |
 | 后端权限 Guard | `apps/nestjs-backend/src/features/auth/guard/permission.guard.ts` |
+| 全局异常过滤器 | `apps/nestjs-backend/src/filter/global-exception.filter.ts` |
 | 邮件发送 Service | `apps/nestjs-backend/src/features/mail-sender/mail-sender.service.ts` |
 | 评论内容类型定义 | `packages/openapi/src/comment/types.ts` |
 | Channel 命名 | `packages/core/src/models/channel.ts` |
@@ -750,10 +930,10 @@ return sender.catch((reason) => {
 
 5. **通知双通道**：每条通知同时走 WebSocket（即时）和 Email（用户开启 notifyMeta.email 时异步），邮件模板复用 i18n 体系。
 
-6. **订阅模型的单用户约束**：`comment_subscription` 表的 `(tableId, recordId)` 唯一约束导致同一记录只能有一个订阅者，这是一个值得注意的设计限制——多人协作场景下，只有最后一个订阅者能收到订阅通知，其他协作者必须依赖 @提及 或被引用才能收到通知。
+6. **订阅模型是记录级开关**：`comment_subscription` 表的 `(tableId, recordId)` 唯一约束使同一记录只能有一行订阅，`createdBy` 不在唯一约束中。重复订阅会触发 Prisma P2002 错误（前端通过 `subscribeStatus` 检查防止自重复订阅，但无法区分是否是自己的订阅）。`getSubscribeDetail` 返回的是记录上唯一的订阅行，无论 `createdBy` 是谁——其他用户看到"已订阅"实际是别人的订阅。`unsubscribeComment` 也不校验 `createdBy`，可以删除他人的订阅。
 
 7. **deleteComment 权限不对称**：删除评论只需 `record|read` 而非 `record|comment`，虽然 Service 层通过 `createdBy` 限制只能删自己的评论，但权限注解与语义不一致。管理员也无法通过此接口删除他人的不当评论。
 
 8. **updateComment 数据清洗缺失**：`updateComment` 未调用 `filterCommentContent`，可能导致冗余展示态字段入库。虽然读取时回填覆盖了此问题，但数据一致性应从写入端保证。
 
-9. **通知可靠性为尽力交付**：评论 DB 写入是强一致的，但通知分发（DB 持久化 + WebSocket 推送 + 邮件）均为尽力交付，无重试和补偿机制。WebSocket 推送失败后刷新可恢复（通知已入 DB），但邮件发送失败不可恢复。`sendCommentNotify` 内部的循环调用无 await，存在部分通知丢失的窗口。
+9. **通知分发是完全 fire-and-forget**：评论 DB 写入是强一致的，但通知分发从 `sendCommentNotify` 的 `forEach` 开始就是 fire-and-forget——`forEach` 无 await、`NotificationService.sendCommentNotify` 内部也无 await `sendCommonNotify`，形成双重无 await。所有通知 DB 写入、WebSocket 推送、邮件发送的失败都不会影响 API 返回，而是变成 unhandled Promise rejection。唯一能影响 API 返回的是 `sendCommentNotify` 的查询阶段（查收件人、查表名等），但此时评论已入库，查询失败会导致 API 返回 500 而评论已存在（用户重试可能产生重复评论）。

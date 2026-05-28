@@ -562,6 +562,173 @@ buildIsCondition(field, value, tableAlias, hostTableAlias)
 
 **6. `resolveDateRange`** (`TableRecordConditionWhereVisitor.ts:473-639`)
 
+#### 日期过滤专项深度解析
+
+日期操作符分为**两条独立代码路径**，调用链完全分离：
+
+```
+日期操作符分派
+  ├─ isWithIn → visitDateIsWithIn → applyIsWithin → buildIsWithinCondition
+  │
+  └─ isBefore / isAfter / isOnOrBefore / isOnOrAfter
+          → visitDateIsBefore / visitDateIsAfter
+          → applyDateComparison
+          → buildDateComparisonCondition
+```
+
+##### 路径 A：isWithIn → buildIsWithinCondition
+
+**文件**: `TableRecordConditionWhereVisitor.ts:1184-1209`
+
+```typescript
+const buildIsWithinCondition = (
+  field: core.Field,
+  value: core.RecordConditionValue | undefined,
+  tableAlias?: string
+): Result<RecordConditionWhere, DomainError> => {
+  return safeTry<RecordConditionWhere, DomainError>(function* () {
+    const column = yield* resolveColumn(field, tableAlias);
+    const dateValue = yield* resolveDateValue(value);
+    const range = yield* resolveDateRange(dateValue, resolveDateFormatting(field));
+    const columnRef = sql.ref(column);
+    const isMultiple = isArrayLikeOutputField(field, yield* fieldIsMultiple(field));
+
+    if (isMultiple || fieldIsJson(field)) {
+      // 多值字段: EXISTS + jsonb_array_elements_text
+      const normalizedArray = normalizeToJsonArray(columnRef);
+      return ok(sql`EXISTS (
+        SELECT 1 FROM jsonb_array_elements_text(${normalizedArray}) AS elem
+        WHERE NULLIF(elem, 'null')::timestamptz BETWEEN ${range.start} AND ${range.end}
+      )`);
+    }
+
+    // 单值字段: 直接 BETWEEN
+    return ok(sql`${columnRef} between ${range.start} and ${range.end}`);
+  });
+};
+```
+
+**关键特征**：
+- **不支持字段引用**：`value` 必须是 `RecordConditionDateValue`（字面量日期模式），不能是字段引用
+- **总是用 BETWEEN**：无论单值/多值，都生成 `BETWEEN start AND end` 形式
+- **参数位**：2 个参数位（`range.start`, `range.end`）
+
+##### 路径 B：isBefore/isAfter 等 → buildDateComparisonCondition
+
+**文件**: `TableRecordConditionWhereVisitor.ts:1080-1182`
+
+```typescript
+const buildDateComparisonCondition = (
+  field: core.Field,
+  value: core.RecordConditionValue | undefined,
+  operator: ComparisonOperator,  // '<' | '<=' | '>' | '>='
+  tableAlias?: string,
+  hostTableAlias?: string
+): Result<RecordConditionWhere, DomainError> => {
+  return safeTry<RecordConditionWhere, DomainError>(function* () {
+    const column = yield* resolveColumn(field, tableAlias);
+    const columnRef = sql.ref(column);
+    const isMultiple = isArrayLikeOutputField(field, yield* fieldIsMultiple(field));
+
+    // 分支 1: 值是字段引用（如 日期1 < 日期2）
+    if (core.isRecordConditionFieldReferenceValue(value)) {
+      const rightColumn = yield* resolveColumn(value.field(), hostTableAlias ?? tableAlias);
+      const right = sql.ref(rightColumn);
+      // ... 生成 col OP right 的比较
+    }
+
+    // 分支 2: 值是字面量日期
+    const dateValue = yield* resolveDateValue(value);
+    const range = yield* resolveDateRange(dateValue, resolveDateFormatting(field));
+
+    // ══════════════════════════════════════════════
+    // 关键：边界选择逻辑（第 1148 行）
+    // ══════════════════════════════════════════════
+    const boundary = operator === '>' || operator === '<=' ? range.end : range.start;
+    //            ┌──────────┬──────────┬──────────┐
+    //            │  '>'     │  '>='    │  '<'     │  '<='
+    // ┌──────────┼──────────┼──────────┼──────────┼──────────
+    // │ boundary │  end     │  start   │  start   │  end
+    // └──────────┴──────────┴──────────┴──────────┴──────────
+
+    const right = sql`${boundary}`;
+
+    if (isMultiple || fieldIsJson(field)) {
+      // 多值字段: EXISTS + 元素级比较
+      return ok(sql`EXISTS (
+        SELECT 1 FROM jsonb_array_elements_text(${normalizedArray}) AS elem
+        WHERE NULLIF(elem, 'null')::timestamptz ${sql.raw(operator)} ${right}
+      )`);
+    }
+
+    // 单值字段: 直接比较
+    if (operator === '>') return ok(sql`${columnRef} > ${right}`);
+    if (operator === '>=') return ok(sql`${columnRef} >= ${right}`);
+    if (operator === '<') return ok(sql`${columnRef} < ${right}`);
+    return ok(sql`${columnRef} <= ${right}`);
+  });
+};
+```
+
+**关键特征**：
+- **支持字段引用**：`value` 可以是字段引用（`{ type: 'field', fieldId: '...' }`）
+- **边界选择逻辑**（第 1148 行）：
+  | 操作符 | 比较方向 | 使用的边界 | 语义（以 today 为例） |
+  |--------|---------|-----------|---------------------|
+  | `>` (isAfter) | `col > ?` | `range.end` | 今天结束之后 → 明天及以后 |
+  | `>=` (isOnOrAfter) | `col >= ?` | `range.start` | 今天开始或之后 → 今天及以后 |
+  | `<` (isBefore) | `col < ?` | `range.start` | 今天开始之前 → 昨天及以前 |
+  | `<=` (isOnOrBefore) | `col <= ?` | `range.end` | 今天结束或之前 → 今天及以前 |
+- **参数位**：1 个参数位（仅 `boundary`）
+
+##### resolveDateRange 的统一输出
+
+**文件**: `TableRecordConditionWhereVisitor.ts:473-639`
+
+无论哪种操作符路径，日期范围解析都统一通过 `resolveDateRange`，返回 ISO 字符串：
+
+```typescript
+const resolveDateRange = (
+  value: core.RecordConditionDateValue,
+  formatting?: core.DateTimeFormatting
+): Result<{ start: string; end: string }, DomainError> => {
+  // ... 27 种 mode 的分支逻辑
+  return ok({
+    start: range[0].toISOString(),  // 始终是 ISO 格式
+    end: range[1].toISOString()     // 始终是 ISO 格式
+  });
+};
+```
+
+**各 date mode 的范围计算规则**：
+
+| mode | 范围计算 | 示例（今天=2026-05-28 周四） |
+|------|---------|---------------------------|
+| `today` | `[startOf('day'), endOf('day')]` | `[2026-05-28T00:00, 2026-05-28T23:59:59]` |
+| `tomorrow` / `yesterday` | 当天 | - |
+| `currentWeek` | `[startOf('week'), endOf('week')]` | **周一为起始**：`[05-26, 06-01]` |
+| `currentMonth` | 当月 | `[05-01, 05-31]` |
+| `currentYear` | 当年 | `[01-01, 12-31]` |
+| `lastWeek` | 上周（周一起始） | `[05-19, 05-25]` |
+| `nextWeekPeriod` | 下周（周一起始） | `[06-02, 06-08]` |
+| `oneWeekAgo` | 7 天前的那一天 | `[05-21, 05-21]` |
+| `daysAgo(3)` | 3 天前的那一天 | `[05-25, 05-25]` |
+| `pastWeek` | 过去 7 天（含今天） | `[05-22, 05-28]` |
+| `nextWeek` | 未来 7 天（含今天） | `[05-28, 06-03]` |
+| `exactDate('2026-05-28')` | 指定日期（无时区） | `[05-28T00:00, 05-28T23:59:59]` |
+
+> **注意**：周起始是周一（第 567-569 行明确设置 `weekStart: 1`），这会影响所有周相关的计算。
+
+##### 两条路径的参数位对应关系表
+
+| 操作符 | 函数 | range.start 位置 | range.end 位置 | 总参数位 |
+|--------|------|-----------------|---------------|---------|
+| `isWithIn` | `buildIsWithinCondition` | $1 | $2 | **2** |
+| `isBefore` (`<`) | `buildDateComparisonCondition` | $1 (boundary=start) | - | **1** |
+| `isAfter` (`>`) | `buildDateComparisonCondition` | - | $1 (boundary=end) | **1** |
+| `isOnOrBefore` (`<=`) | `buildDateComparisonCondition` | - | $1 (boundary=end) | **1** |
+| `isOnOrAfter` (`>=`) | `buildDateComparisonCondition` | $1 (boundary=start) | - | **1** |
+
 ### 3.3 WHERE 子句构建入口
 
 **文件**: `packages/v2/adapter-table-repository-postgres/src/record/repository/buildRecordWhereClause.ts`
@@ -924,18 +1091,22 @@ SQL: "t"."col_status" = $1
 #### 叶子 2: Due Date isWithIn currentWeek
 
 ```
-visitDateIsWithIn → resolveDateRange({ mode: "currentWeek", timeZone: "UTC" })
+visitDateIsWithIn → applyIsWithin → buildIsWithinCondition
+  → resolveDateValue(value)
+    → resolveDateRange({ mode: "currentWeek", timeZone: "UTC" })
 
-假设今天是 2026-05-28 (周四, UTC):
-  本周开始 = 2026-05-25 (周一) startOf('day')
-  本周结束 = 2026-05-31 (周日) endOf('day')
+假设今天是 2026-05-28 (周四, Asia/Shanghai):
+  dateUtil = new DateUtil("UTC")  # 按 UTC 时区计算
+  本周开始 = 2026-05-25T00:00:00Z (周一 00:00 UTC)
+  本周结束 = 2026-05-31T23:59:59Z (周日 23:59:59 UTC)
+  → return { start: "2026-05-25T00:00:00Z", end: "2026-05-31T23:59:59Z" }
 
-由于 Date 字段格式为 date-only (time: None):
-  → shouldCompareAsDateOnly = true
-  → buildDateOnlyComparableExpr: (col AT TIME ZONE 'UTC')::date
+⚠️ 注意：buildIsWithinCondition 中**没有 AT TIME ZONE 转换
+  时区转换完全在 resolveDateRange 内部完成
+  range.start / range.end 已经是对应时区的 ISO 字符串
 
-SQL: ("t"."col_due_date" AT TIME ZONE $1)::date between $2 and $3
-参数: ["UTC", "2026-05-25T00:00:00Z", "2026-05-31T23:59:59Z"]
+SQL: "t"."col_due_date" between $1 and $2
+参数: ["2026-05-25T00:00:00Z", "2026-05-31T23:59:59Z"]
 ```
 
 ### B.7 最终 SQL
@@ -946,13 +1117,13 @@ FROM "bse_xxx"."tbl_yyy" AS "t"
 WHERE (
   ("t"."col_status" = $1)
   AND
-  (("t"."col_due_date" AT TIME ZONE $2)::date between $3 and $4)
+  ("t"."col_due_date" between $2 and $3)
 )
 ```
 
 **参数绑定**：
 ```typescript
-["Open", "UTC", "2026-05-25T00:00:00Z", "2026-05-31T23:59:59Z"]
+["Open", "2026-05-25T00:00:00Z", "2026-05-31T23:59:59Z"]
 ```
 
 ### B.8 补充：含字段引用和 hostTableAlias 的场景
@@ -1013,6 +1184,166 @@ jsonb_extract_path_text(to_jsonb("t"."col_assignee"), 'id') = $1
 -- 参数: ["usr_abc123"]
 ```
 
+### B.10 isWithIn 与 isBefore 的 SQL 对照
+
+使用完全相同的日期场景进行对比：**今天 = 2026-05-28 (周四), timeZone = "UTC", date mode = "today"**
+
+#### 对照 1: Due Date isWithIn today
+
+```json
+{
+  "fieldId": "fldDueDate1",
+  "operator": "isWithIn",
+  "value": {
+    "mode": "today",
+    "timeZone": "UTC"
+  }
+}
+```
+
+**调用路径**：
+```
+visitDateIsWithIn
+  → applyIsWithin
+    → buildIsWithinCondition
+      → resolveDateRange({ mode: "today", tz: "UTC" })
+         → start: 2026-05-28T00:00:00Z
+         → end:   2026-05-28T23:59:59Z
+      → SQL: column BETWEEN start AND end
+```
+
+**最终 SQL**：
+```sql
+"t"."col_due_date" between $1 and $2
+```
+**参数**：`["2026-05-28T00:00:00Z", "2026-05-28T23:59:59Z"]`
+
+**匹配的数据**：所有日期在今天范围内的记录（包含边界）
+
+---
+
+#### 对照 2: Due Date isBefore today
+
+```json
+{
+  "fieldId": "fldDueDate1",
+  "operator": "isBefore",
+  "value": {
+    "mode": "today",
+    "timeZone": "UTC"
+  }
+}
+```
+
+**调用路径**：
+```
+visitDateIsBefore
+  → applyDateComparison(field, value, '<')
+    → buildDateComparisonCondition(field, value, '<', ...)
+      → resolveDateRange({ mode: "today", tz: "UTC" })
+         → start: 2026-05-28T00:00:00Z
+         → end:   2026-05-28T23:59:59Z
+      → 边界选择: operator === '<' → boundary = range.start
+         → boundary: 2026-05-28T00:00:00Z
+      → SQL: column < boundary
+```
+
+**最终 SQL**：
+```sql
+"t"."col_due_date" < $1
+```
+**参数**：`["2026-05-28T00:00:00Z"]`
+
+**匹配的数据**：今天开始之前的记录 → **昨天及以前**
+
+---
+
+#### 对照 3: Due Date isOnOrBefore today
+
+```json
+{
+  "fieldId": "fldDueDate1",
+  "operator": "isOnOrBefore",
+  "value": { "mode": "today", "timeZone": "UTC" }
+}
+```
+
+**边界选择**：`operator === '<=' → boundary = range.end`
+
+**最终 SQL**：
+```sql
+"t"."col_due_date" <= $1
+```
+**参数**：`["2026-05-28T23:59:59Z"]`
+
+**匹配的数据**：今天结束或之前 → **今天及以前**
+
+---
+
+#### 对照 4: Due Date isAfter today
+
+```json
+{
+  "fieldId": "fldDueDate1",
+  "operator": "isAfter",
+  "value": { "mode": "today", "timeZone": "UTC" }
+}
+```
+
+**边界选择**：`operator === '>' → boundary = range.end`
+
+**最终 SQL**：
+```sql
+"t"."col_due_date" > $1
+```
+**参数**：`["2026-05-28T23:59:59Z"]`
+
+**匹配的数据**：今天结束之后 → **明天及以后**
+
+---
+
+#### 对照 5: Due Date isOnOrAfter today
+
+```json
+{
+  "fieldId": "fldDueDate1",
+  "operator": "isOnOrAfter",
+  "value": { "mode": "today", "timeZone": "UTC" }
+}
+```
+
+**边界选择**：`operator === '>=' → boundary = range.start`
+
+**最终 SQL**：
+```sql
+"t"."col_due_date" >= $1
+```
+**参数**：`["2026-05-28T00:00:00Z"]`
+
+**匹配的数据**：今天开始或之后 → **今天及以后**
+
+---
+
+#### 对照总结表（mode = "today"）
+
+| 操作符 | 边界选择 | SQL 形式 | 参数值 | 实际语义 |
+|--------|---------|---------|--------|---------|
+| `isWithIn` | start + end | `BETWEEN $1 AND $2` | `[00:00, 23:59:59]` | **今天** |
+| `isBefore` | start | `< $1` | `00:00` | **昨天及以前** |
+| `isOnOrBefore` | end | `<= $1` | `23:59:59` | **今天及以前** |
+| `isAfter` | end | `> $1` | `23:59:59` | **明天及以后** |
+| `isOnOrAfter` | start | `>= $1` | `00:00` | **今天及以后** |
+
+#### 对照总结表（mode = "currentWeek"，周一=2026-05-26）
+
+| 操作符 | 边界选择 | SQL 形式 | 参数值 | 实际语义 |
+|--------|---------|---------|--------|---------|
+| `isWithIn` | start + end | `BETWEEN $1 AND $2` | `[05-26, 06-01]` | **本周** |
+| `isBefore` | start | `< $1` | `05-26` | **上周末及以前** |
+| `isOnOrBefore` | end | `<= $1` | `06-01` | **本周及以前** |
+| `isAfter` | end | `> $1` | `06-01` | **下周一及以后** |
+| `isOnOrAfter` | start | `>= $1` | `05-26` | **本周及以后** |
+
 ---
 
 ## 关键设计决策总结
@@ -1027,7 +1358,10 @@ jsonb_extract_path_text(to_jsonb("t"."col_assignee"), 'id') = $1
 | OR 分支处理 | 克隆独立访问者 | 每个 OR 分支需要独立的条件累积状态 |
 | 字段引用路由 | classifyFieldReferenceComparison | 不同字段类型间比较策略不同，hostTableAlias 影响兼容性判定 |
 | NULL 处理 | IS DISTINCT FROM / COALESCE | 符合 SQL 三值逻辑，确保 NULL 行被正确筛选 |
-| 日期查询 | 时区转换 + DATE 截断 | 支持用户时区的日期精确匹配 |
+| **日期范围操作符** | **两条独立代码路径** | `isWithIn` 走 `buildIsWithinCondition`（BETWEEN，2 参数位）；`isBefore/After` 走 `buildDateComparisonCondition`（单边界，1 参数位） |
+| 日期边界选择 | `operator === '>' || '<=' ? end : start` | 统一用 `resolveDateRange` 输出 range，根据操作符选择一个边界；`isWithIn` 同时用两个边界 |
+| 周起始 | 周一为起始（`weekStart: 1`） | 符合国内/国际通用周定义，影响所有周相关的日期计算 |
+| 时区处理 | 在 JS 层计算（`DateUtil`） | 不在 SQL 层做 AT TIME ZONE 转换，`resolveDateRange` 返回的 ISO 字符串已考虑时区 |
 | 表名机制 | DbTableName 可自定义 | 不强制 bse/tbl 前缀，支持用户指定任意 schema.table |
 | 业务表管理 | 动态 Kysely 建表 | 支持用户自定义字段，无需迁移流程 |
 | 系统表管理 | Prisma | 元数据结构稳定，享受 Prisma 生态 |

@@ -492,6 +492,99 @@ const subscribeUsersIds = Array.from(
 
 由于唯一约束 `(tableId, recordId)`，`findMany` 实际最多返回一条记录。因此订阅用户的贡献**最多是一个人**。而 `relativeUsers`（@提及 + 被引用评论作者）可以包含多人，最终合并后才是一个完整的收件人列表。
 
+### 6.5 comment_subscription 结构演变历史
+
+`comment_subscription` 表经历了三次结构变更，从无主键表逐步演化为有主键的标准表。
+
+**阶段 1：初始创建（20240919032636_add_comment）
+
+```sql
+-- 20240919032636_add_comment/migration.sql:17-32
+CREATE TABLE "comment_subscription" (
+    "table_id" TEXT NOT NULL,        -- 无 id 列！
+    "record_id" TEXT NOT NULL,
+    "created_by" TEXT NOT NULL,
+    "created_time" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX "comment_subscription_table_id_record_id_idx" ON "comment_subscription"("table_id", "record_id");
+CREATE UNIQUE INDEX "comment_subscription_table_id_record_id_key" ON "comment_subscription"("table_id", "record_id");
+
+-- ⚠️ 没有 PRIMARY KEY 约束！
+```
+
+**关键特征**：
+- 没有 `id` 列
+- 没有 `PRIMARY KEY` 约束
+- 只有 `(table_id, record_id)` 作为唯一索引（但不是主键）
+
+这是一张**无主键表**，不符合关系型数据库的最佳实践。Prisma 要求所有模型必须有主键，所以当时的 Prisma schema 可能使用了 `@@unique([tableId, recordId]` 作为复合主键，或者通过其他方式绕过。
+
+**阶段 2：补主键（20250509062715_require_primary_key）
+
+```sql
+-- 20250509062715_require_primary_key/migration.sql:2-4
+ALTER TABLE "comment_subscription" ADD COLUMN "id" TEXT DEFAULT substring(md5(random()::text), 1, 25),
+ADD CONSTRAINT "comment_subscription_pkey" PRIMARY KEY ("id");
+```
+
+**关键变更**：
+- 新增 `id` 列，默认值为 `substring(md5(random()::text), 1, 25)`（PostgreSQL 原生 SQL 级别的随机字符串）
+- 设为 `PRIMARY KEY` 约束
+
+为什么用 `md5(random()::text)` 而不是 `cuid()`：
+- 这是数据库级别的默认值，不是应用级别的
+- 对已有数据自动填充 ID
+
+**阶段 3：移除默认值（20250922111648_add_indexes）
+
+```sql
+-- 20250922111648_add_indexes/migration.sql:2
+ALTER TABLE "comment_subscription" ALTER COLUMN "id" DROP DEFAULT;
+```
+
+**关键变更**：
+- 移除 `id` 列的默认值
+
+**当前 Prisma schema（schema.prisma:757）
+
+```
+model CommentSubscription {
+  id          String   @id @default(cuid())   -- Prisma 应用级别
+  tableId     String   @map("table_id")
+  recordId    String   @map("record_id")
+  createdBy   String   @map("created_by")
+  createdTime DateTime @default(now()) @map("created_time")
+
+  @@unique([tableId, recordId])
+  @@index([tableId, recordId])
+  @@map("comment_subscription")
+```
+
+**当前线上结构的判断方法
+
+| 判断维度 | 检查方法 |
+|--------|---------|
+| **阶段 1（无主键） | 查 `information_schema.columns` 中 `comment_subscription` 没有 `id` 列 |
+| **阶段 2（有默认值的主键） | `id` 列存在且有 `DEFAULT` 不为空 |
+| **阶段 3（无默认值的主键） | `id` 列存在且 `column_default` 为 null |
+
+**SQL 判断脚本：
+
+```sql
+-- 检查 id 列是否存在
+SELECT column_name, column_default, is_nullable
+FROM information_schema.columns
+WHERE table_name = 'comment_subscription'
+  AND column_name = 'id';
+
+-- 检查主键约束
+SELECT constraint_name, constraint_type
+FROM information_schema.table_constraints
+WHERE table_name = 'comment_subscription'
+  AND constraint_type = 'PRIMARY KEY';
+```
+
 ---
 
 ## 七、权限边界
@@ -880,7 +973,27 @@ createComment()                                              ← API 入口
 
 5. **邮件通知**：尽力交付，无重试。SMTP 发送失败后仅记日志，不会重发。
 
-6. **幂等性**：`createComment` 每次调用都生成新的 `commentId`，所以天然幂等。但 `sendCommentNotify` 中对每个 `userId` 调用 `sendCommonNotify` 也生成新的 `notificationId`，如果被多次调用（如网络超时后重试），可能导致**同一评论对同一用户产生多条通知**。
+6. **幂等性修正**：之前的结论"自然幂等"是错误的。`createComment` 每次调用都生成新的 `commentId`，**完全不具备幂等性**。代码证据：
+
+   ```typescript
+   // comment-open-api.service.ts:355
+   async createComment(tableId: string, recordId: string, createCommentRo: ICreateCommentRo) {
+     const id = generateCommentId();  // ← 函数入口第一行就生成 ID
+     // ...
+     await this.prismaService.comment.create({ data: { id, ... } });
+   }
+   ```
+
+   `generateCommentId()` 定义（`id-generator.ts:118`）：
+   ```typescript
+   export function generateCommentId() {
+     return IdPrefix.Comment + getRandomString(16);  // 随机字符串，每次调用不同
+   }
+   ```
+
+   **后果**：如果用户因为 API 返回 500（查询阶段失败）而重试发送评论，每次重试都会在 DB 中插入一条新评论——**产生重复评论**。这是一个真实的 bug，不是理论风险。
+
+   相比之下，`sendCommentNotify` 中对每个 `userId` 调用 `sendCommonNotify` 也生成新的 `notificationId`，如果被多次调用（如网络超时后重试），确实会导致**同一评论对同一用户产生多条通知**。
 
 ### 9.8 unhandledRejection → uncaughtException 的进程级错误传播路径
 
@@ -1059,6 +1172,9 @@ await this.sendCommentNotify(tableId, recordId, commentId, {
 | 创建评论 OpenAPI | `packages/openapi/src/comment/create.ts` |
 | 评论迁移 SQL | `packages/db-main-prisma/prisma/postgres/migrations/20240919032636_add_comment/migration.sql` |
 | CommentSubscription Prisma 模型 | `packages/db-main-prisma/prisma/postgres/schema.prisma:757` |
+| CommentSubscription 补主键迁移 | `packages/db-main-prisma/prisma/postgres/migrations/20250509062715_require_primary_key/migration.sql` |
+| CommentSubscription 移除默认值迁移 | `packages/db-main-prisma/prisma/postgres/migrations/20250922111648_add_indexes/migration.sql` |
+| ID 生成器 | `packages/core/src/utils/id-generator.ts` |
 
 ---
 
@@ -1089,3 +1205,7 @@ await this.sendCommentNotify(tableId, recordId, commentId, {
 10. **unhandledRejection → uncaughtException 的升级链**：进程级错误传播路径设计特殊。`unhandledRejection` 监听器中不仅记日志，还会 `throw reason`，将异步 Promise 拒绝主动升级为同步未捕获异常，进而触发 `uncaughtException`。`uncaughtException` 监听器只记日志、不退出进程，违反 Node.js 最佳实践——异常发生后进程状态可能已损坏，但仍带病继续运行。
 
 11. **创建与更新的失败策略不一致**：`createComment` 顺序是「写评论 → 查询通知 → 实时推送」，查询失败时实时推送不会发送，其他用户看不到更新；而 `updateComment` 顺序是「写评论 → 实时推送 → 查询通知」，查询失败时实时推送已经发了，其他用户能看到更新但通知不会发送。两种操作没有统一的失败处理策略，会导致用户在不同场景下看到不一致的现象。
+
+12. **createComment 完全不具备幂等性**：函数入口第一行就调用 `generateCommentId()` 生成随机 ID，每次调用都会产生不同的 ID。这意味着如果查询阶段失败导致 API 返回 500，用户重试时会在 DB 中插入多条不同的评论——**产生重复评论是真实的 bug，不是理论风险**。
+
+13. **comment_subscription 的三次结构演变**：从 2024 年 9 月的无主键表（只有 `table_id`/`record_id`/`created_by`/`created_time`）→ 2025 年 5 月补 `id` 主键（PostgreSQL 原生 `md5(random()::text)` 默认值）→ 2025 年 9 月移除默认值。当前 Prisma schema 使用 `@id @default(cuid())` 应用级别生成 ID。线上结构可通过 `information_schema.columns` 查询 `id` 列的 `column_default` 来判断处于哪个阶段。

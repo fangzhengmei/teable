@@ -82,8 +82,44 @@ table-open-api.service.ts :500-527  deleteTable()
   tableMeta.update({
     data: { version + 1, deletedTime, provisionState: 'deleting', lastModifiedBy }
   })
-  saveRawOps(baseId, RawOpType.Del, ...)     // 写操作日志
+  saveRawOps(baseId, RawOpType.Del, IdPrefix.Table, [{ docId: tableId, version }])
+  //   ↑ 关键：saveRawOps 只写操作日志，不直接写 trash 表
 ```
+
+#### 1.2.1 Trash 索引表的写入链路（V1 异步事件驱动）
+
+**⚠️ 关键修正：V1 路径中 `trash` 表不是在 `deleteTable` 中直接写入**。
+
+完整链路经过三层中转：
+
+```
+tableService.deleteTable()
+  → saveRawOps(baseId, RawOpType.Del, IdPrefix.Table, ...)
+    → 写入 raw_ops 表（操作日志）
+    → share-db.service.ts :80  bindAfterTransaction()
+        → 事务提交后触发 eventEmitterService.ops2Event(ops)
+          → event-emitter.service.ts :85  ops2Event()
+            → rawOpType=Del + docId 前缀=IdPrefix.Table
+              → 映射为 Events.TABLE_DELETE
+              → 发射 TableDeleteEvent
+                → trash.listener.ts :20  @OnEvent(Events.TABLE_DELETE, { async: true })
+                    → TrashListener.onEvent()
+                      → 从 DB 查出 deletedTime（因为事件是异步的，此时事务已提交）
+                      → prisma.trash.create({
+                          resourceId: tableId,
+                          resourceType: ResourceType.Table,
+                          parentId: table.baseId,
+                          deletedTime: table.deletedTime,
+                          deletedBy: user.id,
+                        })
+```
+
+**关键细节**：
+1. `TrashListener` 监听 5 种事件：`SPACE_DELETE` / `BASE_DELETE` / `TABLE_DELETE` / `APP_DELETE` / `WORKFLOW_DELETE`（`trash.listener.ts :18-22`）
+2. 事件是 `{ async: true }` 异步监听，**在事务提交之后执行**——因此能查到 `deletedTime`
+3. 如果 `payload.permanent === true`（永久删除），监听器直接 `return`，不写 `trash` 索引
+4. 监听器从 DB 重新查出 `deletedTime`（而非从事件 payload 传递），保证时间戳准确
+5. `parentId` 根据资源类型不同取值：Space 无父级，Base 取 `spaceId`，Table/App/Workflow 取 `baseId`
 
 ### 1.3 恢复：按同一 `deletedTime` 精确匹配批量恢复
 
@@ -379,14 +415,55 @@ RestoreRecordsHandler.ts :55-112  handle()
   ]))
 ```
 
+#### 2.6.1 V2 `cleanupTrashRecordIds` 的实际实现（Repository 层）
+
+**⚠️ 关键修正：V2 清理只删除 `record_trash`，不删除 `table_trash`。**
+
+`PostgresTableRecordRepository.insertMany()` 内部（`adapter-table-repository-postgres/src/record/repository/PostgresTableRecordRepository.ts :1476`）：
+
+```
+  if (options?.cleanupTrashRecordIds?.length) {
+    await cleanupRestoredRecordTrash(
+      db,
+      table.id().toString(),
+      options.cleanupTrashRecordIds    // recordId[]
+    );
+  }
+```
+
+`cleanupRestoredRecordTrash` 函数实现（`:192-206`）：
+
+```
+const cleanupRestoredRecordTrash = async (
+  db: Kysely<DynamicDB> | Transaction<DynamicDB>,
+  tableId: string,
+  recordIds: ReadonlyArray<string>
+): Promise<void> => {
+  if (recordIds.length === 0) return;
+
+  const restoredRecordIds = Array.from(new Set(recordIds));  // 去重
+  await db
+    .deleteFrom('record_trash')              // ← 只删 record_trash
+    .where('table_id', '=', tableId)
+    .where('record_id', 'in', restoredRecordIds)  // ← 按 record_id 匹配，非按快照行 ID
+    .execute();
+};
+```
+
+**V2 清理 vs V1 清理的关键差异**：
+- V1 按**快照行 ID**（`record_trash.id`）精确删除匹配的快照条目
+- V2 按**原记录 ID**（`record_trash.record_id`）删除该记录在 `record_trash` 中的所有快照
+- V2 不删 `table_trash`——`table_trash` 的清理由上层调用方（`trash.service`）在恢复流程结束后处理
+
 ### 2.7 V1 vs V2 垃圾清理对比
 
 | | V1 | V2 |
 |---|---|---|
-| **清理位置** | `trash.service` 显式调用 | `TableRecordRepository.insertMany()` 内部 |
-| **参数** | 匹配后的 `matchedRecordTrashRowIds` | `cleanupTrashRecordIds: recordId[]` |
+| **清理位置** | `trash.service` 显式调用 | `PostgresTableRecordRepository.insertMany()` 内部 |
+| **参数** | 匹配后的 `matchedRecordTrashRowIds`（快照行 ID） | `cleanupTrashRecordIds: recordId[]`（原记录 ID） |
+| **匹配方式** | `record_trash.id IN (...)` — 按快照行 ID 精确删除 | `record_trash.record_id IN (...)` — 按原记录 ID 删除所有快照 |
 | **事务** | `trash.service` 开启 `dataPrismaService.$tx` | Repository 层 `unitOfWork.withTransaction` |
-| **清理内容** | `record_trash` + `table_trash` 一起删 | 仅 `record_trash`（`table_trash` 由上层清） |
+| **清理内容** | `record_trash` + `table_trash` 在同一事务中一起删 | **仅** `record_trash`；`table_trash` 由上层清 |
 | **大事务保护** | `bigTransactionTimeout` | 由 UnitOfWork 管理 |
 
 ---
@@ -478,6 +555,9 @@ trash.controller.ts :45-56
 trash.controller.ts :72-85  prepareRestoreTableCanary()
 
   const decision = trashService.getRestoreTableV2Decision(trashId)
+  if (!decision) {
+    return;                              // ← 不设 cls.useV2，走 V1 路径
+  }
   cls.set('useV2', decision.useV2)
   response.setHeader('X-Teable-V2', decision.useV2)
   response.setHeader('X-Teable-V2-Reason', decision.reason)
@@ -489,16 +569,51 @@ trash.service.ts :674-714  getRestoreTableV2Decision()
   if (trashId.startsWith('opr')) return undefined     // 表内资源不走 V2 Table 路径
 
   const trash = prisma.trash.findUnique({ id: trashId })
-  if (trash.resourceType !== Table) return undefined  // 只有 Table 走分流
+  if (!trash || trash.resourceType !== Table) return undefined  // 只有 Table 走分流
+
+  const baseId = trash.parentId
+  if (!baseId) return { useV2: false, reason: 'disabled', baseId: '', tableId }  // 无父级
 
   const base = prisma.base.findUnique({
     where: { id: baseId, deletedTime: null },
     select: { spaceId: true, v2Enabled: true }
   })
+  if (!base?.spaceId) return { useV2: false, reason: 'disabled', baseId, tableId }  // Base 无 space
 
   const decision = canaryService.shouldUseV2ForBaseWithReason(base, 'restoreTable')
   return { ...decision, baseId, tableId }
 ```
+
+#### 4.2.1 V2 分支边界条件与影响链
+
+**⚠️ 关键修正：`getRestoreTableV2Decision` 返回 `undefined` 与返回 `{ useV2: false }` 是完全不同的路径。**
+
+| 决策结果 | 触发条件 | `cls.useV2` | 实际走的路径 | 影响 |
+|----------|----------|-------------|-------------|------|
+| `undefined` | `trashId` 以 `opr` 开头（表内资源）| 不设（保持原值） | V1 `restoreTrash()` → `restoreTableResource()` | 正确：表内资源恢复无 V2 路径 |
+| `undefined` | `trash` 记录不存在，或 `resourceType !== Table` | 不设 | V1 `restoreTrash()` → `restoreResource()` | 正确：Space/Base 走 V1 |
+| `{ useV2: false }` | `baseId` 为空，或 Base 无 `spaceId` | `false` | V1 `restoreTrash()` | 数据异常场景，安全回退 |
+| `{ useV2: false }` | CanaryService 灰度决策为 V1 | `false` | V1 `restoreTrash()` | 正常灰度回退 |
+| `{ useV2: true }` | CanaryService 灰度决策为 V2 | `true` | V2 `restoreTrashV2()` | 正常 V2 路径 |
+
+**`restoreTrashV2` 内部的二次决策**（`trash.service.ts :716-728`）：
+
+```
+  async restoreTrashV2(trashId: string) {
+    const decision = await this.getRestoreTableV2Decision(trashId);
+    if (!decision) {
+      // ⚠️ 如果 controller 层判断 useV2=true 但 service 层二次查询返回 undefined
+      // （理论上不应发生，但可能是并发删除导致 trash 记录消失）
+      throw new CustomHttpException(
+        `The trash ${trashId} not found`, HttpErrorCode.NOT_FOUND
+      );
+    }
+    await this.assertParentNotTrashed(decision.baseId);
+    await this.restoreTableV2(decision.baseId, decision.tableId);
+  }
+```
+
+**潜在风险**：如果 `cls.useV2` 在之前的请求中被设为 `true`（CLS 是请求级隔离的，但需确认），且当前请求的 `getRestoreTableV2Decision` 返回 `undefined`，则 `cls.useV2` 不会被显式设为 `false`。但由于 NestJS CLS 是请求级作用域，每个请求开始时 `useV2` 默认为 `undefined`（falsy），因此不会误入 V2 路径。
 
 **决策依据**：Base 的 `v2Enabled` 字段 + CanaryService 灰度配置（百分比/用户名单/环境）。
 
@@ -598,9 +713,13 @@ model Trash {
 
 | 事件 | 写入 | 清理 |
 |------|------|------|
-| Table 删除（V1） | 由 `tableService.deleteTable` 后续逻辑写入 | `restoreTrash()` 中 `prisma.trash.deleteMany({ id: trashId })` |
+| Space 删除（V1） | `TrashListener` 监听 `SPACE_DELETE` 事件异步写入 | `restoreTrash()` 中 `prisma.trash.deleteMany({ id: trashId })` |
+| Base 删除（V1） | `TrashListener` 监听 `BASE_DELETE` 事件异步写入 | `restoreTrash()` 中 `prisma.trash.deleteMany({ id: trashId })` |
+| Table 删除（V1） | `saveRawOps` → `ops2Event` → `TrashListener` 监听 `TABLE_DELETE` 异步写入 | `restoreTrash()` 中 `prisma.trash.deleteMany({ id: trashId })` |
+| App 删除（V1） | `TrashListener` 监听 `APP_DELETE` 事件异步写入 | `restoreTrash()` 中 `prisma.trash.deleteMany({ id: trashId })` |
+| Workflow 删除（V1） | `TrashListener` 监听 `WORKFLOW_DELETE` 事件异步写入 | `restoreTrash()` 中 `prisma.trash.deleteMany({ id: trashId })` |
 | Table 删除（V2） | `V2TableTrashedProjection` 写入 | `V2TableRestoredProjection` 删除 |
-| 永久删除 | — | `spaceService.permanentDeleteSpace` / `baseService.permanentDeleteBase` / `tableOpenApiService.permanentDeleteTables` 内清理 |
+| 永久删除 | 不写（`TrashListener` 检查 `permanent` 标志直接 return） | `spaceService.permanentDeleteSpace` / `baseService.permanentDeleteBase` / `tableOpenApiService.permanentDeleteTables` 内清理 |
 
 ---
 
@@ -665,7 +784,13 @@ table-open-api.service.ts  permanentDeleteTables()
 │      tableService.deleteTable(baseId, tableId, deletedTime)      │
 │      field.updateMany({ deletedTime })                           │
 │      view.updateMany({ deletedTime })                            │
-│    }                                                             │
+│    } → saveRawOps → shareDb.bindAfterTransaction                │
+│      → ops2Event → TABLE_DELETE                                  │
+│        → TrashListener (async) → prisma.trash.create()           │
+│                                                                  │
+│  Space/Base/App/Workflow 删除 (V1)                               │
+│    → emit SPACE_DELETE/BASE_DELETE/APP_DELETE/WORKFLOW_DELETE    │
+│      → TrashListener (async) → prisma.trash.create()             │
 │                                                                  │
 │  Record 删除 (V1)                                                │
 │    deleteRecords() → $tx {                                       │
@@ -687,6 +812,10 @@ table-open-api.service.ts  permanentDeleteTables()
 │                                                                  │
 │  POST /api/trash/restore/:trashId                                │
 │    → prepareRestoreTableCanary()                                 │
+│      → getRestoreTableV2Decision(trashId)                        │
+│        → undefined: cls.useV2 不设 → V1                         │
+│        → { useV2: false }: cls.useV2 = false → V1               │
+│        → { useV2: true }:  cls.useV2 = true  → V2               │
 │      → canaryService.shouldUseV2ForBaseWithReason(base,          │
 │          'restoreTable')                                         │
 │                                                                  │
@@ -703,6 +832,8 @@ table-open-api.service.ts  permanentDeleteTables()
 │                                                                  │
 │  Table 恢复 (V2)                                                 │
 │    restoreTrashV2()                                              │
+│      getRestoreTableV2Decision() — 二次验证                      │
+│        → undefined → throw NOT_FOUND                             │
 │      assertParentNotTrashed(baseId)                              │
 │      restoreTableV2() → RestoreTableHandler                      │
 │        getDeletedByIdInBase → tableRepository.restore()          │
@@ -714,12 +845,19 @@ table-open-api.service.ts  permanentDeleteTables()
 │      recordTrash.findMany()                                      │
 │      快照版本匹配 (createdTime <= trash.createdTime)             │
 │      multipleCreateRecords()       // INSERT INTO                │
-│      $tx { recordTrash.deleteMany + tableTrash.delete }          │
+│      $tx { recordTrash.deleteMany(id IN matched)                 │
+│           + tableTrash.delete(id = trashId) }                    │
 │                                                                  │
 │  Record 恢复 (V2)                                                │
 │    restoreRecordsV2() → RestoreRecordsCommand                    │
 │      → RestoreRecordsHandler                                     │
-│        insertMany({ restoreRecordsById, cleanupTrashRecordIds }) │
+│        insertMany({ restoreRecordsById,                          │
+│                     cleanupTrashRecordIds })                     │
+│          → PostgresTableRecordRepository:                        │
+│            INSERT INTO table + cleanupRestoredRecordTrash()      │
+│            → record_trash.deleteFrom()                           │
+│              .where('record_id', 'in', ids)                      │
+│              // ⚠️ 只删 record_trash，不删 table_trash          │
 │        emit RecordsBatchCreated                                  │
 │                                                                  │
 └──────────────────────────────────────────────────────────────────┘

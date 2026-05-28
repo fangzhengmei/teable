@@ -1,288 +1,591 @@
-# Teable Trash & Restore 机制全解析
+# Teable Trash & Restore 机制全解析（完整代码路径追踪）
 
 ## 重点摘要
 
-本文档围绕 **三个核心要点** 深入解析 Teable 的 Trash & Restore 机制：
+本文档从**完整代码链路**深度解析 Teable 的 Trash & Restore 机制，核心围绕两个设计原则：
 
-| 要点 | 核心机制 | 关键代码位置 |
-|------|----------|--------------|
-| **V1/V2 分流** | `CanaryService` 根据 Base 的 `v2Enabled` 标志 + 灰度配置决策路径 | `trash.controller.ts:prepareRestoreTableCanary()` → `canaryService.shouldUseV2ForBaseWithReason()` |
-| **deletedTime 级联恢复** | 删除时 table/field/view 共享同一 `deletedTime` 时间戳，恢复时精确匹配批量清除 | `table-open-api.service.ts:restoreTable()` → `updateMany({ deletedTime })` |
-| **垃圾清理** | 恢复后在同一事务中删除 `record_trash`（快照内容）和 `table_trash`（操作索引） | `trash.service.ts:874` / `RestoreRecordsHandler.ts` `cleanupTrashRecordIds` |
-
----
-
-## 1. 整体架构概览
-
-Teable 的 Trash/Restore 系统采用**软删除 + 快照持久化**的双重策略，分为两个层级：
-
-| 层级 | 数据库 | 主要表 | 管理对象 |
-|------|--------|--------|----------|
-| **Space/Base/Table 级** | 主库（meta DB） | `trash` | Space、Base、Table 的删除/恢复 |
-| **Table 内资源级** | 数据库（data DB） | `table_trash` + `record_trash` | View、Field、Record 的删除/恢复 |
-
-关键代码分布：
-
-```
-apps/nestjs-backend/src/features/trash/
-├── trash.controller.ts              # REST API 入口
-├── trash.service.ts                 # 核心业务逻辑（V1 + 路由分发）
-├── v2-table-trash.service.ts        # V2 领域事件投影（CQRS）
-├── v2-record-trash.service.ts       # V2 记录快照持久化
-├── v2-trash-record-name.ts          # V2 记录显示名解析
-└── listener/
-    └── table-trash.listener.ts      # V1 事件监听：记录/字段/视图删除快照
-
-packages/v2/core/src/
-├── commands/
-│   ├── RestoreTableCommand.ts       # 恢复表格命令定义
-│   ├── RestoreTableHandler.ts       # 恢复表格命令处理器
-│   ├── RestoreRecordsCommand.ts     # 恢复记录命令定义
-│   ├── RestoreRecordsHandler.ts     # 恢复记录命令处理器
-│   ├── RestoreRecordsStreamCommand.ts   # 流式恢复记录命令
-│   └── RestoreRecordsStreamHandler.ts   # 流式恢复记录处理器
-├── domain/table/
-│   ├── Table.ts                     # markTrashed() / markRestored()
-│   └── events/
-│       ├── TableTrashed.ts          # 表格软删除领域事件
-│       └── TableRestored.ts         # 表格恢复领域事件
-└── ports/
-    ├── TableRepository.ts           # restore() 端口定义
-    └── TableRecordRepository.ts     # insertMany() 带 restore 选项
-```
+| 原则 | 适用对象 | 实现机制 | 关键代码位置 |
+|------|----------|----------|--------------|
+| **统一软删除标记** | Space/Base/Table/Field/View | 所有可删除实体共用 `deletedTime: DateTime?` 字段，`null`=活跃，非空=已删除 | `packages/db-main-prisma/prisma/template.prisma` 中各模型 |
+| **物理删除 + 快照恢复** | Record（数据表记录） | 不设软删除标记，直接从数据表物理删除，恢复依赖 `table_trash` + `record_trash` 快照 | `record.service.ts:batchDeleteRecords` → `DELETE FROM table` |
 
 ---
 
-## 2. 软删除标记机制
+## 1. 架构分层与代码路径总览
 
-### 2.1 deletedTime 字段 — 统一的软删除标记
+### 1.1 层级架构
 
-Teable 没有使用布尔型 `isDeleted` 标记，而是在所有可删除实体上统一使用 `deletedTime: DateTime?` 字段：
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    REST API 层 (Controller)                   │
+│  trash.controller.ts → POST /api/trash/restore/:trashId       │
+├──────────────────────────────────────────────────────────────┤
+│              Service 层 (业务逻辑 + 路径分发)                  │
+│  ├─ trash.service.ts              (V1 主逻辑 + V1/V2 分流)    │
+│  ├─ v2-table-trash.service.ts      (V2 领域事件投影)          │
+│  ├─ v2-record-trash.service.ts     (V2 记录快照持久化)        │
+│  ├─ table-open-api.service.ts      (V1 Table 删除/恢复)       │
+│  ├─ table-open-api-v2.service.ts   (V2 Table 删除/恢复)       │
+│  ├─ field-open-api.service.ts      (字段恢复 + 依赖排序)      │
+│  ├─ record-delete.service.ts       (V1 记录删除)              │
+│  ├─ record-open-api.service.ts     (V1 记录恢复)              │
+│  └─ view.service.ts                (视图恢复)                 │
+├──────────────────────────────────────────────────────────────┤
+│              Domain 层 (V2 核心)                              │
+│  ├─ Table.ts → markTrashed() / markRestored()                 │
+│  ├─ 领域事件: TableTrashed / TableRestored / RecordsDeleted   │
+│  └─ 命令处理器: RestoreTableHandler / RestoreRecordsHandler   │
+├──────────────────────────────────────────────────────────────┤
+│              Repository 层 (数据访问)                         │
+│  ├─ TableRepository.restore()                                 │
+│  ├─ TableRecordRepository.insertMany({ cleanupTrashRecordIds })│
+│  └─ Prisma 元数据操作                                          │
+└──────────────────────────────────────────────────────────────┘
+```
 
-| 模型 | deletedTime 语义 |
-|------|------------------|
-| `Space` | `null` = 活跃，非空 = 已软删除 |
-| `Base` | 同上 |
-| `TableMeta` | 同上，额外有索引 `@@index([baseId, deletedTime])` |
-| `Field` | 同上，`@@index([tableId, deletedTime])` |
-| `View` | 同上 |
-| `Record`（数据表） | **物理删除**，不设软删除标记，依赖快照恢复 |
+### 1.2 代码调用链全景
 
-**设计要点**：
-- `deletedTime` 记录精确的删除时刻，而非布尔值，便于后续按时间筛选和清理
-- TableMeta 还有 `permanentDeletedTime` 字段，用于区分软删除与永久删除
-- 删除时同步将 `provisionState` 设为 `deleting`，恢复时设回 `ready`
+```
+删除路径:
+  Table 删除: deleteTable(baseId, tableId)
+    → detachLink()
+    → deletedTime = new Date() 「同一时间戳」
+    → tableService.deleteTable(..., deletedTime)  → table_meta.deletedTime
+    → prisma.field.updateMany({ deletedTime })     → field.deletedTime
+    → prisma.view.updateMany({ deletedTime })      → view.deletedTime
+    → (写入 trash 表索引)
 
-### 2.2 Trash 表 — 删除索引
+  Record 删除 (V1): deleteRecords(tableId, recordIds)
+    → getRecordsById() 「保存快照」
+    → batchDeleteRecords() 「物理删除: DELETE FROM table」
+    → emit OPERATION_RECORDS_DELETE 事件
+        → TableTrashListener.recordDeleteListener()
+            → tableTrash.create  { snapshot: JSON.stringify(recordIds) }
+            → recordTrash.createMany { snapshot: JSON.stringify(fullRecord) }
+
+  Record 删除 (V2): DeleteRecordsCommand → DeleteRecordsHandler
+    → tableRecordRepository.deleteMany() 「物理删除」
+    → RecordsDeleted 事件
+        → V2RecordsDeletedTableTrashProjection.persistDeletedRecords()
+            → tableTrash.insertInto
+            → recordTrash.insertInto （分批次，每批 5000 条）
+
+恢复路径:
+  Table 恢复 (V1): restoreTable(baseId, tableId)
+    → const { deletedTime } = trash.findFirst() 「获取删除时的时间戳」
+    → tableService.restoreTable()                  → deletedTime = null
+    → prisma.field.updateMany({ tableId, deletedTime }, { deletedTime: null })
+    → prisma.view.updateMany({ tableId, deletedTime }, { deletedTime: null })
+
+  Record 恢复 (V1): restoreTableResource(trashId)
+    → recordTrash.findMany() 「按 createdTime <= trash.createdTime 匹配快照」
+    → multipleCreateRecords() 「重新插入: INSERT INTO table」
+    → $tx: recordTrash.deleteMany() + tableTrash.delete() 「原子清理快照」
+
+  Record 恢复 (V2): RestoreRecordsCommand → RestoreRecordsHandler
+    → buildTableRecords() 「构建领域对象」
+    → tableRecordRepository.insertMany({ cleanupTrashRecordIds }) 「Repository 内部清理」
+```
+
+---
+
+## 2. 统一软删除标记机制：`deletedTime: DateTime?`
+
+### 2.1 Prisma Schema 定义
+
+**所有可删除实体采用完全相同的软删除模式**，在 `packages/db-main-prisma/prisma/template.prisma` 中统一定义：
 
 ```prisma
-model Trash {
-  id           String   @id @default(cuid())
-  resourceType String   @map("resource_type")   // "space" | "base" | "table"
-  resourceId   String   @map("resource_id")      // 被删资源的 ID
-  parentId     String?  @map("parent_id")         // 父资源 ID（Base→SpaceId, Table→BaseId）
-  deletedTime  DateTime @default(now()) @map("deleted_time")
-  deletedBy    String   @map("deleted_by")
-  @@unique([resourceType, resourceId])
+model Space {
+  deletedTime      DateTime? @map("deleted_time")   // ← 软删除标记
+}
+
+model Base {
+  deletedTime      DateTime?   @map("deleted_time") // ← 软删除标记
+}
+
+model TableMeta {
+  deletedTime       DateTime?           @map("deleted_time")  // ← 软删除标记
+  @@index([baseId, deletedTime])                         // 查询索引
+}
+
+model Field {
+  deletedTime         DateTime? @map("deleted_time")  // ← 软删除标记
+  @@index([tableId, deletedTime])                    // 查询索引
+}
+
+model View {
+  deletedTime         DateTime? @map("deleted_time")  // ← 软删除标记
 }
 ```
 
-- `Trash` 表是**顶层资源的删除索引**，不存快照内容
-- `parentId` 记录层级关系，用于恢复时的**父级存在性校验**
-- 唯一约束 `(resourceType, resourceId)` 防止重复删除条目
+### 2.2 语义统一
 
-### 2.3 TableTrash + RecordTrash — 表内资源的快照存储
+| deletedTime 值 | 语义 | 查询条件 |
+|----------------|------|----------|
+| `null` | 活跃（正常） | `where: { deletedTime: null }` |
+| 非空 Date | 已软删除 | `where: { deletedTime: { not: null } }` |
 
-```prisma
-model TableTrash {
-  id           String   @id @default(cuid())
-  tableId      String   @map("table_id")
-  resourceType String   @map("resource_type")   // "view" | "field" | "record"
-  snapshot     String   @map("snapshot")          // JSON 快照
-  createdTime  DateTime @default(now()) @map("created_time")
-  createdBy    String   @map("created_by")
-}
+### 2.3 删除时的原子性标记（V1 Table 删除）
 
-model RecordTrash {
-  id          String   @id @default(cuid())
-  tableId     String   @map("table_id")
-  recordId    String   @map("record_id")
-  snapshot    String   @map("snapshot")            // 完整记录快照 JSON
-  createdTime DateTime @default(now()) @map("created_time")
-  createdBy   String   @map("created_by")
-}
-```
+**核心设计**：删除时 Table/Field/View 共享**同一个精确到毫秒的 `deletedTime` 时间戳**，保证级联恢复的原子性。
 
-**快照内容差异**：
-- **View**: snapshot = `JSON.stringify([viewId])`，仅存 ID
-- **Field**: snapshot = `JSON.stringify({ fields: IFieldVo[], records?: IRecord[] })`，存字段定义 + 关联记录数据
-- **Record**: `table_trash.snapshot` 存记录 ID 列表，`record_trash.snapshot` 存完整记录 JSON
-
----
-
-## 3. Restore 主流程与依赖顺序重建
-
-### 3.1 API 入口与 V1/V2 分流（CanaryService 灰度控制）
-
-```
-POST /api/trash/restore/:trashId
-  └─ TrashController.restoreTrash()
-       ├─ prepareRestoreTableCanary()  → 判断是否走 V2
-       │    └─ canaryService.shouldUseV2ForBaseWithReason(base, 'restoreTable')
-       ├─ V2 路径 → trashService.restoreTrashV2(trashId)
-       │    └─ assertParentNotTrashed()
-       │    └─ restoreTableV2() → tableOpenApiV2Service.restoreTable()
-       │         └─ RestoreTableCommand → RestoreTableHandler
-       └─ V1 路径 → trashService.restoreTrash(trashId)
-            ├─ trashId 以 "opr" 开头 → restoreTableResource()（表内资源）
-            └─ 否则 → restoreResource()（Space/Base/Table）
-```
-
-**⚠️ V1/V2 分流的关键逻辑完全在 CanaryService**：
-- 决策入口：`getRestoreTableV2Decision(trashId)` → `canaryService.shouldUseV2ForBaseWithReason(base, 'restoreTable')`
-- 决策依据：Base 的 `v2Enabled` 标志 + 灰度配置（按百分比、按用户名单等）
-- 结果通过 `X-Teable-V2` 响应头返回给前端
-
-决策完整流程：
-```typescript
-// trash.service.ts:674
-async getRestoreTableV2Decision(trashId: string) {
-  const trash = await prisma.trash.findUnique({ where: { id: trashId } });
-  const baseId = trash.parentId;
-  const base = await prisma.base.findUnique({ where: { id: baseId, deletedTime: null } });
-  return this.canaryService.shouldUseV2ForBaseWithReason(base, 'restoreTable');
-}
-```
-
-### 3.2 Space/Base/Table 恢复流程
-
-#### Space 恢复
+完整代码路径：
 
 ```typescript
-// trash.service.ts:569
-private async restoreSpace(spaceId: string) {
-  // 1. 权限校验
-  await this.permissionService.validPermissions(spaceId, ['space|create'], ...);
-  // 2. 直接清空 deletedTime
-  await this.prismaService.txClient().space.update({
-    where: { id: spaceId },
-    data: { deletedTime: null },
+// apps/nestjs-backend/src/features/table/open-api/table-open-api.service.ts:500
+async deleteTable(baseId: string, tableId: string) {
+  await this.detachLink(tableId);  // 先解除 Link 字段关联
+
+  return await this.prismaService.$tx(async (prisma) => {
+    // ⚠️ 关键：只生成一个时间戳，全表共享
+    const deletedTime = new Date();
+
+    // 1. Table 标记删除
+    await this.tableService.deleteTable(baseId, tableId, deletedTime);
+    // → table_meta.deletedTime = deletedTime
+    // → provisionState = 'deleting'
+
+    // 2. 所有 Field 标记删除（同一时间戳）
+    await prisma.field.updateMany({
+      where: { tableId, deletedTime: null },  // 只更新当前活跃的
+      data: { deletedTime },                  // 精确时间戳
+    });
+
+    // 3. 所有 View 标记删除（同一时间戳）
+    await prisma.view.updateMany({
+      where: { tableId, deletedTime: null },  // 只更新当前活跃的
+      data: { deletedTime },                  // 精确时间戳
+    });
   });
 }
 ```
 
-#### Base 恢复（含冲突检测）
+`tableService.deleteTable` 内部实现：
 
 ```typescript
-// trash.service.ts:579
-private async restoreBase(baseId: string) {
-  // 1. 权限校验
-  // 2. 查找 Base 所属 Space
-  const base = await prisma.base.findUniqueOrThrow({ ... });
-  // 3. 冲突检测：检查父级 Space 是否也在垃圾箱中
-  const trashedSpace = await prisma.trash.findFirst({
-    where: { resourceId: base.spaceId, resourceType: TrashType.Space },
+// apps/nestjs-backend/src/features/table/table.service.ts:287
+async deleteTable(baseId: string, tableId: string, deletedTime: Date) {
+  const result = await this.prismaService.txClient().tableMeta.findFirst({
+    where: { id: tableId, baseId, deletedTime: null },  // 确保当前是活跃的
   });
-  if (trashedSpace != null) {
-    throw new CustomHttpException(
-      'Unable to restore this base because its parent space is also trashed',
-      HttpErrorCode.VALIDATION_ERROR,
-      { localization: { i18nKey: 'httpErrors.trash.parentSpaceTrashed' } }
+
+  await this.prismaService.txClient().tableMeta.update({
+    where: { id: tableId, baseId },
+    data: {
+      version: version + 1,
+      deletedTime,          // 使用传入的时间戳
+      lastModifiedBy: userId,
+      provisionState: ProvisionState.deleting,
+    },
+  });
+
+  // 记录操作历史
+  await this.batchService.saveRawOps(baseId, RawOpType.Del, IdPrefix.Table, [
+    { docId: tableId, version },
+  ]);
+}
+```
+
+### 2.4 恢复时的精确匹配（V1 Table 恢复）
+
+恢复时通过**精确匹配同一 `deletedTime`** 实现级联恢复：
+
+```typescript
+// apps/nestjs-backend/src/features/table/open-api/table-open-api.service.ts:529
+async restoreTable(baseId: string, tableId: string) {
+  return await this.prismaService.$tx(async (prisma) => {
+    // 1. 从 trash 表获取删除时的精确时间戳
+    const { deletedTime } = await prisma.trash.findFirstOrThrow({
+      where: { resourceId: tableId, resourceType: ResourceType.Table },
+    });
+
+    if (!deletedTime) {
+      throw new CustomHttpException(
+        'Unable to restore this table because it is not in the trash',
+        HttpErrorCode.VALIDATION_ERROR,
+      );
+    }
+
+    // 2. 恢复 Table 本身
+    await this.tableService.restoreTable(baseId, tableId);
+    // → deletedTime = null
+    // → provisionState = 'ready'
+
+    // 3. ⚠️ 只恢复「这次删除」的字段（精确时间戳匹配）
+    await prisma.field.updateMany({
+      where: { tableId, deletedTime },  // 精确匹配删除时的时间戳
+      data: { deletedTime: null },      // 清空标记
+    });
+
+    // 4. ⚠️ 只恢复「这次删除」的视图（精确时间戳匹配）
+    await prisma.view.updateMany({
+      where: { tableId, deletedTime },  // 精确匹配删除时的时间戳
+      data: { deletedTime: null },      // 清空标记
+    });
+  });
+}
+```
+
+**设计合理性分析**：
+- 表格可能多次删除→恢复→再删除，每次删除有不同的 `deletedTime`
+- 恢复时精确匹配时间戳，确保只恢复"这次删除"的字段和视图
+- 如果使用 `where: { deletedTime: { not: null } }` 会错误地恢复所有历史删除批次
+
+---
+
+## 3. Record 物理删除 + 快照恢复
+
+### 3.1 设计原则：Record 不走软删除
+
+与 Space/Base/Table/Field/View 不同，**数据表中的 Record 记录不使用软删除**：
+- 数据表可能有百万/千万级记录，软删除会导致数据膨胀
+- 查询时需要额外过滤 `WHERE deleted_time IS NULL`，影响性能
+- 恢复时需要重建索引和关联，快照恢复更可靠
+
+### 3.2 V1 记录删除完整路径
+
+```typescript
+// apps/nestjs-backend/src/features/record/record-modify/record-delete.service.ts:30
+async deleteRecords(tableId: string, recordIds: string[], windowId?: string) {
+  const table = await this.tableDomainQueryService.getTableDomainById(tableId);
+
+  const { records: recordsForEvent, orders } = await this.prismaService.$tx(async () => {
+    // 1. 先查询完整记录，保存快照（用于事件和恢复）
+    const recordsForEvent = await this.recordService.getRecordsById(
+      tableId, recordIds, false, false
+    );
+
+    // 2. 处理 Link 字段关联更新
+    const cellContextsByTableId = await this.linkService.getDeleteRecordUpdateContext(
+      tableId, recordsForEvent.records
+    );
+
+    // 3. 获取记录在视图中的行序（恢复时用）
+    const orders = windowId
+      ? await this.recordService.getRecordIndexes(table, recordIds)
+      : undefined;
+
+    // 4. ⚠️ 物理删除记录（DELETE FROM table WHERE __id IN (...)）
+    await this.computedOrchestrator.computeCellChangesForRecordsMulti(
+      sources, async () => {
+        await this.recordService.batchDeleteRecords(tableId, recordIds);
+      }
+    );
+
+    return { records: recordsForEvent, orders };
+  });
+
+  // 5. 发布删除事件，触发 TableTrashListener 写入快照
+  this.eventEmitterService.emitAsync(Events.OPERATION_RECORDS_DELETE, {
+    operationId: generateOperationId(),
+    windowId,
+    tableId,
+    userId: this.cls.get('user.id'),
+    records: recordsForEvent.records.map((record, index) => ({
+      ...record,
+      order: orders?.[index],
+    })),
+  });
+}
+```
+
+物理删除核心实现：
+
+```typescript
+// apps/nestjs-backend/src/features/record/record.service.ts:1123
+async batchDeleteRecords(tableId: string, recordIds: string[]) {
+  const dbTableName = await this.getDbTableName(tableId);
+
+  // 1. 先查版本号（用于乐观锁）
+  const nativeQuery = this.knex(dbTableName)
+    .select('__id as id', '__version as version')
+    .whereIn('__id', recordIds)
+    .toQuery();
+  const recordRaw = await this.dataPrismaService
+    .txClient()
+    .$queryRawUnsafe<{ id: string; version: number }[]>(nativeQuery);
+
+  // 2. 记录操作历史
+  const dataList = recordIds.map((recordId) => ({
+    docId: recordId,
+    version: recordRawMap[recordId].version,
+  }));
+  await this.batchService.saveRawOps(tableId, RawOpType.Del, IdPrefix.Record, dataList);
+
+  // 3. ⚠️ 物理删除（真正的 DELETE SQL）
+  await this.batchDel(tableId, recordIds);
+}
+```
+
+### 3.3 快照持久化（V1 监听器）
+
+删除事件触发后，`TableTrashListener` 异步写入快照：
+
+```typescript
+// apps/nestjs-backend/src/features/trash/listener/table-trash.listener.ts:19
+@OnEvent(Events.OPERATION_RECORDS_DELETE)
+async recordDeleteListener(payload: IDeleteRecordsPayload) {
+  const { operationId, userId, tableId, records } = payload;
+  const recordIds = records.map((record) => record.id);
+  const createdTime = new Date();
+
+  // ⚠️ 同一事务写入 table_trash 和 record_trash
+  await this.dataPrismaService.$tx(async (prisma) => {
+    // 1. 写入 table_trash 索引表
+    await prisma.tableTrash.create({
+      data: {
+        id: operationId,              // 操作 ID，用于定位
+        tableId,
+        createdBy: userId,
+        resourceType: ResourceType.Record,
+        snapshot: JSON.stringify(recordIds),  // 仅存记录 ID 列表
+        createdTime,
+      },
+    });
+
+    // 2. 写入 record_trash 快照表（批量，每批 5000 条）
+    const batchSize = 5000;
+    for (let i = 0; i < records.length; i += batchSize) {
+      const batch = records.slice(i, i + batchSize);
+      await prisma.recordTrash.createMany({
+        data: batch.map((record) => ({
+          id: generateRecordTrashId(),  // 每条快照独立 ID
+          tableId,
+          recordId: record.id,          // 原记录 ID
+          snapshot: JSON.stringify(record),  // ⚠️ 完整记录 JSON 快照
+          createdBy: userId,
+          createdTime,                  // ⚠️ 同一 createdTime
+        })),
+      });
+    }
+  });
+}
+```
+
+### 3.4 V2 记录删除路径
+
+V2 通过领域事件驱动，快照由投影处理器持久化：
+
+```typescript
+// packages/v2/core/src/commands/DeleteRecordsHandler.ts:66
+async handle(context, command) {
+  // ...
+  // 1. 物理删除
+  const deleteResult = yield* await this.unitOfWork.withTransaction(
+    context,
+    async (transactionContext) => {
+      return await handler.tableRecordRepository.deleteMany(
+        transactionContext, table, scopedDeleteSpec
+      );
+    }
+  );
+
+  // 2. 发布领域事件
+  const events: IDomainEvent[] = [
+    RecordsDeleted.create({
+      tableId: table.id(),
+      baseId: table.baseId(),
+      recordIds: deletedRecordIds,
+      recordSnapshots,  // ⚠️ 携带完整快照
+      orchestration: { ... },
+    }),
+  ];
+  yield* await handler.eventBus.publishMany(context, events);
+}
+```
+
+V2 投影处理器写入快照：
+
+```typescript
+// apps/nestjs-backend/src/features/trash/v2-table-trash.service.ts:48
+@ProjectionHandler(RecordsDeleted)
+export class V2RecordsDeletedTableTrashProjection implements IEventHandler<RecordsDeleted> {
+  async handle(context: IExecutionContext, event: RecordsDeleted) {
+    const records = event.recordSnapshots.map((snapshot) => {
+      const record: IDeleteRecordsPayload['records'][number] = {
+        id: snapshot.id,
+        fields: snapshot.fields as IRecord['fields'],
+        version: snapshot.version,
+        autoNumber: snapshot.autoNumber,
+        createdTime: snapshot.createdTime,
+        createdBy: snapshot.createdBy,
+        lastModifiedTime: snapshot.lastModifiedTime,
+        lastModifiedBy: snapshot.lastModifiedBy,
+        order: snapshot.orders,
+      };
+      if (snapshot.displayName) record.name = snapshot.displayName;
+      return record;
+    });
+
+    await this.v2RecordTrashService.persistDeletedRecords(
+      {
+        operationId: generateOperationId(),
+        windowId: context.windowId,
+        tableId: event.tableId.toString(),
+        userId: context.actorId.toString(),
+        records,
+      },
+      context
     );
   }
-  // 4. 清空 deletedTime
-  await prisma.base.update({ where: { id: baseId }, data: { deletedTime: null } });
-  // 5. 清除性能缓存
-  this.performanceCacheService.del(generateBaseNodeListCacheKey(baseId));
 }
 ```
 
-#### Table 恢复（V1）
+### 3.5 V1 记录恢复 + 垃圾清理
+
+恢复时先匹配快照版本，再重新插入，最后原子清理快照：
 
 ```typescript
-// table-open-api.service.ts:529
-async restoreTable(baseId: string, tableId: string) {
-  const { deletedTime } = await prisma.trash.findFirstOrThrow({
-    where: { resourceId: tableId, resourceType: ResourceType.Table },
+// apps/nestjs-backend/src/features/trash/trash.service.ts:822
+case TableTrashType.Record: {
+  const recordIds = snapshot as string[];
+
+  // 1. 查找所有可能的快照（同一 recordId 可能有多条历史快照）
+  const recordTrashRows = await this.dataPrismaService.recordTrash.findMany({
+    where: { tableId, recordId: { in: recordIds } },
+    orderBy: [{ recordId: 'asc' }, { createdTime: 'desc' }, { id: 'desc' }],
   });
-  // 1. 恢复 Table 本身（清 deletedTime + provisionState → ready）
-  await this.tableService.restoreTable(baseId, tableId);
-  // 2. 恢复该 Table 下所有字段（按同一 deletedTime 匹配）
-  await prisma.field.updateMany({
-    where: { tableId, deletedTime },
-    data: { deletedTime: null },
-  });
-  // 3. 恢复该 Table 下所有视图（按同一 deletedTime 匹配）
-  await prisma.view.updateMany({
-    where: { tableId, deletedTime },
-    data: { deletedTime: null },
-  });
+
+  // 2. ⚠️ 快照版本匹配：只取 createdTime <= 当前 trash 操作时间的最近快照
+  const latestSnapshotsByRecordId = recordTrashRows.reduce<
+    Map<string, IRecordTrashSnapshotRow>
+  >((acc, row) => {
+    // 同一条记录可能多次删除-恢复-再删除
+    // 只有 createdTime <= 本次 trashItem.createdTime 且未被匹配过的才取
+    if (row.createdTime <= createdTime && !acc.has(row.recordId)) {
+      acc.set(row.recordId, row);
+    }
+    return acc;
+  }, new Map());
+
+  // 3. 提取匹配的快照
+  const matchedRecordTrashRows = recordIds
+    .map((recordId) => latestSnapshotsByRecordId.get(recordId))
+    .filter((row): row is IRecordTrashSnapshotRow => row != null);
+  const records = matchedRecordTrashRows.map(({ snapshot }) => JSON.parse(snapshot));
+
+  // 4. V1 路径：物理插入
+  await this.recordOpenApiService.multipleCreateRecords(
+    tableId,
+    {
+      fieldKeyType: FieldKeyType.Id,
+      records,
+      typecast: true,
+    },
+    true
+  );
+
+  // 5. ⚠️ 原子清理快照（同一事务）
+  await this.dataPrismaService.$tx(
+    async (prisma) => {
+      // 删除已恢复的 record_trash 快照条目
+      await prisma.recordTrash.deleteMany({
+        where: { id: { in: matchedRecordTrashRows.map(({ id }) => id) },
+      });
+      // 删除 table_trash 操作索引
+      await prisma.tableTrash.delete({
+        where: { id: trashId },
+      });
+    },
+    {
+      timeout: this.thresholdConfig.bigTransactionTimeout,  // 大事务保护
+    }
+  );
 }
 ```
 
-**⚠️ 关键设计（V1 核心机制）：deletedTime 原子对齐恢复**
-V1 表格恢复时，字段和视图的恢复依靠 `deletedTime` 精确匹配实现级联恢复：
-1. **删除时**：`table/field/view` 在同一事务中被赋予**同一个精确的 deletedTime 时间戳**
-2. **恢复时**：通过 `where: { tableId, deletedTime }` 批量清除该时间戳
-3. **保证**：只有在"这次删除"中一起被删除的字段和视图才会一起恢复，保证原子性
+### 3.6 V2 记录恢复 + 垃圾清理
 
-**为什么不用批量清 `deletedTime: { not: null }`？**
-因为表格可能多次删除-恢复，不同批次删除的字段有不同的 deletedTime，精确匹配避免恢复错误批次。
-
-#### Table 恢复（V2 — CQRS）
+V2 路径中，垃圾清理由 Repository 层内部处理：
 
 ```typescript
-// RestoreTableHandler.ts
+// packages/v2/core/src/commands/RestoreRecordsHandler.ts:56
 async handle(context, command) {
-  // 1. 从 repository 查找已软删除的 Table 聚合
-  const table = yield* await this.tableQueryService.getDeletedByIdInBase(
-    context, command.baseId, command.tableId
-  );
-  // 2. 在事务中持久化恢复（meta scope）
-  yield* await this.unitOfWork.withTransaction(
-    context,
-    (transactionContext) => this.tableRepository.restore(transactionContext, table),
-    { scope: 'meta' }
-  );
-  // 3. 领域事件：markRestored()
-  yield* table.markRestored();
-  const events = table.pullDomainEvents();
-  // 4. 发布领域事件（触发投影清理 trash 表）
-  yield* await this.eventBus.publishMany(context, events);
+  const table = (await this.tableQueryService.getById(context, command.tableId)).value;
+  const batchSize = resolveRestoreRecordsBatchSize(command.records.length);
+
+  for (const batch of this.restoreRecordBatches(command.records, batchSize)) {
+    // 1. 构建 TableRecord 领域对象
+    const records = this.buildTableRecords(table, batch);
+
+    // 2. 构建恢复元数据（系统列保留）
+    const restoreRecordsById = this.buildRestoreRecordsById(batch);
+
+    // 3. 持久化 + 清理（Repository 内部执行）
+    const persistedResult = await this.unitOfWork.withTransaction(
+      context,
+      async (transactionContext) => {
+        return tableRecordRepository.insertMany(
+          transactionContext,
+          table,
+          records,
+          {
+            restoreRecordsById,
+            // ⚠️ 传递需要清理的记录 ID，Repository 内部删除快照
+            cleanupTrashRecordIds: batch.map((record) => record.recordId),
+          }
+        );
+      }
+    );
+  }
 }
 ```
 
-**V2 领域事件驱动**：
-- `TableTrashed` 事件 → `V2TableTrashedProjection` 写入 `trash` 表
-- `TableRestored` 事件 → `V2TableRestoredProjection` 从 `trash` 表删除条目
-- `RecordsDeleted` 事件 → `V2RecordsDeletedTableTrashProjection` 持久化记录快照
+### 3.7 V1 vs V2 垃圾清理设计差异
 
-### 3.3 表内资源恢复流程
+| 维度 | V1 | V2 |
+|------|----|----|
+| **清理位置** | `trash.service` 显式调用 delete | `TableRecordRepository.insertMany()` 内部 |
+| **参数传递** | 显式匹配后得到的 `matchedRecordTrashRowIds` | `cleanupTrashRecordIds: recordId[]` |
+| **事务控制** | `trash.service` 中开启事务 | Repository 层内部事务 |
+| **清理内容** | `record_trash.deleteMany` + `table_trash.delete` | 只清理 `record_trash`（`table_trash` 由上层清理？） |
 
-表内资源恢复走 `restoreTableResource(trashId)`，按 `resourceType` 分发：
+---
 
-#### View 恢复
+## 4. 关联对象恢复处理
+
+### 4.1 View 恢复
+
+View 恢复最简单，直接清空 `deletedTime`：
 
 ```typescript
-// trash.service.ts:799
-case TableTrashType.View: {
-  await this.viewService.restoreView(tableId, snapshot[0]);
-  // → view.update({ where: { id: viewId }, data: { deletedTime: null } })
-  break;
+// apps/nestjs-backend/src/features/view/view.service.ts:237
+async restoreView(tableId: string, viewId: string) {
+  await this.prismaService.$tx(async () => {
+    // 清空软删除标记
+    await this.prismaService.txClient().view.update({
+      where: { id: viewId },
+      data: { deletedTime: null },
+    });
+    // 更新修改时间
+    const ops = ViewOpBuilder.editor.setViewProperty.build({
+      key: 'lastModifiedTime',
+      newValue: new Date().toISOString(),
+    });
+    await this.updateViewByOps(tableId, viewId, [ops]);
+  });
 }
 ```
 
-#### Field 恢复（含依赖排序重建）
+### 4.2 Field 恢复（含依赖排序重建）
+
+Field 恢复走"重新创建"路径（非清空 `deletedTime`），因为字段删除后物理列可能已被清理：
 
 ```typescript
-// trash.service.ts:802
+// apps/nestjs-backend/src/features/trash/trash.service.ts:802
 case TableTrashType.Field: {
   const { fields, records } = snapshot as ICreateFieldsOperation['result'];
-  // 1. 重新创建字段（内含依赖排序）
+
+  // 1. 重新创建字段（内部会做依赖排序）
   await this.fieldOpenApiService.createFields(tableId, fields);
-  // 2. 如果快照中包含关联记录数据，更新已有记录
+
+  // 2. 如果快照中有记录数据，更新仍存在的记录
   if (records) {
-    const existingSnapshots = await this.recordService.getSnapshotBulk(...);
+    const existingSnapshots = await this.recordService.getSnapshotBulk(
+      tableId,
+      records.map((r) => r.id)
+    );
     const existingIdSet = new Set(existingSnapshots.map((s) => s.data.id));
     const filteredRecords = records.filter((r) => existingIdSet.has(r.id));
     if (filteredRecords.length) {
@@ -296,156 +599,88 @@ case TableTrashType.Field: {
 }
 ```
 
-**字段恢复的本质是"重新创建"**，而非简单清空 `deletedTime`。这是因为字段删除后其数据库列可能已被清理，恢复需要重新创建物理列。
-
-**依赖排序重建** — `sortCreateFieldsByDependencies()`：
+**依赖排序重建** - 字段创建前会进行拓扑排序：
 
 ```typescript
-// field-open-api.service.ts:1075
+// apps/nestjs-backend/src/features/field/open-api/field-open-api.service.ts:1075
 private sortCreateFieldsByDependencies<T>(tableId: string, fields: T[]): T[] {
-  // 1. 构建依赖图：通过 getFieldReferenceIds() 解析每个字段的引用依赖
-  //    如 Lookup 字段依赖 Link 字段，Rollup 依赖 Lookup
-  // 2. 拓扑排序（Kahn 算法）：
-  //    - 计算每个字段的入度（依赖数）
-  //    - 入度为 0 的字段先创建
-  //    - 创建后更新依赖字段的入度
-  // 3. 检测循环依赖：若排序后数量 < 原始数量，说明存在环，回退到原始顺序
-  // 4. 同层级按原始索引排序，保持用户定义的字段顺序
-}
-```
-
-**引用恢复** — `restoreReference()`：
-字段恢复后，关联字段的引用关系也需要恢复：
-
-```typescript
-async restoreReference(references: string[]) {
-  // 查找引用字段（仅未删除的）
-  const fieldRaws = await this.prismaService.txClient().field.findMany({
-    where: { id: { in: references }, deletedTime: null },
-  });
-  // 对每个引用字段进行配置校验和错误标记
-  for (const refFieldRaw of fieldRaws) {
-    const refField = createFieldInstanceByRaw(refFieldRaw);
-    await this.checkAndUpdateError(refFieldRaw.tableId, refField);
+  // 1. 解析每个字段的依赖
+  //    - Lookup 字段依赖 Link 字段
+  //    - Rollup 字段依赖 Lookup 字段
+  //    - Formula 字段依赖其他字段
+  const depsByFieldId = new Map<string, string[]>();
+  for (const field of fields) {
+    const instance = createFieldInstanceByVo(fieldVo);
+    const deps = this.fieldSupplementService
+      .getFieldReferenceIds(instance)
+      .filter(id => idSet.has(id) && id !== field.id);
+    depsByFieldId.set(field.id, deps);
   }
-}
-```
 
-#### Record 恢复（含快照匹配）
+  // 2. Kahn 拓扑排序
+  const indegree = new Map<string, number>();
+  const outgoing = new Map<string, string[]>();
+  // ... 构建图 ...
 
-```typescript
-// trash.service.ts:822
-case TableTrashType.Record: {
-  const recordIds = snapshot as string[];
-  // 1. 查找所有匹配的 record_trash 行
-  const recordTrashRows = await this.dataPrismaService.recordTrash.findMany({
-    where: { tableId, recordId: { in: recordIds } },
-    orderBy: [{ recordId: 'asc' }, { createdTime: 'desc' }, { id: 'desc' }],
-  });
-
-  // 2. 快照匹配：一条记录可能被多次删除-恢复-再删除
-  //    需要找到"属于本次 trash 操作"的快照
-  const latestSnapshotsByRecordId = recordTrashRows.reduce((acc, row) => {
-    // 只取 createdTime <= 当前 trash 条目的 createdTime 的最近快照
-    if (row.createdTime <= createdTime && !acc.has(row.recordId)) {
-      acc.set(row.recordId, row);
+  const ready: string[] = [];
+  while (ready.length) {
+    const current = ready.shift()!;
+    orderedIds.push(current);
+    for (const next of outgoing.get(current) ?? []) {
+      const nextDegree = (indegree.get(next) ?? 0) - 1;
+      indegree.set(next, nextDegree);
+      if (nextDegree === 0) ready.push(next);
     }
-    return acc;
-  }, new Map());
-
-  // 3. V1 路径：multipleCreateRecords + 清理 trash 数据
-  // 4. V2 路径：RestoreRecordsCommand → RestoreRecordsHandler
-  if (await this.shouldRestoreRecordsWithV2(tableId)) {
-    await this.restoreRecordsV2(tableId, records);
-    return;
   }
-  await this.recordOpenApiService.multipleCreateRecords(tableId, {
-    fieldKeyType: FieldKeyType.Id,
-    records,
-    typecast: true,
-  }, true);
-  
-  // ⚠️ 清理 record_trash 和 table_trash（关键：在同一事务中）
-  await this.dataPrismaService.$tx(async (prisma) => {
-    // 1. 删除所有匹配的 record_trash 快照条目
-    await prisma.recordTrash.deleteMany({ where: { id: { in: matchedRecordTrashRowIds } } });
-    // 2. 删除 table_trash 中的操作索引条目
-    await prisma.tableTrash.delete({ where: { id: trashId } });
-  }, {
-    timeout: this.thresholdConfig.bigTransactionTimeout,  // 大事务超时配置
-  });
+
+  // 3. 环检测：如果排序后数量 < 原始数量，说明有循环依赖
+  if (orderedIds.length !== fields.length) {
+    this.logger.warn(`detected a dependency cycle; falling back to input order`);
+    return fields;  // 回退到原始顺序
+  }
 }
 ```
 
-**⚠️ 垃圾清理机制（record_trash + table_trash）**
-1. **双表联动**：`table_trash` 是操作索引表（存记录 ID 列表），`record_trash` 是快照内容表（存完整记录 JSON）
-2. **原子删除**：恢复成功后，两表必须在同一事务中一起删除
-3. **精确匹配**：只删除本次恢复对应的 record_trash 行（通过 `createdTime <= trashItem.createdTime` 匹配的行）
-4. **大事务保护**：配置 `bigTransactionTimeout` 避免超大数据量恢复超时
+### 4.3 Link 字段解关联
 
-**快照时间匹配的核心问题**：同一 `recordId` 可能在 `record_trash` 中有多行（多次删除），恢复时必须取 `createdTime <= 当前trash条目.createdTime` 的最新快照，避免恢复到错误的版本。
-
-### 3.4 V2 记录恢复
+表格删除前先解关联 Link 字段，避免悬空引用：
 
 ```typescript
-// RestoreRecordsHandler.ts
-async handle(context, command) {
-  const table = (await this.tableQueryService.getById(context, command.tableId)).value;
-  const batchSize = resolveRestoreRecordsBatchSize(command.records.length);
-
-  for (const batch of this.restoreRecordBatches(command.records, batchSize)) {
-    // 1. 构建 TableRecord 领域对象
-    const records = this.buildTableRecords(table, batch);
-    // 2. 构建恢复元数据（version, orders, autoNumber, createdTime 等）
-    const restoreRecordsById = this.buildRestoreRecordsById(batch);
-    // 3. 在事务中持久化
-    await this.unitOfWork.withTransaction(context, (txContext) =>
-      tableRecordRepository.insertMany(txContext, table, records, {
-        restoreRecordsById,              // 系统列恢复值
-        cleanupTrashRecordIds: batch.map(r => r.recordId),  // ⚠️ V2：Repository 内部执行垃圾清理
-      })
-    );
-    // 4. 发布 RecordsBatchCreated 事件
-    const batchEvents = this.buildBatchCreatedEvents(table, batch);
-    await this.eventBus.publishMany(context, batchEvents);
-  }
-}
+// table-open-api.service.ts 删除和永久删除前都会调用
+await this.detachLink(tableId);
 ```
 
-**V2 垃圾清理设计差异**：
-- V1：在 trash.service 显示调用 `recordTrash.deleteMany` + `tableTrash.delete`
-- V2：通过 `cleanupTrashRecordIds` 参数传递给 `tableRecordRepository.insertMany()`，由 Repository 层在内部事务中清理
+字段恢复后触发引用恢复和校验：
 
-**流式恢复** — `RestoreRecordsStreamHandler`：
-对于大批量记录，支持流式处理：
-- 接收 `AsyncIterable<RestoreRecordInput>` 作为输入
-- 按 `batchSize`（1~5000）分批处理
-- 每批通过 `insertManyStream` 持久化
-- 通过 AsyncGenerator 产出 `progress / done / error` 事件
-- 支持延迟计算更新（`deferComputedUpdates`）和跳过计算（`skipComputedUpdates`）
+```typescript
+// field-open-api.service.ts:1214
+if (referencesToRestore.size) {
+  await this.restoreReference(Array.from(referencesToRestore));
+}
+```
 
 ---
 
-## 4. 冲突检测与拦截
+## 5. 冲突检测与拦截
 
-### 4.1 父级链路冲突检测 — `assertParentNotTrashed()`
+### 5.1 父级链路完整性校验（递归 CTE）
 
-这是最核心的冲突拦截机制，使用递归 CTE 检查整个父级链路：
+恢复前检查整个父级链路是否都不在垃圾箱中：
 
 ```typescript
-// trash.service.ts:614
+// apps/nestjs-backend/src/features/trash/trash.service.ts:614
 private async assertParentNotTrashed(parentId: string | null) {
   if (!parentId) return;
 
-  // 递归 CTE：沿 trash 表的 parent_id 链路向上查找
+  // ⚠️ 递归 CTE：沿 trash.parent_id 向上遍历整条链路
   const query = this.knex
     .withRecursive('parent_chain', (qb) => {
-      // 基础条件：检查直接父级是否在 trash 中
+      // 基础条件：直接父级
       qb.select('resource_id', 'parent_id')
         .from('trash')
         .where('resource_id', parentId)
         .unionAll((qb) => {
-          // 递归条件：沿 parent_id 继续向上查找
+          // 递归条件：父级的父级
           qb.select('t.resource_id', 't.parent_id')
             .from('trash as t')
             .join('parent_chain as pc', 't.resource_id', 'pc.parent_id')
@@ -454,7 +689,7 @@ private async assertParentNotTrashed(parentId: string | null) {
     })
     .select('resource_id')
     .from('parent_chain')
-    .limit(1)
+    .limit(1)  // 找到一个就足够
     .toQuery();
 
   const result = await this.prismaService.$queryRawUnsafe(query);
@@ -468,19 +703,13 @@ private async assertParentNotTrashed(parentId: string | null) {
 }
 ```
 
-**拦截场景举例**：
-- 恢复 Base → 检查所属 Space 是否在 trash 中
-- 恢复 Table → 检查所属 Base 是否在 trash 中
-- 链式场景：恢复 Table → 所属 Base 在 trash → 所属 Space 也在 trash
-
-**为什么需要递归**：trash 表中 `parentId` 只记录直接父级，但父级自身可能也有父级在 trash 中，需要递归遍历整条链路。
-
-### 4.2 Base 恢复时的 Space 级冲突检测
+### 5.2 Base 恢复时的 Space 校验
 
 ```typescript
 // trash.service.ts:588
 private async restoreBase(baseId: string) {
   const base = await prisma.base.findUniqueOrThrow({ ... });
+  // 检查所属 Space 是否也在垃圾箱
   const trashedSpace = await prisma.trash.findFirst({
     where: { resourceId: base.spaceId, resourceType: TrashType.Space },
   });
@@ -493,262 +722,192 @@ private async restoreBase(baseId: string) {
 }
 ```
 
-这是非递归的快捷路径，直接查 trash 表看 Space 是否在垃圾箱中。
+### 5.3 Field 恢复时的配置有效性校验
 
-### 4.3 Table 恢复时的 deletedTime 校验
-
-```typescript
-// table-open-api.service.ts:532
-async restoreTable(baseId: string, tableId: string) {
-  const { deletedTime } = await prisma.trash.findFirstOrThrow({
-    where: { resourceId: tableId, resourceType: ResourceType.Table },
-  });
-  if (!deletedTime) {
-    throw new CustomHttpException(
-      'Unable to restore this table because it is not in the trash',
-      ...
-    );
-  }
-}
-```
-
-防止对不在垃圾箱中的表格执行恢复操作。
-
-### 4.4 Field 恢复时的配置有效性校验
-
-字段恢复走"重新创建"路径，创建后通过 `isFieldConfigurationValid()` 检查：
+字段恢复后校验 Link/Lookup/Rollup 引用链是否完整：
 
 ```typescript
 private async isFieldConfigurationValid(tableId, field) {
-  // Lookup 字段：校验引用的 Link 字段是否存在且有效
+  // Lookup 字段：校验引用的 Link 字段是否存在
   if (field.lookupOptions && !field.isConditionalLookup) {
     const lookupValid = await this.validateLookupField(field);
     if (!lookupValid) return false;
-    // Rollup 字段：额外校验聚合函数
+    // Rollup 额外校验聚合函数
     if (field.type === FieldType.Rollup) {
       return await this.validateRollupAggregation(field);
     }
   }
-  // Conditional Lookup：校验条件引用链
+  // Conditional Lookup / Conditional Rollup 校验
   if (field.isConditionalLookup) {
     return await this.validateConditionalLookup(tableId, field);
-  }
-  // Conditional Rollup：校验条件聚合
-  if (field.type === FieldType.ConditionalRollup) {
-    return await this.validateConditionalRollupAggregation(tableId, field);
   }
   return true;
 }
 ```
 
-校验失败的字段会被标记为 `hasError: true`，不会阻止恢复操作，但会在 UI 上显示错误状态。
-
-### 4.5 Record 恢复时的快照版本冲突
-
-```typescript
-// trash.service.ts:846
-// 一条记录可能被多次删除-恢复，需要正确匹配快照
-const latestSnapshotsByRecordId = recordTrashRows.reduce((acc, row) => {
-  // 只取 createdTime <= 当前 trash 操作时间的快照
-  if (row.createdTime <= createdTime && !acc.has(row.recordId)) {
-    acc.set(row.recordId, row);
-  }
-  return acc;
-}, new Map());
-```
-
-这解决了同一 `recordId` 在 `record_trash` 中有多条记录时的版本选择问题。
+校验失败的字段标记 `hasError: true`，UI 显示错误状态，但不阻止恢复。
 
 ---
 
-## 5. 关联对象恢复处理
+## 6. V1/V2 分流机制
 
-### 5.1 删除时的级联软删除
-
-表格删除时，所有子资源一起软删除：
+### 6.1 分流决策点
 
 ```typescript
-// table-open-api.service.ts:500
-async deleteTable(baseId, tableId) {
-  // 1. 先解关联 Link 字段
+// apps/nestjs-backend/src/features/trash/trash.controller.ts:45
+@Post('restore/:trashId')
+async restoreTrash(
+  @Param('trashId') trashId: string,
+  @Res({ passthrough: true }) response: Response
+): Promise<void> {
+  // ⚠️ 先做 V2 决策
+  await this.prepareRestoreTableCanary(trashId, response);
+
+  if (this.cls.get('useV2')) {
+    return await this.trashService.restoreTrashV2(trashId);  // V2 路径
+  }
+  return await this.trashService.restoreTrash(trashId);     // V1 路径
+}
+```
+
+### 6.2 决策逻辑
+
+```typescript
+// apps/nestjs-backend/src/features/trash/trash.controller.ts:72
+protected async prepareRestoreTableCanary(trashId: string, response: Response) {
+  const decision = await this.trashService.getRestoreTableV2Decision(trashId);
+  if (!decision) return;
+
+  this.cls.set('useV2', decision.useV2);
+  this.cls.set('v2Feature', TrashController.restoreTableV2Feature);
+  this.cls.set('v2Reason', decision.reason);
+
+  // 响应头返回决策结果
+  response.setHeader(X_TEABLE_V2_HEADER, decision.useV2 ? 'true' : 'false');
+  response.setHeader(X_TEABLE_V2_FEATURE_HEADER, TrashController.restoreTableV2Feature);
+  response.setHeader(X_TEABLE_V2_REASON_HEADER, decision.reason);
+}
+```
+
+### 6.3 决策核心：`CanaryService`
+
+```typescript
+// apps/nestjs-backend/src/features/trash/trash.service.ts:674
+async getRestoreTableV2Decision(trashId: string) {
+  const trash = await this.prismaService.txClient().trash.findUnique({
+    where: { id: trashId },
+    select: { resourceId: true, resourceType: true, parentId: true },
+  });
+
+  const baseId = trash.parentId;
+  const base = await this.prismaService.txClient().base.findUnique({
+    where: { id: baseId, deletedTime: null },
+    select: { spaceId: true, v2Enabled: true },
+  });
+
+  // ⚠️ 决策交给 CanaryService
+  const decision = await this.canaryService.shouldUseV2ForBaseWithReason(
+    base,
+    'restoreTable'  // 功能维度
+  );
+  return { ...decision, baseId, tableId: trash.resourceId };
+}
+```
+
+**决策依据**：
+1. Base 的 `v2Enabled` 标志（数据库配置）
+2. 灰度配置（按百分比、按用户名单、按环境等）
+3. 功能维度（`restoreTable`）单独的灰度策略
+
+---
+
+## 7. Trash 表的完整生命周期
+
+### 7.1 Trash 表写入（V1 Table 删除）
+
+```typescript
+// V2 领域事件投影：TableTrashed 事件触发
+@ProjectionHandler(TableTrashed)
+export class V2TableTrashedProjection implements IEventHandler<TableTrashed> {
+  async handle(context, event) {
+    const db = container.resolve<Kysely<IAttachmentsTableDb>>(v2MetaDbTokens.db);
+    const table = await db
+      .selectFrom('table_meta')
+      .where('id', '=', event.tableId.toString())
+      .select(['base_id', 'deleted_time'])
+      .executeTakeFirst();
+
+    // 先删除可能存在的旧条目（唯一键冲突保护）
+    await db
+      .deleteFrom('trash')
+      .where('resource_id', '=', event.tableId.toString())
+      .where('resource_type', '=', ResourceType.Table)
+      .execute();
+
+    // 写入新条目
+    await db
+      .insertInto('trash')
+      .values({
+        id: nanoid(),
+        resource_id: event.tableId.toString(),
+        resource_type: ResourceType.Table,
+        parent_id: table.base_id,
+        deleted_time: table.deleted_time,
+        deleted_by: context.actorId.toString(),
+      })
+      .execute();
+  }
+}
+```
+
+### 7.2 Trash 表清理（V2 Table 恢复）
+
+```typescript
+@ProjectionHandler(TableRestored)
+export class V2TableRestoredProjection implements IEventHandler<TableRestored> {
+  async handle(_context, event) {
+    const db = container.resolve<Kysely<IAttachmentsTableDb>>(v2MetaDbTokens.db);
+    // TableRestored 事件触发清理 trash 表条目
+    await db
+      .deleteFrom('trash')
+      .where('resource_id', '=', event.tableId.toString())
+      .where('resource_type', '=', ResourceType.Table)
+      .execute();
+  }
+}
+```
+
+### 7.3 永久删除流程
+
+```typescript
+// trash.service.ts:362
+async permanentDeleteTables(baseId: string, tableIds: string[]) {
+  // 1. 解除 Link 关联
   await this.detachLink(tableId);
-  // 2. 事务中标记所有资源
-  const deletedTime = new Date();
-  await this.tableService.deleteTable(baseId, tableId, deletedTime);     // table_meta
-  await prisma.field.updateMany({ where: { tableId, deletedTime: null }, data: { deletedTime } });
-  await prisma.view.updateMany({ where: { tableId, deletedTime: null }, data: { deletedTime } });
-}
-```
-
-### 5.2 恢复时的级联恢复
-
-V1 Table 恢复时，按同一 `deletedTime` 批量恢复所有字段和视图：
-
-```typescript
-await prisma.field.updateMany({ where: { tableId, deletedTime }, data: { deletedTime: null } });
-await prisma.view.updateMany({ where: { tableId, deletedTime }, data: { deletedTime: null } });
-```
-
-### 5.3 Field 恢复时的关联数据处理
-
-字段恢复时，快照中可能包含关联的记录数据：
-
-```typescript
-case TableTrashType.Field: {
-  const { fields, records } = snapshot;
-  await this.fieldOpenApiService.createFields(tableId, fields);
-  if (records) {
-    // 只更新当前仍存在的记录
-    const existingSnapshots = await this.recordService.getSnapshotBulk(tableId, records.map(r => r.id));
-    const existingIdSet = new Set(existingSnapshots.map(s => s.data.id));
-    const filteredRecords = records.filter(r => existingIdSet.has(r.id));
-    if (filteredRecords.length) {
-      await this.recordOpenApiService.updateRecords(tableId, {
-        fieldKeyType: FieldKeyType.Id,
-        records: filteredRecords,
-      });
-    }
-  }
-}
-```
-
-**重要细节**：只更新仍然存在的记录，避免对已删除的记录执行无效更新。
-
-### 5.4 Link 字段解关联 — `detachLink()`
-
-表格删除前会先解关联 Link 字段：
-
-```typescript
-// table-open-api.service.ts 中 deleteTable 和 permanentDeleteTables 都会调用
-await this.detachLink(tableId);
-```
-
-这确保删除表格时，其他表格中引用该表格的 Link 字段不会留下悬空引用。
-
-### 5.5 V2 记录恢复的系统列保留
-
-V2 恢复记录时，不仅恢复字段数据，还恢复系统列：
-
-```typescript
-// RestoreRecordsHandler.ts
-private buildRestoreRecordsById(batch) {
-  return new Map(batch.map(record => [
-    record.recordId,
-    {
-      ...(record.version !== undefined ? { version: record.version } : {}),
-      ...(record.orders ? { orders: record.orders } : {}),
-      ...(record.autoNumber !== undefined ? { autoNumber: record.autoNumber } : {}),
-      ...(record.createdTime ? { createdTime: record.createdTime } : {}),
-      ...(record.createdBy ? { createdBy: record.createdBy } : {}),
-      ...(record.lastModifiedTime ? { lastModifiedTime: record.lastModifiedTime } : {}),
-      ...(record.lastModifiedBy ? { lastModifiedBy: record.lastModifiedBy } : {}),
-      ...(record.extraColumnValues ? { extraColumnValues: record.extraColumnValues } : {}),
-    },
-  ]));
-}
-```
-
-这确保恢复后的记录保留原始的创建时间、版本号、行序等元数据。
-
-### 5.6 永久删除与垃圾箱清理
-
-```typescript
-// trash.service.ts:1060
-private async resetTableTrashItems(tableId) {
-  // 收集所有已删除的 view/field/record ID
-  // 1. 物理删除 view、field、taskReference、ops
-  // 2. 清理 record_trash、table_trash
-}
-
-// table-open-api.service.ts:362
-async permanentDeleteTables(baseId, tableIds) {
-  // 1. detachLink
-  // 2. dropTables — 物理删除数据表
-  // 3. cleanTaskRelatedData — 清理任务引用
-  // 4. cleanTablesRelatedData — 清理所有关联数据（field, view, ops, trash, recordTrash 等）
+  // 2. DROP TABLE 物理删除数据表
+  await this.dropTables(tableIds);
+  // 3. 清理任务关联数据
+  await this.cleanTaskRelatedData(tableIds);
+  // 4. 清理所有元数据（field/view/ops/trash/tableTrash/recordTrash）
+  await this.cleanTablesRelatedData(baseId, tableIds);
 }
 ```
 
 ---
 
-## 6. 删除→恢复完整数据流
-
-### 6.1 Table 删除数据流（V1）
-
-```
-用户操作 → deleteTable(baseId, tableId)
-  ├─ detachLink(tableId)            // 解除 Link 关联
-  ├─ tableService.deleteTable()     // table_meta.deletedTime = now, provisionState = deleting
-  ├─ field.updateMany()             // 所有字段 deletedTime = now
-  ├─ view.updateMany()              // 所有视图 deletedTime = now
-  └─ 事件 → trash 表写入记录       // (resourceType=Table, resourceId=tableId, parentId=baseId)
-```
-
-### 6.2 Table 删除数据流（V2 CQRS）
-
-```
-用户操作 → DeleteTableCommand → DeleteTableHandler
-  ├─ tableQueryService.getByIdInBase()       // 查找 Table 聚合
-  ├─ table.markTrashed()                     // 领域事件: TableTrashed
-  ├─ unitOfWork.withTransaction()            // 持久化: tableRepository.delete()
-  └─ eventBus.publishMany()                  // 发布事件
-       ├─ V2TableTrashedProjection           // → 写入 trash 表
-       └─ (其他投影处理器)
-
-记录删除 → RecordsDeleted 事件
-  ├─ V2RecordsDeletedTableTrashProjection    // → 持久化快照到 table_trash + record_trash
-  └─ V2RecordsDeletedAttachmentProjection    // → 清理 attachments_table
-```
-
-### 6.3 Table 恢复数据流（V1）
-
-```
-POST /api/trash/restore/:trashId
-  └─ trashService.restoreTrash(trashId)
-       ├─ prisma.trash.findUniqueOrThrow()       // 查找 trash 记录
-       ├─ assertParentNotTrashed(parentId)         // 递归 CTE 检查父级链
-       ├─ restoreResource({resourceType, resourceId})
-       │    └─ restoreTable(tableId)
-       │         ├─ permissionService.validPermissions()
-       │         └─ tableOpenApiService.restoreTable(baseId, tableId)
-       │              ├─ tableService.restoreTable()    // deletedTime=null, provisionState=ready
-       │              ├─ field.updateMany()             // 同一 deletedTime 的字段恢复
-       │              └─ view.updateMany()              // 同一 deletedTime 的视图恢复
-       └─ prisma.trash.deleteMany({id: trashId})   // 清理 trash 索引
-```
-
-### 6.4 Table 恢复数据流（V2）
-
-```
-POST /api/trash/restore/:trashId
-  └─ trashService.restoreTrashV2(trashId)
-       ├─ getRestoreTableV2Decision()                // V2 分流判断
-       ├─ assertParentNotTrashed(baseId)              // 递归 CTE 父级检查
-       └─ restoreTableV2(baseId, tableId)
-            └─ tableOpenApiV2Service.restoreTable()
-                 └─ RestoreTableCommand → RestoreTableHandler
-                      ├─ getDeletedByIdInBase()       // 查找已软删除的 Table
-                      ├─ unitOfWork.withTransaction()  // tableRepository.restore()
-                      ├─ table.markRestored()          // 领域事件: TableRestored
-                      └─ eventBus.publishMany()        // 发布事件
-                           └─ V2TableRestoredProjection  // → 从 trash 表删除条目
-```
-
----
-
-## 7. 核心设计模式总结
+## 8. 核心设计模式总结
 
 | 模式 | 实现 | 场景 |
 |------|------|------|
-| **软删除标记** | `deletedTime: DateTime?` | Space/Base/Table/Field/View |
-| **删除索引** | `Trash` 表 + `parentId` 层级 | 快速查询已删除资源 + 父级校验 |
-| **快照持久化** | `TableTrash` + `RecordTrash` | View/Field/Record 的完整数据保存 |
-| **⚠️ deletedTime 时间戳对齐** | 删除时 table/field/view 共享精确 `deletedTime` | **V1 批量级联恢复的匹配依据** |
-| **快照版本匹配** | `createdTime <= trashItem.createdTime` | 同一记录多次删除-恢复的版本选择 |
-| **拓扑排序** | Kahn 算法 + 字段依赖图 | Field 恢复时的创建顺序 |
-| **递归 CTE** | `assertParentNotTrashed()` | 父级链路完整性校验 |
-| **⚠️ CanaryService 灰度分流** | `shouldUseV2ForBaseWithReason()` | **V1/V2 架构迁移路径决策** |
-| **CQRS 投影** | V2 领域事件 → 投影处理器 | Trash 表的读写分离 |
-| **流式批量** | `RestoreRecordsStreamHandler` | 大批量记录恢复的渐进式处理 |
-| **引用恢复** | `restoreReference()` + `isFieldConfigurationValid()` | Link/Lookup/Rollup 字段恢复后的校验 |
-| **⚠️ 原子垃圾清理** | 事务中同时删除 `record_trash` + `table_trash` | **恢复成功后清理快照** |
+| **统一软删除标记** | `deletedTime: DateTime?` | Space/Base/Table/Field/View（元数据级） |
+| **⚠️ 物理删除 + 快照恢复** | 直接 `DELETE` + `table_trash`/`record_trash` 双表快照 | Record（数据级，避免膨胀） |
+| **deletedTime 时间戳对齐** | 删除时 table/field/view 共享精确 `deletedTime` | V1 批量级联恢复的匹配依据 |
+| **⚠️ 快照版本匹配** | `createdTime <= trashItem.createdTime` + 最新匹配 | 同一记录多次删除-恢复的版本选择 |
+| **双表联动快照** | `table_trash`（索引）+ `record_trash`（内容） | 记录删除快照的高效存储与查询 |
+| **原子垃圾清理** | 事务中同时删除 `record_trash` + `table_trash` | 恢复成功后清理快照，避免残留 |
+| **拓扑排序** | Kahn 算法 + 字段依赖图（Lookup→Link，Rollup→Lookup） | Field 恢复时的创建顺序 |
+| **递归 CTE** | `assertParentNotTrashed()` 沿 `parent_id` 向上遍历 | 父级链路完整性校验 |
+| **⚠️ CanaryService 灰度分流** | `shouldUseV2ForBaseWithReason()` | V1/V2 架构迁移路径决策 |
+| **CQRS 投影** | 领域事件 → 投影处理器异步读写分离 | Trash 表写入与清理 |
+| **流式批量** | `RestoreRecordsStreamHandler` 异步生成器 | 大批量记录恢复的渐进式处理 |
+| **引用恢复与校验** | `restoreReference()` + `isFieldConfigurationValid()` | Link/Lookup/Rollup 字段恢复后的完整性校验 |

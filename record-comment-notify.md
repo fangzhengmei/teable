@@ -882,6 +882,154 @@ createComment()                                              ← API 入口
 
 6. **幂等性**：`createComment` 每次调用都生成新的 `commentId`，所以天然幂等。但 `sendCommentNotify` 中对每个 `userId` 调用 `sendCommonNotify` 也生成新的 `notificationId`，如果被多次调用（如网络超时后重试），可能导致**同一评论对同一用户产生多条通知**。
 
+### 9.8 unhandledRejection → uncaughtException 的进程级错误传播路径
+
+那些被丢弃的 Promise（`sendCommentNotify` 的 forEach、`sendCommonNotify`、`sendCommentPatch`、`sendTableCommentPatch`）在失败时会经历以下传播路径：
+
+```
+[1] Promise 被拒绝且无 .catch() 处理
+    │
+    ▼
+[2] 触发 Node.js unhandledRejection 事件        (bootstrap.ts:79)
+    process.on('unhandledRejection', (reason, promise) => {
+      logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
+      throw reason;  // ← 将异步拒绝转化为同步抛出
+    })
+    │
+    ▼
+[3] throw reason 抛出同步异常（未被 try-catch 捕获）
+    │
+    ▼
+[4] 触发 Node.js uncaughtException 事件         (bootstrap.ts:84)
+    process.on('uncaughtException', (error) => {
+      logger.error(error);  // ← 只记日志，不退出进程
+    })
+    │
+    ▼
+[5] 进程继续运行（状态可能已损坏）
+```
+
+**GlobalExceptionFilter 的边界**：
+
+`GlobalExceptionFilter`（`apps/nestjs-backend/src/filter/global-exception.filter.ts`）只捕获**NestJS 请求处理管道内**的异常，即从 Controller 入口到返回响应过程中抛出的异常。它无法捕获：
+
+- `unhandledRejection`（Promise 被丢弃，不在请求上下文内）
+- `uncaughtException`（同步异常，不在请求上下文内）
+- 定时器回调、事件监听器中的异常
+
+**代码证据 — bootstrap.ts:79-86**：
+
+```typescript
+process.on('unhandledRejection', (reason: string, promise: Promise<unknown>) => {
+  logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
+  throw reason;  // ← 关键：主动 throw，将异步错误升级为同步错误
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error(error);  // ← 只记日志
+});
+```
+
+**重要细节**：`unhandledRejection` 监听器中调用了 `throw reason`，这会将异步的 Promise 拒绝转化为同步的未捕获异常，进而触发 `uncaughtException`。如果没有这个 `throw`，Promise 拒绝只会被记录然后被吞掉。
+
+**进程稳定性风险**：
+
+按照 Node.js 官方文档，`uncaughtException` 发生后继续运行进程是不安全的，因为应用状态可能已损坏。但 Teable 的 `uncaughtException` 监听器只记日志、不退出进程——如果通知 DB 写入失败导致了某些资源泄漏或状态不一致，进程会带病继续运行。
+
+### 9.9 createComment 查询阶段失败时的精确顺序与用户可见性
+
+当 `sendCommentNotify` 的查询阶段（阶段 2）抛出异常时，执行顺序和对用户的影响需要精确分析。
+
+**正常路径的代码结构**（`comment-open-api.service.ts:355`）：
+
+```typescript
+async createComment(tableId: string, recordId: string, createCommentRo: ICreateCommentRo) {
+  const id = generateCommentId();
+  const content = await this.filterCommentContent(createCommentRo.content);
+
+  // 步骤 1：写评论到 DB —— await
+  const result = await this.prismaService.comment.create({
+    data: { id, tableId, recordId, content: JSON.stringify(content), ... }
+  });  // ← 成功后评论已持久化，事务已提交
+
+  // 步骤 2：通知查询阶段 —— await
+  await this.sendCommentNotify(tableId, recordId, id, {
+    content: result.content, quoteId: result.quoteId,
+  });  // ← 如果这里抛异常，函数立即终止
+
+  // 步骤 3：实时推送 —— 无 await
+  this.sendCommentPatch(tableId, recordId, CommentPatchType.CreateComment, result);
+  this.sendTableCommentPatch(tableId, recordId, CommentPatchType.CreateComment);
+
+  // 步骤 4：返回结果
+  return { ...result, content: result.content ? JSON.parse(result.content) : null };
+}
+```
+
+**失败时的精确执行顺序**：
+
+| 阶段 | 执行状态 | 操作 | 结果 |
+|------|---------|------|------|
+| 步骤 1 | ✅ 已执行 | `prismaService.comment.create()` | 评论写入 DB，事务已提交 |
+| 步骤 2 | ✅ 已执行（失败） | `sendCommentNotify` 查询阶段 | 抛异常（如 `base.findUniqueOrThrow` 找不到 base） |
+| 步骤 3 | ❌ 未执行 | `sendCommentPatch`、`sendTableCommentPatch` | 实时推送完全没发 |
+| 步骤 4 | ❌ 未执行 | `return` | 没有返回评论数据 |
+
+**异常传播**：
+- `await sendCommentNotify()` 抛异常 → `createComment` 函数立即终止
+- 异常向上冒泡到 NestJS 调用栈 → `GlobalExceptionFilter` 捕获
+- `GlobalExceptionFilter.catch()` → 返回 HTTP 500 JSON 响应
+
+**对用户可见性的影响**：
+
+| 视角 | 现象 | 后果 |
+|------|------|------|
+| **发送者（前端）** | API 返回 500，UI 显示"发送失败" | 用户以为评论没发出去，可能重试导致**重复评论** |
+| **发送者（刷新后）** | 评论出现在列表中 | 用户困惑——刚才明明显示失败 |
+| **其他在线用户** | 没有实时推送，评论计数不变 | 不知道有新评论，也看不到评论 |
+| **其他在线用户（刷新后）** | 评论出现，计数更新 | 正常看到，但延迟了 |
+| **通知收件人** | 没有任何通知 | 完全不知道有人评论了 |
+
+**特殊场景：提前 return 而非抛异常**
+
+`sendCommentNotify` 中存在提前返回逻辑（`comment-open-api.service.ts:654`）：
+
+```typescript
+if (!baseId || !fieldId) {
+  return;  // ← 正常 return，不抛异常
+}
+```
+
+如果 `tableMeta.findFirst()` 或 `field.findFirst()` 返回 null（但不抛异常），`sendCommentNotify` 会正常 return：
+
+| 阶段 | 执行状态 | 结果 |
+|------|---------|------|
+| 步骤 1 | ✅ | 评论已写入 DB |
+| 步骤 2 | ✅ | 查询阶段提前 return，无异常 |
+| 步骤 3 | ✅ | 实时推送正常发送 |
+| 步骤 4 | ✅ | API 返回 200，评论数据正常返回 |
+| **通知** | ❌ | 完全没发（forEach 循环被跳过） |
+
+这种情况是**静默失败**：用户看到评论发送成功，其他用户也能看到实时更新，**但没有任何人收到通知**——这是最隐蔽的 bug。
+
+**updateComment 也有同样的问题**：
+
+```typescript
+// comment-open-api.service.ts:401-405
+this.sendCommentPatch(tableId, recordId, CommentPatchType.UpdateComment, result);
+await this.sendCommentNotify(tableId, recordId, commentId, {
+  quoteId: result.quoteId,
+  content: result.content,
+});
+```
+
+注意 `updateComment` 的顺序是**先发实时推送，再 await 查询阶段**。如果查询阶段失败：
+- `sendCommentPatch` 已执行 → 其他在线用户能看到实时更新
+- API 返回 500 → 用户以为更新失败
+- 通知完全没发
+
+这与 `createComment` 的顺序不同（先查询后推送），说明评论的更新和创建路径**没有统一的失败策略**。
+
 ---
 
 ## 十、关键文件索引
@@ -937,3 +1085,7 @@ createComment()                                              ← API 入口
 8. **updateComment 数据清洗缺失**：`updateComment` 未调用 `filterCommentContent`，可能导致冗余展示态字段入库。虽然读取时回填覆盖了此问题，但数据一致性应从写入端保证。
 
 9. **通知分发是完全 fire-and-forget**：评论 DB 写入是强一致的，但通知分发从 `sendCommentNotify` 的 `forEach` 开始就是 fire-and-forget——`forEach` 无 await、`NotificationService.sendCommentNotify` 内部也无 await `sendCommonNotify`，形成双重无 await。所有通知 DB 写入、WebSocket 推送、邮件发送的失败都不会影响 API 返回，而是变成 unhandled Promise rejection。唯一能影响 API 返回的是 `sendCommentNotify` 的查询阶段（查收件人、查表名等），但此时评论已入库，查询失败会导致 API 返回 500 而评论已存在（用户重试可能产生重复评论）。
+
+10. **unhandledRejection → uncaughtException 的升级链**：进程级错误传播路径设计特殊。`unhandledRejection` 监听器中不仅记日志，还会 `throw reason`，将异步 Promise 拒绝主动升级为同步未捕获异常，进而触发 `uncaughtException`。`uncaughtException` 监听器只记日志、不退出进程，违反 Node.js 最佳实践——异常发生后进程状态可能已损坏，但仍带病继续运行。
+
+11. **创建与更新的失败策略不一致**：`createComment` 顺序是「写评论 → 查询通知 → 实时推送」，查询失败时实时推送不会发送，其他用户看不到更新；而 `updateComment` 顺序是「写评论 → 实时推送 → 查询通知」，查询失败时实时推送已经发了，其他用户能看到更新但通知不会发送。两种操作没有统一的失败处理策略，会导致用户在不同场景下看到不一致的现象。

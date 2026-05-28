@@ -2,11 +2,183 @@
 
 ## 概述
 
-Teable 的 View Filter 系统采用 **Specification 模式 + Visitor 模式** 的双层架构，实现了从前端过滤条件到数据库 SQL 查询的完整转换链路。整个流程分为三个核心阶段：
+Teable 的 View Filter 系统采用 **Specification 模式 + Visitor 模式** 的双层架构，实现了从前端过滤条件到数据库 SQL 查询的完整转换链路。
 
-1. **条件树解析** - 将前端 JSON 过滤条件解析为领域对象 Specification
-2. **字段映射** - 将逻辑字段 ID 映射为数据库列名
-3. **SQL 拼装** - 通过 Visitor 模式将 Specification 转换为可执行的 SQL WHERE 子句
+在 `ListTableRecordsHandler.handle()` 中，一条 filter JSON 要依次经过 **5 道预处理** 才进入 Specification 构建，最终由 `TableRecordConditionWhereVisitor` 输出 Kysely SQL 表达式。完整管线如下：
+
+```
+前端 Filter JSON
+  │
+  ├─ 1. resolveFilterFieldKeys()      字段键名→字段ID 统一
+  ├─ 2. replaceCurrentUserTagInFilter() "Me"→实际用户ID 替换
+  ├─ 3. sanitizeRecordFilter()        校验并剔除无效节点
+  ├─ 4. buildRecordConditionSpec()    递归构建 Specification 树
+  └─ 5. TableRecordConditionWhereVisitor  Specification→SQL WHERE
+```
+
+---
+
+## 第零阶段：前置预处理管线
+
+### 0.1 resolveFilterFieldKeys — 字段键名统一
+
+**文件**: `packages/v2/core/src/queries/ListTableRecordsHandler.ts:69-159`
+
+前端 API 可通过 `fieldKeyType` 参数指定字段标识方式：
+
+```typescript
+// packages/v2/core/src/domain/table/fields/FieldKeyType.ts
+export const FieldKeyType = {
+  Id: 'id',           // 字段ID (默认)
+  Name: 'name',       // 字段名
+  DbFieldName: 'dbFieldName',  // 数据库列名
+} as const;
+```
+
+当 `fieldKeyType !== 'id'` 时，`resolveFilterFieldKeys` 递归遍历 filter 树，把所有 `fieldId` 从 name/dbFieldName 反查为真正的字段 ID。**字段引用值**（`value.type === 'field'`）中的 `fieldId` 也一并解析。
+
+```typescript
+// ListTableRecordsHandler.ts:81-159
+function resolveFilterNodeFieldKeys(
+  table: Table,
+  node: RecordFilterNode,
+  fieldKeyType: FieldKeyType
+): Result<RecordFilterNode, DomainError> {
+  if (fieldKeyType === FieldKeyType.Id) {
+    return ok(node);   // 已经是ID，直接通过
+  }
+
+  if (isRecordFilterCondition(node)) {
+    // 解析 condition 的 fieldId
+    const fieldIdResult = FieldKeyResolverService.resolveFieldKey(
+      table, node.fieldId, fieldKeyType
+    );
+    // 同时解析 value 中的字段引用
+    if (isRecordFilterFieldReferenceValue(node.value)) {
+      const valueFieldIdResult = FieldKeyResolverService.resolveFieldKey(
+        table, node.value.fieldId, fieldKeyType
+      );
+      // ...
+    }
+  }
+  // group / not 递归处理...
+}
+```
+
+**调用时机** (`ListTableRecordsHandler.ts:414-416`):
+```typescript
+const resolvedFilter = query.filter
+  ? yield* resolveFilterFieldKeys(table, query.filter, query.fieldKeyType)
+  : undefined;
+```
+
+### 0.2 replaceCurrentUserTagInFilter — "Me" 占位符替换
+
+**文件**: `packages/v2/core/src/queries/ListTableRecordsHandler.ts:169-213`
+
+用户类型字段（user / createdBy / lastModifiedBy）的过滤值中可以使用字符串 `"Me"` 代表当前登录用户。此函数递归遍历 filter 树，将所有用户字段条件值中的 `"Me"` 替换为当前用户的 `actorId`。
+
+```typescript
+const currentUserFilterValue = 'Me';  // ListTableRecordsHandler.ts:45
+
+function replaceCurrentUserTagInFilter(
+  table: Table,
+  filter: RecordFilter | null | undefined,
+  actorId: string
+): RecordFilter | null | undefined {
+  // ...
+  const replaceNode = (node: RecordFilterNode): RecordFilterNode => {
+    if (isRecordFilterCondition(node)) {
+      const fieldResult = table.getField(
+        (field) => field.id().toString() === node.fieldId
+      );
+      if (fieldResult.isErr() || !isUserLikeFieldType(fieldResult.value.type())) {
+        return node;  // 非用户字段，跳过
+      }
+      // 替换 value 中所有 "Me"
+      const replaceValue = (value: RecordFilterValue): RecordFilterValue => {
+        if (Array.isArray(value)) {
+          return value.map((item) => (item === currentUserFilterValue ? actorId : item));
+        }
+        return value === currentUserFilterValue ? actorId : value;
+      };
+      return { ...node, value: replaceValue(node.value) };
+    }
+    // group / not 递归...
+  };
+  return replaceNode(filter);
+}
+```
+
+**调用时机** (`ListTableRecordsHandler.ts:417-421`):
+```typescript
+const actorResolvedFilter = replaceCurrentUserTagInFilter(
+  table, resolvedFilter, context.actorId.toString()
+);
+```
+
+View 默认 filter 也经过同样的替换 (`ListTableRecordsHandler.ts:453-457`):
+```typescript
+const defaultFilter = replaceCurrentUserTagInFilter(
+  table, effectiveQueryDefaults?.filter(), context.actorId.toString()
+);
+```
+
+### 0.3 sanitizeRecordFilter — 校验并剔除无效节点
+
+**文件**: `packages/v2/core/src/queries/RecordFilterMapper.ts:161-170`
+
+View 默认 filter 可能引用已被删除的字段。`sanitizeRecordFilter` 对 filter 树做"尽力校验"：逐节点尝试验证，**无法通过验证的节点被静默剔除**（返回 null），而非报错中断。
+
+```typescript
+// RecordFilterMapper.ts:104-151
+const sanitizeNode = (
+  table: Table,
+  node: RecordFilterNode
+): Result<RecordFilterNode | null, DomainError> => {
+  if (isRecordFilterCondition(node)) {
+    const fieldResult = resolveField(table, node.fieldId);
+    if (fieldResult.isErr()) return ok(null);       // 字段已删除→剔除
+
+    const valueResult = buildConditionValue(table, node.value);
+    if (valueResult.isErr()) return ok(null);        // 值无效→剔除
+
+    const specResult = fieldResult.value.spec().create({
+      operator: node.operator, value: valueResult.value
+    });
+    if (specResult.isErr()) return ok(null);         // 操作符不兼容→剔除
+
+    return ok(node);
+  }
+
+  if (isRecordFilterGroup(node)) {
+    const items: RecordFilterNode[] = [];
+    for (const item of node.items) {
+      const sanitized = sanitizeNode(table, item);
+      if (sanitized.isErr()) return err(sanitized.error);
+      if (sanitized.value) items.push(sanitized.value);  // 仅保留有效节点
+    }
+    if (items.length === 0) return ok(null);             // 组为空→整体剔除
+    return ok({ conjunction: node.conjunction, items });
+  }
+  // not 递归...
+};
+
+export const sanitizeRecordFilter = (
+  table: Table,
+  filter: RecordFilter | null | undefined
+): Result<RecordFilter | null | undefined, DomainError> => {
+  if (filter === undefined || filter === null) return ok(filter);
+  return sanitizeNode(table, filter).map((sanitized) => sanitized ?? null);
+};
+```
+
+**调用时机** (`ListTableRecordsHandler.ts:458`):
+```typescript
+const sanitizedDefaultFilter = yield* sanitizeRecordFilter(table, defaultFilter);
+```
+
+**注意**：查询级 filter（`actorResolvedFilter`）不经过 sanitize，因为它是用户主动传入的，无效字段应直接报错而非静默剔除。
 
 ---
 
@@ -19,25 +191,25 @@ Teable 的 View Filter 系统采用 **Specification 模式 + Visitor 模式** �
 前端传入的过滤条件是一个递归的树形结构，支持三种节点类型：
 
 ```typescript
-type RecordFilterNode = 
+type RecordFilterNode =
   | RecordFilterCondition   // 叶子节点：具体条件
   | RecordFilterGroup       // 组合节点：AND/OR 组
   | RecordFilterNot;        // 否定节点：NOT 操作
 
-// 叶子节点示例
+// 叶子节点
 {
   fieldId: "fld_xxx",
-  operator: "is" | "contains" | "isGreater" | ...,
-  value: string | number | boolean | Array | DateValue | FieldReference
+  operator: "is" | "contains" | "isGreater" | "isWithIn" | ...,
+  value: string | number | boolean | Array | DateValue | FieldReference | null
 }
 
-// 组合节点示例
+// 组合节点
 {
   conjunction: "and" | "or",
   items: [RecordFilterNode, RecordFilterNode, ...]
 }
 
-// 否定节点示例
+// 否定节点
 {
   not: RecordFilterNode
 }
@@ -48,40 +220,109 @@ type RecordFilterNode =
 - `recordFilterGroupSchema` - 组合条件验证（递归定义）
 - `recordFilterNotSchema` - 否定条件验证
 
-### 1.2 DTO 到 Specification 的转换
+### 1.2 完整操作符枚举
+
+**文件**: `packages/v2/core/src/domain/table/records/specs/RecordConditionOperators.ts`
+
+```typescript
+export const recordConditionOperatorSchema = z.enum([
+  'is', 'isNot',
+  'contains', 'doesNotContain',
+  'isEmpty', 'isNotEmpty',
+  'isGreater', 'isGreaterEqual', 'isLess', 'isLessEqual',
+  'isAnyOf', 'isNoneOf',
+  'hasAnyOf', 'hasAllOf',
+  'isNotExactly', 'hasNoneOf', 'isExactly',
+  'isWithIn',              // ← 注意大写 W
+  'isBefore', 'isAfter',
+  'isOnOrBefore', 'isOnOrAfter',
+]);
+```
+
+> **纠正**：日期范围操作符为 **`isWithIn`**（大写 W），而非 `isWithin`。这在 `RecordConditionOperators.ts:26` 和 `DateConditionSpec.ts:28` 中均有定义。
+
+日期模式枚举（`RecordConditionOperators.ts:143-172`）：
+```typescript
+export const recordConditionDateModeSchema = z.enum([
+  'today', 'tomorrow', 'yesterday',
+  'currentWeek', 'currentMonth', 'currentYear',
+  'lastWeek', 'lastMonth', 'lastYear',
+  'nextWeekPeriod', 'nextMonthPeriod', 'nextYearPeriod',
+  'oneWeekAgo', 'oneWeekFromNow',
+  'oneMonthAgo', 'oneMonthFromNow',
+  'daysAgo', 'daysFromNow',
+  'exactDate', 'exactFormatDate',
+  'pastWeek', 'pastMonth', 'pastYear',
+  'nextWeek', 'nextMonth', 'nextYear',
+  'pastNumberOfDays', 'nextNumberOfDays',
+]);
+```
+
+### 1.3 DTO 到 Specification 的转换
 
 **文件**: `packages/v2/core/src/queries/RecordFilterMapper.ts`
 
 核心函数 `buildRecordConditionSpec` 通过递归遍历将 DTO 树转换为 Specification 树：
 
 ```typescript
-// 递归构建 Specification
+// RecordFilterMapper.ts:153-159
+export const buildRecordConditionSpec = (
+  table: Table,
+  filter: RecordFilter
+): Result<ISpecification<TableRecord, ITableRecordConditionSpecVisitor>, DomainError> => {
+  if (!filter) return err(domainError.validation({ message: 'Filter is empty' }));
+  return buildSpecFromNode(table, filter);
+};
+
 const buildSpecFromNode = (table: Table, node: RecordFilterNode) => {
   if (isRecordFilterCondition(node)) {
-    // 叶子节点：创建字段特定的 ConditionSpec
-    return resolveField(table, node.fieldId)
-      .andThen(field => buildConditionValue(table, node.value))
-      .andThen(value => field.spec().create({ operator: node.operator, value }));
+    return resolveField(table, node.fieldId).andThen((field) =>
+      buildConditionValue(table, node.value).andThen((value) =>
+        field.spec().create({ operator: node.operator, value })
+      )
+    );
   }
-  
   if (isRecordFilterNot(node)) {
-    // 否定节点：包装 NotSpec
-    return buildSpecFromNode(table, node.not)
-      .andThen(spec => notSpec(spec));
+    return buildSpecFromNode(table, node.not).andThen((spec) => notSpec(spec));
   }
-  
   if (isRecordFilterGroup(node)) {
-    // 组合节点：使用 SpecBuilder 组装
-    const builder = RecordConditionSpecBuilder.create(node.conjunction);
+    const mode = node.conjunction === 'and' ? 'and' : 'or';
+    const builder = RecordConditionSpecBuilder.create(mode);
     for (const item of node.items) {
-      builder.addConditionSpec(buildSpecFromNode(table, item).value);
+      const childResult = buildSpecFromNode(table, item);
+      if (childResult.isErr()) return err(childResult.error);
+      builder.addConditionSpec(childResult.value);
     }
     return builder.build();
   }
+  return err(domainError.validation({ message: 'Invalid record filter node' }));
 };
 ```
 
-### 1.3 Specification 构建器
+**`buildConditionValue` 的值类型路由** (`RecordFilterMapper.ts:39-72`):
+
+```typescript
+const buildConditionValue = (table: Table, rawValue: RecordFilterValue) => {
+  if (rawValue === null) return ok(undefined);                       // 空值操作符
+  if (isRecordFilterFieldReferenceValue(rawValue)) {                 // 字段引用
+    return FieldId.create(rawValue.fieldId).andThen((fieldId) =>
+      table.getField((c) => c.id().equals(fieldId)).andThen((field) => {
+        if (rawValue.tableId) { /* 校验跨表引用 */ }
+        return RecordConditionFieldReferenceValue.create(field);
+      })
+    );
+  }
+  if (isRecordFilterDateValue(rawValue)) {                           // 日期值
+    return RecordConditionDateValue.create(rawValue);
+  }
+  if (Array.isArray(rawValue)) {                                     // 列表值
+    return RecordConditionLiteralListValue.create(rawValue);
+  }
+  return RecordConditionLiteralValue.create(rawValue);               // 标量值
+};
+```
+
+### 1.4 Specification 构建器
 
 **文件**: `packages/v2/core/src/domain/table/records/specs/RecordConditionSpecBuilder.ts`
 
@@ -121,17 +362,11 @@ type FieldOutputColumn = {
 class FieldOutputColumnVisitor {
   collect(table: Table, projection?: FieldId[]): FieldOutputColumn[] {
     for (const field of table.getFields()) {
-      field.accept(this);  // 访问者模式分派
+      field.accept(this);
     }
   }
-  
-  // 每个字段类型的处理（实际都调用 getColumnAlias）
-  visitSingleLineTextField(field): FieldOutputColumn {
-    return this.addColumn(field);
-  }
-  
+
   private getColumnAlias(field: Field): string {
-    // 从 Field.dbFieldName() 获取真实数据库列名
     return field.dbFieldName().value();
   }
 }
@@ -146,11 +381,112 @@ const resolveColumn = (field: core.Field, tableAlias?: string): Result<string, D
   return safeTry<string, DomainError>(function* () {
     const dbFieldName = yield* field.dbFieldName();
     const column = yield* dbFieldName.value();
-    // 可选：添加表别名前缀，用于 JOIN 查询
     return ok(tableAlias ? `${tableAlias}.${column}` : column);
   });
 };
 ```
+
+### 2.3 hostTableAlias 与字段引用路由
+
+**文件**: `packages/v2/adapter-table-repository-postgres/src/record/visitors/TableRecordConditionWhereVisitor.ts`
+
+当 filter 值是**字段引用**（`{ type: 'field', fieldId: '...' }`）而非字面量时，需要确定引用字段属于哪张表。`hostTableAlias` 正是为这个场景设计的。
+
+#### 构造参数
+
+```typescript
+// TableRecordConditionWhereVisitor.ts:207-218
+interface TableRecordConditionWhereVisitorOptions {
+  tableAlias?: string;
+  /**
+   * Optional host table alias for field reference values (when isSymbol is true).
+   * When conditional lookups use field references, the referenced field is from
+   * the host table (e.g. 't'), while the filter field is from the foreign table
+   * (tableAlias, e.g. 'f').
+   * This generates SQL like: "f"."Status" = "t"."StatusFilter"
+   */
+  hostTableAlias?: string;
+}
+```
+
+#### resolvePrimitiveOperand — 决定引用列归属
+
+```typescript
+// TableRecordConditionWhereVisitor.ts:284-301
+const resolvePrimitiveOperand = (
+  value: core.RecordConditionValue,
+  tableAlias?: string,
+  hostTableAlias?: string
+): Result<PrimitiveOperand, DomainError> => {
+  if (core.isRecordConditionLiteralValue(value)) {
+    return ok({ kind: 'literal', value: value.toValue() });
+  }
+  if (core.isRecordConditionFieldReferenceValue(value)) {
+    return safeTry<PrimitiveOperand, DomainError>(function* () {
+      // 字段引用使用 hostTableAlias（如有），否则回退到 tableAlias
+      const alias = hostTableAlias ?? tableAlias;
+      const column = yield* resolveColumn(value.field(), alias);
+      return ok({ kind: 'field', column });
+    });
+  }
+  return err(core.domainError.unexpected({ message: '...' }));
+};
+```
+
+#### classifyFieldReferenceComparison — 字段引用的类型路由
+
+**文件**: `TableRecordConditionWhereVisitor.ts:432-471`
+
+当两个字段相互比较时（如 `字段A = 字段B`），需要根据字段类型决定比较策略。`hasHostTableAlias` 参数会影响路由结果：
+
+```typescript
+type FieldReferenceComparisonRoute =
+  | { kind: 'userOrLinkIds' }      // 用户/链接按 ID 比较
+  | { kind: 'linkTitle' }          // 链接按标题比较
+  | { kind: 'date'; compareAsDateOnly: boolean }  // 日期比较
+  | { kind: 'json' }               // JSON 序列化比较
+  | { kind: 'generic' }            // 通用相等比较
+  | { kind: 'incompatible' };      // 类型不兼容→ 1=0
+
+const classifyFieldReferenceComparison = (
+  field: core.Field,
+  referenceField: core.Field,
+  hasHostTableAlias: boolean        // ← 是否有 hostTableAlias
+): Result<FieldReferenceComparisonRoute, DomainError> => {
+  // 用户/链接类字段
+  if (leftIsUserOrLinkLike) {
+    if (rightIsUserOrLinkLike) return ok({ kind: 'userOrLinkIds' });
+    if (fieldIsLink(field)) return ok({ kind: 'linkTitle' });
+    // 有 hostTableAlias 且右侧不是用户/链接 → 不兼容
+    return ok(hasHostTableAlias ? { kind: 'incompatible' } : { kind: 'generic' });
+  }
+
+  // 日期字段
+  if (compareAsDateOnly) return ok({ kind: 'date', compareAsDateOnly });
+
+  // JSON 字段
+  if (fieldIsJson(field) || fieldIsJson(referenceField)) return ok({ kind: 'json' });
+
+  // 无 hostTableAlias → 通用比较
+  if (!hasHostTableAlias) return ok({ kind: 'generic' });
+
+  // 有 hostTableAlias → 检查两侧类型是否兼容
+  const leftKind = yield* resolveFieldReferenceComparisonKind(field);
+  const rightKind = yield* resolveFieldReferenceComparisonKind(referenceField);
+  return ok(leftKind === rightKind ? { kind: 'generic' } : { kind: 'incompatible' });
+};
+```
+
+**路由结果对应的 SQL 生成** (`buildIsCondition`, `TableRecordConditionWhereVisitor.ts:695-826`):
+
+| 路由 | SQL 策略 |
+|------|---------|
+| `userOrLinkIds` | `jsonb_extract_path_text(to_jsonb(left), 'id') = jsonb_extract_path_text(to_jsonb(right), 'id')` |
+| `linkTitle` | `buildLinkTitleMatchCondition(left, right)` |
+| `date` | `(left AT TIME ZONE tz)::date = (right AT TIME ZONE tz)::date` |
+| `json` | `to_jsonb(left) = to_jsonb(right)` |
+| `generic` | `left = right` |
+| `incompatible` | `1 = 0` (恒假) |
 
 ---
 
@@ -160,41 +496,13 @@ const resolveColumn = (field: core.Field, tableAlias?: string): Result<string, D
 
 **文件**: `packages/v2/core/src/domain/table/records/specs/ITableRecordConditionSpecVisitor.ts`
 
-定义了超过 200 个 visit 方法，每个字段类型 + 每个操作符组合一个方法：
-
-```typescript
-interface ITableRecordConditionSpecVisitor<TResult = unknown> {
-  // 基础记录条件
-  visitRecordById(spec: RecordByIdSpec): Result<TResult, DomainError>;
-  visitRecordByIds(spec: RecordByIdsSpec): Result<TResult, DomainError>;
-  
-  // 单行文本字段条件
-  visitSingleLineTextIs(spec: SingleLineTextConditionSpec): Result<TResult, DomainError>;
-  visitSingleLineTextIsNot(spec: SingleLineTextConditionSpec): Result<TResult, DomainError>;
-  visitSingleLineTextContains(spec: SingleLineTextConditionSpec): Result<TResult, DomainError>;
-  visitSingleLineTextDoesNotContain(...): Result<TResult, DomainError>;
-  visitSingleLineTextIsEmpty(...): Result<TResult, DomainError>;
-  visitSingleLineTextIsNotEmpty(...): Result<TResult, DomainError>;
-  
-  // 数字字段条件 (6 个操作符)
-  visitNumberIs / visitNumberIsNot / visitNumberIsGreater
-  visitNumberIsGreaterEqual / visitNumberIsLess / visitNumberIsLessEqual
-  
-  // 日期字段条件 (8 个操作符)
-  visitDateIs / visitDateIsNot / visitDateIsWithIn
-  visitDateIsBefore / visitDateIsAfter
-  visitDateIsOnOrBefore / visitDateIsOnOrAfter
-  
-  // ... 其他字段类型 (多选、用户、链接、公式、汇总等)
-  // 总计约 200+ 个 visit 方法
-}
-```
+定义了超过 200 个 visit 方法，每个字段类型 × 每个操作符组合一个方法。
 
 ### 3.2 SQL WHERE 条件访问者实现
 
 **文件**: `packages/v2/adapter-table-repository-postgres/src/record/visitors/TableRecordConditionWhereVisitor.ts`
 
-`TableRecordConditionWhereVisitor` 是最核心的 SQL 生成器，实现了上述接口的所有方法，将每个 Specification 转换为 `kysely` 的 SQL 表达式。
+`TableRecordConditionWhereVisitor` 是最核心的 SQL 生成器。
 
 #### 核心结构：
 
@@ -202,183 +510,117 @@ interface ITableRecordConditionSpecVisitor<TResult = unknown> {
 class TableRecordConditionWhereVisitor
   extends AbstractSpecFilterVisitor<RecordConditionWhere>
   implements ITableRecordConditionSpecVisitor<RecordConditionWhere> {
-  
-  constructor(options?: { tableAlias?: string; hostTableAlias?: string }) {
+
+  constructor(options?: TableRecordConditionWhereVisitorOptions) {
     super();
+    this.tableAlias = options?.tableAlias;
+    this.hostTableAlias = options?.hostTableAlias;
   }
-  
-  // 逻辑组合
-  and(left: SqlExpr, right: SqlExpr): SqlExpr {
-    return sql`(${left}) and (${right})`;
+
+  clone(): this {
+    return new TableRecordConditionWhereVisitor({
+      tableAlias: this.tableAlias,
+      hostTableAlias: this.hostTableAlias,
+    }) as this;
   }
-  or(left: SqlExpr, right: SqlExpr): SqlExpr {
-    return sql`(${left}) or (${right})`;
-  }
-  not(inner: SqlExpr): SqlExpr {
-    return sql`not (${inner})`;
-  }
-  
-  // 每个 visitXxx 方法调用对应的辅助构建函数
-  visitSingleLineTextIs(spec: SingleLineTextConditionSpec) {
-    return this.applyIs(spec.field(), spec.value());
-  }
+
+  and(left, right) { return sql`(${left}) and (${right})`; }
+  or(left, right)  { return sql`(${left}) or (${right})`; }
+  not(inner)       { return sql`not (${inner})`; }
 }
 ```
 
 #### 关键构建函数：
 
-**1. `buildIsCondition` - 等值比较** (`TableRecordConditionWhereVisitor.ts:695-826`)
+**1. `buildIsCondition`** (`TableRecordConditionWhereVisitor.ts:695-826`)
 
-处理 `is` 操作符，针对不同字段类型生成不同 SQL：
+处理 `is` 操作符，根据字段类型和值类型分路：
 
-```typescript
-// 简单字符串
-sql`${columnRef} = ${literalValue}`
-
-// 用户/链接类型（JSON 存储）
-sql`jsonb_extract_path_text(to_jsonb(${columnRef}), 'id') = ${rightLiteral}`
-
-// 多值字段（数组）
-sql`EXISTS (
-  SELECT 1 FROM jsonb_array_elements_text(${normalizedArray}) AS elem
-  WHERE elem = ${value}
-)`
-
-// 字段引用比较（字段 A = 字段 B）
-// 需要类型路由：userOrLinkIds / linkTitle / date / json / generic
+```
+buildIsCondition(field, value, tableAlias, hostTableAlias)
+  │
+  ├─ value 是日期值 → resolveDateRange → BETWEEN
+  ├─ value 是字段引用 → classifyFieldReferenceComparison → 路由
+  │   ├─ userOrLinkIds → jsonb_extract_path_text 比较
+  │   ├─ linkTitle     → buildLinkTitleMatchCondition
+  │   ├─ date          → 时区转换后比较
+  │   ├─ json          → to_jsonb 比较
+  │   ├─ generic       → 直接 =
+  │   └─ incompatible  → 1 = 0
+  ├─ 字段是 user/link (字面量) → jsonb_extract_path_text(..., 'id') =
+  ├─ 字段是 json/array → EXISTS + jsonb_array_elements_text
+  └─ 普通字段 → column = literal
 ```
 
-**2. `buildContainsCondition` - 包含匹配** (`TableRecordConditionWhereVisitor.ts:968-1019`)
+**2. `buildContainsCondition`** (`TableRecordConditionWhereVisitor.ts:968-1019`)
 
-```typescript
-// 简单字符串 ILIKE
-sql`${columnRef} ilike '%${escapedValue}%' escape '\\'`
+**3. `buildNumericComparisonCondition`** (`TableRecordConditionWhereVisitor.ts:1021-1078`)
 
-// JSON/数组类型
-sql`jsonb_path_exists(${target}, '$[*] ? (@ like_regex "${escapedValue}" flag "i")'::jsonpath)`
-```
+**4. `buildDateComparisonCondition`** (`TableRecordConditionWhereVisitor.ts:1080-1182`)
 
-**3. `buildNumericComparisonCondition` - 数值比较** (`TableRecordConditionWhereVisitor.ts:1021-1078`)
+**5. `buildListCondition`** (`TableRecordConditionWhereVisitor.ts:1211-1327`)
 
-```typescript
-// 简单数值
-sql`${columnRef} > ${value}`
-
-// 数组内元素比较
-sql`EXISTS (
-  SELECT 1 FROM jsonb_array_elements_text(${normalizedArray}) AS elem
-  WHERE NULLIF(REGEXP_REPLACE(elem, '[^0-9.+-]', '', 'g'), '')::double precision > ${value}
-)`
-```
-
-**4. `buildDateComparisonCondition` - 日期比较** (`TableRecordConditionWhereVisitor.ts:1080-1182`)
-
-```typescript
-// 处理时区转换
-const compareAsDateOnly = shouldCompareAsDateOnly(field);
-const leftExpr = compareAsDateOnly 
-  ? sql`(${columnRef} AT TIME ZONE ${timeZone})::date`
-  : columnRef;
-sql`${leftExpr} ${operator} ${right}`
-```
-
-**5. `buildListCondition` - 列表操作（any/none/all/exact）** (`TableRecordConditionWhereVisitor.ts:1211-1327`)
-
-```typescript
-// IN 查询
-sql`${columnRef} in (${valueList})`
-
-// JSON 数组操作符
-sql`${jsonbColumn} ?| ${textArray}`    // any
-sql`${jsonbColumn} ?& ${textArray}`    // all
-sql`${jsonbColumn} @> ${jsonbArray}`   // contains
-```
-
-**6. `resolveDateRange` - 日期范围解析** (`TableRecordConditionWhereVisitor.ts:473-639`)
-
-支持多种日期模式：
-- `today` / `tomorrow` / `yesterday`
-- `oneWeekAgo` / `oneMonthAgo`
-- `daysAgo` / `daysFromNow` (需要 numberOfDays)
-- `exactDate` / `exactFormatDate`
-- `currentWeek` / `currentMonth` / `currentYear`
-- `lastWeek` / `nextWeekPeriod` 等
+**6. `resolveDateRange`** (`TableRecordConditionWhereVisitor.ts:473-639`)
 
 ### 3.3 WHERE 子句构建入口
 
 **文件**: `packages/v2/adapter-table-repository-postgres/src/record/repository/buildRecordWhereClause.ts`
 
 ```typescript
-const buildRecordWhereClause = (
+export const buildRecordWhereClause = (
   spec: ISpecification<TableRecord, ITableRecordConditionSpecVisitor>,
-  options?: { tableAlias?: string }
+  options?: TableRecordConditionWhereVisitorOptions  // 含 tableAlias + hostTableAlias
 ): Result<Expression<SqlBool> | null, DomainError> => {
   const visitor = new TableRecordConditionWhereVisitor(options);
-  const acceptResult = spec.accept(visitor);  // 触发访问者模式
-  return visitor.where();  // 获取最终 SQL 表达式
+  const acceptResult = spec.accept(visitor);
+  if (acceptResult.isErr()) return err(acceptResult.error);
+  const whereResult = visitor.where();
+  if (whereResult.isErr()) {
+    if (whereResult.error.message === 'Empty where condition') return ok(null);
+    return err(whereResult.error);
+  }
+  return ok(whereResult.value as unknown as Expression<SqlBool>);
 };
-```
-
-### 3.4 搜索条件构建
-
-**文件**: `packages/v2/adapter-table-repository-postgres/src/record/repository/RecordSearchWhereBuilder.ts`
-
-全局搜索（跨字段搜索）的 SQL 构建：
-
-```typescript
-buildRecordSearchWhereClause(table, recordSearch, { tableAlias: 't' })
-  // 为每个字段生成搜索条件，然后 OR 组合
-  // 不同字段类型有不同的搜索策略：
-  // - 结构化字段 (user/link/attachment): 匹配 title
-  // - 数字: ROUND 后字符串匹配
-  // - 日期: 解析为日期范围查询
-  // - 长文本: 去除换行符后匹配
-  // - 多值字段: 聚合数组元素后匹配
 ```
 
 ---
 
 ## 完整调用链
 
-### 查询记录的完整流程
+### ListTableRecordsHandler 中的真实调用路径
 
 ```
-ListTableRecordsHandler.execute()
+ListTableRecordsHandler.handle(context, query)
   │
-  ├─ 解析 ViewQueryDefaults (View 级默认过滤)
-  │   └─ ViewQueryDefaults.filter()
+  ├─ 1. 加载 Table
+  │     └─ tableRepository.findOne(context, TableByIdSpec)
   │
-  ├─ 解析查询级过滤条件
-  │   └─ resolveFilterFieldKeys() → 字段键解析
+  ├─ 2. resolveFilterFieldKeys(table, query.filter, query.fieldKeyType)
+  │     └─ 将 name/dbFieldName 键名反查为字段 ID
   │
-  ├─ 合并过滤条件
-  │   └─ ViewQueryDefaults.merge()
+  ├─ 3. replaceCurrentUserTagInFilter(table, resolvedFilter, actorId)
+  │     └─ 将 "Me" 替换为当前用户 ID
   │
-  ├─ 构建 Specification
-  │   └─ buildRecordConditionSpec(table, filter)
-  │       └─ RecordFilterMapper.ts (递归 DTO → Spec)
+  ├─ 4. 加载 View 默认过滤
+  │     ├─ effectiveView.queryDefaults()
+  │     ├─ replaceCurrentUserTagInFilter(table, defaultFilter, actorId)
+  │     └─ sanitizeRecordFilter(table, defaultFilter)
+  │         └─ 剔除引用已删除字段的节点
   │
-  ├─ 调用 Repository
-  │   └─ PostgresTableRecordQueryRepository.find()
-  │       │
-  │       ├─ 创建 QueryBuilder
-  │       │   └─ queryBuilderManager.createBuilder()
-  │       │
-  │       ├─ 应用过滤
-  │       │   └─ queryBuilder.where(spec)
-  │       │
-  │       ├─ 构建 SQL
-  │       │   └─ queryBuilder.build()
-  │       │       │
-  │       │       └─ buildRecordWhereClause(spec, { tableAlias: 't' })
-  │       │           └─ TableRecordConditionWhereVisitor
-  │       │               └─ spec.accept(visitor)  →  SQL Expr
-  │       │
-  │       └─ 执行查询
-  │           └─ kysely.executeQuery()
+  ├─ 5. mergeFilterWithViewDefaults(sanitizedDefault, actorResolvedFilter)
+  │     └─ sanitizeFilterByEnabledFieldIds(merged, enabledFieldIds)
   │
-  └─ 返回结果
-      └─ ListTableRecordsResult.create()
+  ├─ 6. buildQueryPlan(context, table, query, effectiveFilter, ...)
+  │     └─ buildRecordConditionSpec(table, resolvedFilter)
+  │         └─ RecordFilterMapper.ts 递归 DTO → Specification
+  │
+  ├─ 7. tableRecordQueryRepository.find(context, table, spec, ...)
+  │     └─ buildRecordWhereClause(spec, { tableAlias: 't' })
+  │         └─ TableRecordConditionWhereVisitor
+  │             └─ spec.accept(visitor) → SQL Expr
+  │
+  └─ 8. 返回结果 + 字段键名反向转换
+      └─ FieldKeyResolverService.transformResponseKeys(table, fields, fieldKeyType)
 ```
 
 ---
@@ -403,19 +645,49 @@ SingleLineTextConditionSpec / NumberConditionSpec / ...  (叶子)
 
 **目的**: 分离算法（SQL 生成）与数据结构（Specification 树）
 
+**AndSpec.accept()** — 复用同一个访问者，顺序累积条件：
+```typescript
+accept(v: V): Result<void, DomainError> {
+  return v.visit(this)
+    .andThen(() => this.left.accept(v))
+    .andThen(() => this.right.accept(v))
+    .map(() => undefined);
+}
 ```
-ISpecification.accept(visitor)
-  → 分派到具体的 visitXxx 方法
 
-ITableRecordConditionSpecVisitor
-  ├─ TableRecordConditionWhereVisitor  (生成 SQL WHERE)
-  ├─ NoopRecordConditionSpecVisitor    (空操作，用于测试)
-  └─ ... (未来可扩展: 内存校验、MongoDB 查询生成等)
+**OrSpec.accept()** — 克隆两个独立访问者，分别累积后合并：
+```typescript
+accept(v: V): Result<void, DomainError> {
+  if (isSpecFilterVisitor(v)) {
+    const leftVisitor = v.clone();
+    const rightVisitor = v.clone();
+    return v.visit(this)
+      .andThen(() => this.left.accept(leftVisitor))
+      .andThen(() => this.right.accept(rightVisitor))
+      .andThen(() => leftVisitor.where())
+      .andThen(leftCond =>
+        rightVisitor.where().map(rightCond => v.or(leftCond, rightCond))
+      )
+      .andThen(cond => v.addCond(cond));
+  }
+}
+```
+
+**NotSpec.accept()** — 克隆一个访问者处理内部条件，然后取反：
+```typescript
+accept(v: V): Result<void, DomainError> {
+  if (isSpecFilterVisitor(v)) {
+    const innerVisitor = v.clone();
+    return v.visit(this)
+      .andThen(() => this.inner.accept(innerVisitor))
+      .andThen(() => innerVisitor.where())
+      .map((innerCond) => v.not(innerCond))
+      .andThen((cond) => v.addCond(cond));
+  }
+}
 ```
 
 ### 3. Builder 模式
-
-**目的**: 提供流畅的 API 构建复杂条件树
 
 ```
 RecordConditionSpecBuilder.create('and')
@@ -444,9 +716,9 @@ RecordConditionSpecBuilder.create('and')
 ### 3. 字段引用比较
 
 支持 `字段 A = 字段 B` 的比较方式，需要：
-- 类型兼容性检查
-- 结构化类型特殊路由（用户/链接按 ID 比较）
-- 日期时区统一转换
+- 通过 `hostTableAlias` 确定引用字段的表归属
+- 通过 `classifyFieldReferenceComparison` 路由到正确的比较策略
+- 跨表且类型不兼容时降级为 `1 = 0`
 
 ### 4. 性能考虑
 
@@ -456,469 +728,46 @@ RecordConditionSpecBuilder.create('and')
 
 ---
 
-## 相关文件速查
+## 数据库表结构说明
 
-| 模块 | 文件路径 |
-|------|---------|
-| DTO 定义 | `packages/v2/core/src/queries/RecordFilterDto.ts` |
-| DTO → Spec 映射 | `packages/v2/core/src/queries/RecordFilterMapper.ts` |
-| Spec 构建器 | `packages/v2/core/src/domain/table/records/specs/RecordConditionSpecBuilder.ts` |
-| 访问者接口 | `packages/v2/core/src/domain/table/records/specs/ITableRecordConditionSpecVisitor.ts` |
-| SQL WHERE 生成 | `packages/v2/adapter-table-repository-postgres/src/record/visitors/TableRecordConditionWhereVisitor.ts` |
-| 字段列映射 | `packages/v2/adapter-table-repository-postgres/src/record/query-builder/FieldOutputColumnVisitor.ts` |
-| 查询仓库 | `packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordQueryRepository.ts` |
-| 列表查询处理器 | `packages/v2/core/src/queries/ListTableRecordsHandler.ts` |
-| View 查询默认值 | `packages/v2/core/src/domain/table/views/ViewQueryDefaults.ts` |
-| 字段条件值对象 | `packages/v2/core/src/domain/table/fields/types/FieldCondition.ts` |
+### 动态表命名机制
 
----
+Teable **不使用 Prisma 定义业务数据表**，而是通过 Kysely 动态创建和管理表。
 
-## 附录：完整样例追踪
+**`DbTableName` 的真实规则** (`packages/v2/core/src/domain/table/DbTableName.ts`):
 
-以下通过一个**真实的复合过滤条件**，逐步追踪从前端 JSON 到最终 SQL 的完整转换过程。
-
----
-
-### A.1 样例场景
-
-假设我们有一个任务管理表，字段配置如下：
-
-| 字段名 | 字段类型 | 字段 ID | 数据库列名 |
-|--------|---------|---------|-----------|
-| Name | 单行文本 | `fld_name` | `col_name` |
-| Status | 单选 | `fld_status` | `col_status` |
-| Priority | 单选 | `fld_priority` | `col_priority` |
-| Due Date | 日期 | `fld_due` | `col_due_date` |
-| Assignee | 用户(单选) | `fld_assignee` | `col_assignee` |
-| Score | 数字 | `fld_score` | `col_score` |
-
-**业务需求**：查询 **高优先级且未完成** 的任务，满足以下任一条件：
-- 名称包含 "bug" **并且** 负责人是 "张三"
-- **或者** 截止日期在本周内 **并且** 分数 > 80
-
----
-
-### A.2 第一阶段：JSON 过滤条件 (前端输入)
-
-**前端传入的完整 Filter JSON**：
-
-```json
-{
-  "conjunction": "and",
-  "items": [
-    {
-      "fieldId": "fld_priority",
-      "operator": "is",
-      "value": "High"
-    },
-    {
-      "fieldId": "fld_status",
-      "operator": "isNot",
-      "value": "Done"
-    },
-    {
-      "conjunction": "or",
-      "items": [
-        {
-          "conjunction": "and",
-          "items": [
-            {
-              "fieldId": "fld_name",
-              "operator": "contains",
-              "value": "bug"
-            },
-            {
-              "fieldId": "fld_assignee",
-              "operator": "is",
-              "value": { "type": "user", "id": "usr_zhangsan", "title": "张三" }
-            }
-          ]
-        },
-        {
-          "conjunction": "and",
-          "items": [
-            {
-              "fieldId": "fld_due",
-              "operator": "isWithin",
-              "value": { "mode": "currentWeek", "timeZone": "Asia/Shanghai" }
-            },
-            {
-              "fieldId": "fld_score",
-              "operator": "isGreater",
-              "value": 80
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}
-```
-
-**条件树结构**：
-
-```
-AND (根节点)
-  ├─ Priority = "High"           (叶子 1)
-  ├─ Status ≠ "Done"             (叶子 2)
-  └─ OR
-      ├─ AND (分支 A)
-      │   ├─ Name contains "bug"    (叶子 3)
-      │   └─ Assignee = "张三"      (叶子 4)
-      └─ AND (分支 B)
-          ├─ Due Date is 本周内     (叶子 5)
-          └─ Score > 80             (叶子 6)
-```
-
----
-
-### A.3 第二阶段：JSON → Specification 递归转换
-
-**文件**: `packages/v2/core/src/queries/RecordFilterMapper.ts`
-
-转换过程通过 `buildRecordConditionSpec` 函数递归执行：
-
-#### 步骤 1: 解析根节点 AND 组
+`DbTableName` 是一个 `RehydratedValueObject`，其值由建表时决定，**没有固定的 bse/tbl 前缀模式**。格式为 `schema.tableName`（含点号时按 `.` 分割）或不含 schema 的纯表名。
 
 ```typescript
-// 入口: buildRecordConditionSpec(table, rootFilter)
-const builder = RecordConditionSpecBuilder.create('and');
-
-// 遍历 items:
-// item[0]: Priority = "High"
-builder.addConditionSpec(
-  SingleSelectConditionSpec.create(priorityField, 'is', LiteralValue("High"))
-);
-
-// item[1]: Status ≠ "Done"
-builder.addConditionSpec(
-  SingleSelectConditionSpec.create(statusField, 'isNot', LiteralValue("Done"))
-);
-
-// item[2]: OR 组 → 递归构建子 Specification
-const orGroupBuilder = RecordConditionSpecBuilder.create('or');
-// ... 递归处理 OR 组的 items
-builder.addConditionSpec(orGroupResult.value);
-
-// 最终返回: AndSpec(AndSpec(Spec1, Spec2), OrSpec(SpecA, SpecB))
-```
-
-#### 步骤 2: 递归处理 OR 组内的 AND 分支
-
-```typescript
-// 分支 A: (Name contains "bug" AND Assignee = "张三")
-const branchA = RecordConditionSpecBuilder.create('and');
-branchA.addConditionSpec(
-  SingleLineTextConditionSpec.create(nameField, 'contains', LiteralValue("bug"))
-);
-branchA.addConditionSpec(
-  UserConditionSpec.create(assigneeField, 'is', UserValue({ id: "usr_zhangsan" }))
-);
-
-// 分支 B: (Due Date is 本周内 AND Score > 80)
-const branchB = RecordConditionSpecBuilder.create('and');
-branchB.addConditionSpec(
-  DateConditionSpec.create(dueField, 'isWithin', DateValue({ mode: "currentWeek" }))
-);
-branchB.addConditionSpec(
-  NumberConditionSpec.create(scoreField, 'isGreater', LiteralValue(80))
-);
-
-// 组合为 OrSpec
-orGroupBuilder.addConditionSpec(branchA.build().value);
-orGroupBuilder.addConditionSpec(branchB.build().value);
-```
-
-#### 步骤 3: 最终 Specification 树结构
-
-```
-AndSpec (根)
-  ├─ left: AndSpec
-  │     ├─ left: SingleSelectConditionSpec (Priority = "High")
-  │     └─ right: SingleSelectConditionSpec (Status ≠ "Done")
-  └─ right: OrSpec
-        ├─ left: AndSpec (分支 A)
-        │     ├─ left: SingleLineTextConditionSpec (Name contains "bug")
-        │     └─ right: UserConditionSpec (Assignee = "张三")
-        └─ right: AndSpec (分支 B)
-              ├─ left: DateConditionSpec (Due Date is 本周内)
-              └─ right: NumberConditionSpec (Score > 80)
-```
-
----
-
-### A.4 第三阶段：字段 ID → 数据库列名映射
-
-**文件**: `packages/v2/adapter-table-repository-postgres/src/record/query-builder/FieldOutputColumnVisitor.ts`
-
-在 SQL 生成之前，通过访问者模式收集所有涉及字段的列名：
-
-```typescript
-// 伪代码：字段到列的映射表
-const fieldToColumnMap = {
-  "fld_name":      "col_name",      // 单行文本 → TEXT
-  "fld_status":    "col_status",    // 单选 → TEXT
-  "fld_priority":  "col_priority",  // 单选 → TEXT
-  "fld_due":       "col_due_date",  // 日期 → TIMESTAMPTZ
-  "fld_assignee":  "col_assignee",  // 用户 → JSONB
-  "fld_score":     "col_score",     // 数字 → DOUBLE PRECISION
-};
-```
-
-**关键点**：
-- 每个字段对象通过 `field.dbFieldName()` 获取存储的列名
-- 表别名通过参数传入（通常为 `t`）
-- 最终列引用格式：`"t"."col_name"`
-
----
-
-### A.5 第四阶段：Specification → Kysely SQL 表达式
-
-**文件**: `packages/v2/adapter-table-repository-postgres/src/record/visitors/TableRecordConditionWhereVisitor.ts`
-
-#### 访问者模式的执行流程
-
-```typescript
-const visitor = new TableRecordConditionWhereVisitor({ tableAlias: 't' });
-spec.accept(visitor);  // 触发递归访问
-const sqlExpr = visitor.where().value;
-```
-
-**AndSpec.accept() 的实现** (`packages/v2/core/src/domain/shared/specification/AndSpec.ts:30-36`):
-```typescript
-accept(v: V): Result<void, DomainError> {
-  return v
-    .visit(this)              // 1. 通知访问者进入 AndSpec
-    .andThen(() => this.left.accept(v))   // 2. 递归访问左子树
-    .andThen(() => this.right.accept(v))  // 3. 递归访问右子树
-    .map(() => undefined);
-}
-```
-
-**OrSpec.accept() 的特殊实现** (`packages/v2/core/src/domain/shared/specification/OrSpec.ts:33-52`):
-```typescript
-accept(v: V): Result<void, DomainError> {
-  if (isSpecFilterVisitor(v)) {
-    const leftVisitor = v.clone();   // 克隆访问者处理左分支
-    const rightVisitor = v.clone();  // 克隆访问者处理右分支
-
-    return v.visit(this)
-      .andThen(() => this.left.accept(leftVisitor))
-      .andThen(() => this.right.accept(rightVisitor))
-      .andThen(() => leftVisitor.where())
-      .andThen(leftCond => 
-        rightVisitor.where().map(rightCond => v.or(leftCond, rightCond))
-      )
-      .andThen(cond => v.addCond(cond));
+// DbTableName.ts
+export class DbTableName extends RehydratedValueObject {
+  split(options?: { defaultSchema?: string | null }): Result<{
+    schema: string | null;
+    tableName: string;
+  }> {
+    return this.value().map((raw) => {
+      const dotIndex = raw.indexOf('.');
+      if (dotIndex === -1) {
+        return { schema: options?.defaultSchema ?? null, tableName: raw };
+      }
+      return { schema: raw.slice(0, dotIndex), tableName: raw.slice(dotIndex + 1) };
+    });
   }
-  // ...
 }
 ```
 
-> **关键洞察**：OrSpec 需要**克隆两个独立的访问者**来分别处理左右分支，因为每个分支会累积自己的条件状态。而 AndSpec 可以复用同一个访问者，条件会被顺序累积。
-
----
-
-### A.6 各个叶子节点的 SQL 生成详解
-
-#### 叶子 1: Priority = "High"
-
+建表 API 允许用户指定 `dbTableName` (`packages/v2/core/src/schemas/table/createTable.schema.ts:15`):
 ```typescript
-// visitSingleSelectIs(spec)
-// → buildIsCondition(field, value)
-
-// 最终 SQL:
-"t"."col_priority" = $1
-// 参数: ["High"]
+export const createTableInputSchema = z.object({
+  baseId: z.string(),
+  tableId: z.string().optional(),
+  name: z.string(),
+  dbTableName: z.string().optional(),  // ← 用户可自定义
+  // ...
+});
 ```
 
-**代码路径**：`TableRecordConditionWhereVisitor.ts:2200` → `visitSingleSelectIs()` → `applyIs()` → `buildIsCondition()`
-
-#### 叶子 2: Status ≠ "Done"
-
-```typescript
-// visitSingleSelectIsNot(spec)
-// → buildIsNotCondition(field, value)
-
-// 注意: 使用 IS DISTINCT FROM 以正确处理 NULL
-// 最终 SQL:
-"t"."col_status" is distinct from $1
-// 参数: ["Done"]
-```
-
-**代码路径**：`TableRecordConditionWhereVisitor.ts:2206` → `visitSingleSelectIsNot()` → `buildIsNotCondition()`
-
-#### 叶子 3: Name contains "bug"
-
-```typescript
-// visitSingleLineTextContains(spec)
-// → buildContainsCondition(field, value)
-
-// 注意: 使用 ILIKE 进行大小写不敏感匹配
-// 最终 SQL:
-"t"."col_name" ilike $1 escape '\'
-// 参数: ["%bug%"]
-```
-
-**代码路径**：`TableRecordConditionWhereVisitor.ts:2052` → `visitSingleLineTextContains()` → `buildContainsCondition()`
-
-#### 叶子 4: Assignee = "张三"
-
-```typescript
-// visitUserIs(spec)
-// → buildIsCondition(field, value, type: 'userOrLinkIds')
-
-// 用户字段存储为 JSONB: { id: "usr_xxx", title: "xxx" }
-// 需要从 JSON 中提取 id 进行比较
-// 最终 SQL:
-jsonb_extract_path_text(to_jsonb("t"."col_assignee"), 'id') = $1
-// 参数: ["usr_zhangsan"]
-```
-
-**代码路径**：`TableRecordConditionWhereVisitor.ts:2333` → `visitUserIs()` → `applyIs()` → `buildIsCondition(type: 'userOrLinkIds')`
-
-#### 叶子 5: Due Date is 本周内
-
-```typescript
-// visitDateIsWithIn(spec)
-// → resolveDateRange(mode, timeZone)
-// → buildDateBetweenCondition(field, start, end)
-
-// 假设今天是 2026-05-28 (周四)
-// 上海时区的本周: 2026-05-26 00:00:00 ~ 2026-06-01 23:59:59.999
-// 最终 SQL:
-(("t"."col_due_date" AT TIME ZONE $1)::date >= $2 AND ("t"."col_due_date" AT TIME ZONE $1)::date < $3)
-// 参数: ["Asia/Shanghai", "2026-05-26", "2026-06-02"]
-```
-
-**代码路径**：`TableRecordConditionWhereVisitor.ts:2132` → `visitDateIsWithIn()` → `resolveDateRange()` → `buildDateBetweenCondition()`
-
-#### 叶子 6: Score > 80
-
-```typescript
-// visitNumberIsGreater(spec)
-// → buildNumericComparisonCondition(field, value, '>')
-
-// 最终 SQL:
-"t"."col_score" > $1
-// 参数: [80]
-```
-
-**代码路径**：`TableRecordConditionWhereVisitor.ts:2260` → `visitNumberIsGreater()` → `buildNumericComparisonCondition()`
-
----
-
-### A.7 组合条件的 SQL 拼装
-
-#### 分支 A 的 AND 组合
-
-```sql
--- (Name contains "bug") AND (Assignee = "张三")
-(("t"."col_name" ilike $1 escape '\')) and (jsonb_extract_path_text(to_jsonb("t"."col_assignee"), 'id') = $2)
--- 参数: ["%bug%", "usr_zhangsan"]
-```
-
-#### 分支 B 的 AND 组合
-
-```sql
--- (Due Date is 本周内) AND (Score > 80)
-(((("t"."col_due_date" AT TIME ZONE $1)::date >= $2 AND ("t"."col_due_date" AT TIME ZONE $1)::date < $3)) and ("t"."col_score" > $4))
--- 参数: ["Asia/Shanghai", "2026-05-26", "2026-06-02", 80]
-```
-
-#### OR 组合（分支 A ∨ 分支 B）
-
-```sql
--- 分支 A OR 分支 B
-((分支 A 的 SQL) or (分支 B 的 SQL))
-```
-
-#### 根节点 AND 组合
-
-```sql
--- (Priority = "High") AND (Status ≠ "Done") AND (OR 组合)
-((("t"."col_priority" = $1) and ("t"."col_status" is distinct from $2)) and ((分支 A) or (分支 B)))
-```
-
----
-
-### A.8 最终生成的完整 SQL
-
-```sql
-SELECT *
-FROM "bse_xxxxxxxxxxxxxxx"."tbl_xxxxxxxxxxxxxxx" AS "t"
-WHERE (
-  (
-    ("t"."col_priority" = $1) 
-    AND 
-    ("t"."col_status" is distinct from $2)
-  ) 
-  AND 
-  (
-    (
-      ("t"."col_name" ilike $3 escape '\') 
-      AND 
-      (jsonb_extract_path_text(to_jsonb("t"."col_assignee"), 'id') = $4)
-    ) 
-    OR 
-    (
-      (
-        (("t"."col_due_date" AT TIME ZONE $5)::date >= $6 
-         AND 
-         ("t"."col_due_date" AT TIME ZONE $5)::date < $7)
-      ) 
-      AND 
-      ("t"."col_score" > $8)
-    )
-  )
-)
-```
-
-**参数绑定数组**：
-```typescript
-[
-  "High",                     // $1: Priority
-  "Done",                     // $2: Status
-  "%bug%",                    // $3: Name contains
-  "usr_zhangsan",             // $4: Assignee id
-  "Asia/Shanghai",            // $5: 时区
-  "2026-05-26",               // $6: 本周开始
-  "2026-06-02",               // $7: 本周结束(+1天)
-  80                          // $8: Score
-]
-```
-
----
-
-### A.9 数据库表结构说明
-
-#### 动态表创建机制
-
-Teable **不使用 Prisma 定义业务数据表**，而是通过 Kysely 动态创建和管理表：
-
-**Schema 命名规则**：
-- Schema 名 = baseId: `bse + 16位字符` (如 `bse_aaaaaaaaaaaaaaaa`)
-- 表名 = tableId: `tbl + 16位字符` (如 `tbl_tttttttttttttttt`)
-
-**文件**: `packages/v2/adapter-table-repository-postgres/src/schema/visitors/PostgresTableSchemaFieldCreateVisitor.ts`
-
-```typescript
-// 动态 CREATE TABLE 示例
-CREATE TABLE "bse_xxxxxxxxxxxxxxx"."tbl_xxxxxxxxxxxxxxx" (
-  "__id" TEXT PRIMARY KEY,          // 记录 ID
-  "__created_time" TIMESTAMPTZ,     // 创建时间(系统)
-  "__last_modified_time" TIMESTAMPTZ, // 最后修改时间(系统)
-  "__auto_serial" SERIAL,           // 自增序号
-  
-  -- 用户定义字段 (动态添加)
-  "col_name" TEXT,                  // 单行文本
-  "col_status" TEXT,                // 单选
-  "col_priority" TEXT,              // 单选
-  "col_due_date" TIMESTAMPTZ,       // 日期
-  "col_assignee" JSONB,             // 用户(JSON 存储)
-  "col_score" DOUBLE PRECISION      // 数字
-);
-```
+**实际使用中**，`dbTableName` 通常被赋值为 `{baseId}.{tableId}` 格式（如 `bse_aaaaaaaaaaaaaaaa.tbl_tttttttttttttttt`），但**这不是由代码强制约束的**，不能假设一定遵循此模式。
 
 **字段类型映射**：
 
@@ -943,21 +792,242 @@ Prisma 仅用于**系统元数据表**的管理（`packages/db-data-prisma/prism
 - `ComputedUpdateOutbox` - 计算字段更新队列
 - `RecordHistory` - 记录历史
 - `TableTrash` / `RecordTrash` - 回收站
-- 等等...
 
 **业务数据存储完全绕过 Prisma**，直接使用 Kysely 进行动态 SQL 构建和执行。
 
 ---
 
-### A.10 关键设计决策总结
+## 相关文件速查
+
+| 模块 | 文件路径 |
+|------|---------|
+| DTO 定义 | `packages/v2/core/src/queries/RecordFilterDto.ts` |
+| 操作符枚举 | `packages/v2/core/src/domain/table/records/specs/RecordConditionOperators.ts` |
+| 字段键类型 | `packages/v2/core/src/domain/table/fields/FieldKeyType.ts` |
+| 字段键解析服务 | `packages/v2/core/src/application/services/FieldKeyResolverService.ts` |
+| DTO → Spec 映射 | `packages/v2/core/src/queries/RecordFilterMapper.ts` |
+| Spec 构建器 | `packages/v2/core/src/domain/table/records/specs/RecordConditionSpecBuilder.ts` |
+| 访问者接口 | `packages/v2/core/src/domain/table/records/specs/ITableRecordConditionSpecVisitor.ts` |
+| SQL WHERE 生成 | `packages/v2/adapter-table-repository-postgres/src/record/visitors/TableRecordConditionWhereVisitor.ts` |
+| 字段列映射 | `packages/v2/adapter-table-repository-postgres/src/record/query-builder/FieldOutputColumnVisitor.ts` |
+| 查询仓库 | `packages/v2/adapter-table-repository-postgres/src/record/repository/PostgresTableRecordQueryRepository.ts` |
+| 列表查询处理器 | `packages/v2/core/src/queries/ListTableRecordsHandler.ts` |
+| 表名值对象 | `packages/v2/core/src/domain/table/DbTableName.ts` |
+| 建表 Schema | `packages/v2/core/src/schemas/table/createTable.schema.ts` |
+
+---
+
+## 附录：最小可复现样例
+
+以下给出一个可直接通过 API 提交的最小 filter JSON，追踪到最终 SQL 的完整过程。
+
+### B.1 样例场景
+
+一张任务表，包含 3 个字段：
+
+| 字段名 | 字段类型 | 字段 ID | 数据库列名 (dbFieldName) |
+|--------|---------|---------|--------------------------|
+| Name | 单行文本 | `fldName001` | `col_name` |
+| Status | 单选 | `fldStatus01` | `col_status` |
+| Due Date | 日期(仅日期,UTC) | `fldDueDate1` | `col_due_date` |
+
+业务需求：**Status 为 "Open" 且 Due Date 在本周内**
+
+### B.2 前端提交的 filter JSON
+
+使用 `fieldKeyType: "name"` 提交（字段键名为字段名，非 ID）：
+
+```json
+{
+  "conjunction": "and",
+  "items": [
+    {
+      "fieldId": "Status",
+      "operator": "is",
+      "value": "Open"
+    },
+    {
+      "fieldId": "Due Date",
+      "operator": "isWithIn",
+      "value": {
+        "mode": "currentWeek",
+        "timeZone": "UTC"
+      }
+    }
+  ]
+}
+```
+
+### B.3 第零阶段：预处理管线执行
+
+#### 步骤 1: resolveFilterFieldKeys
+
+`fieldKeyType = "name"`，需要将 `"Status"` → `"fldStatus01"`、`"Due Date"` → `"fldDueDate1"`：
+
+```json
+{
+  "conjunction": "and",
+  "items": [
+    {
+      "fieldId": "fldStatus01",
+      "operator": "is",
+      "value": "Open"
+    },
+    {
+      "fieldId": "fldDueDate1",
+      "operator": "isWithIn",
+      "value": {
+        "mode": "currentWeek",
+        "timeZone": "UTC"
+      }
+    }
+  ]
+}
+```
+
+#### 步骤 2: replaceCurrentUserTagInFilter
+
+无用户字段条件，无 `"Me"` 需要替换，直接通过。
+
+#### 步骤 3: sanitizeRecordFilter
+
+查询级 filter 不经过 sanitize（仅 View 默认 filter 经过）。
+
+### B.4 第一阶段：buildRecordConditionSpec
+
+递归解析为 Specification 树：
+
+```
+AndSpec (根)
+  ├─ left: SingleSelectConditionSpec (Status = "Open")
+  └─ right: DateConditionSpec (Due Date isWithIn currentWeek)
+```
+
+### B.5 第二阶段：字段映射
+
+```
+"fldStatus01" → resolveColumn → "col_status" (加别名 → "t.col_status")
+"fldDueDate1" → resolveColumn → "col_due_date" (加别名 → "t.col_due_date")
+```
+
+### B.6 第三阶段：SQL 生成
+
+#### 叶子 1: Status = "Open"
+
+```
+visitSingleSelectIs → buildIsCondition → 普通字段 + 字面量
+
+SQL: "t"."col_status" = $1
+参数: ["Open"]
+```
+
+#### 叶子 2: Due Date isWithIn currentWeek
+
+```
+visitDateIsWithIn → resolveDateRange({ mode: "currentWeek", timeZone: "UTC" })
+
+假设今天是 2026-05-28 (周四, UTC):
+  本周开始 = 2026-05-25 (周一) startOf('day')
+  本周结束 = 2026-05-31 (周日) endOf('day')
+
+由于 Date 字段格式为 date-only (time: None):
+  → shouldCompareAsDateOnly = true
+  → buildDateOnlyComparableExpr: (col AT TIME ZONE 'UTC')::date
+
+SQL: ("t"."col_due_date" AT TIME ZONE $1)::date between $2 and $3
+参数: ["UTC", "2026-05-25T00:00:00Z", "2026-05-31T23:59:59Z"]
+```
+
+### B.7 最终 SQL
+
+```sql
+SELECT *
+FROM "bse_xxx"."tbl_yyy" AS "t"
+WHERE (
+  ("t"."col_status" = $1)
+  AND
+  (("t"."col_due_date" AT TIME ZONE $2)::date between $3 and $4)
+)
+```
+
+**参数绑定**：
+```typescript
+["Open", "UTC", "2026-05-25T00:00:00Z", "2026-05-31T23:59:59Z"]
+```
+
+### B.8 补充：含字段引用和 hostTableAlias 的场景
+
+当 Conditional Lookup 字段的 filter 使用字段引用值时，`hostTableAlias` 被传入。例如：在链接表的查询中，条件为"链接表的 Status 等于主表的 StatusFilter"：
+
+```
+构造: TableRecordConditionWhereVisitor({
+  tableAlias: 'f',      // 链接表（外键表）
+  hostTableAlias: 't'   // 主表
+})
+
+filter: {
+  fieldId: "fld_link_status",
+  operator: "is",
+  value: { type: "field", fieldId: "fld_main_status_filter" }
+}
+
+字段引用路由:
+  resolvePrimitiveOperand(value, 'f', 't')
+    → hostTableAlias ?? tableAlias = 't'
+    → 引用列 = resolveColumn(fld_main_status_filter, 't') = "t.col_status_filter"
+
+  classifyFieldReferenceComparison(link_status, main_status_filter, hasHostTableAlias=true)
+    → 假设都是 singleSelect → kind: 'generic'
+
+SQL: "f"."col_status" = "t"."col_status_filter"
+```
+
+如果左侧是 user 字段而右侧不是 user/link 类型，且 `hasHostTableAlias=true`：
+```
+classifyFieldReferenceComparison → kind: 'incompatible'
+SQL: 1 = 0   (恒假，保护数据安全)
+```
+
+### B.9 补充：含 "Me" 占位符的场景
+
+```json
+{
+  "fieldId": "fld_assignee",
+  "operator": "is",
+  "value": "Me"
+}
+```
+
+经过 `replaceCurrentUserTagInFilter` 后：
+```json
+{
+  "fieldId": "fld_assignee",
+  "operator": "is",
+  "value": "usr_abc123"
+}
+```
+
+最终 SQL（用户字段，单选）：
+```sql
+jsonb_extract_path_text(to_jsonb("t"."col_assignee"), 'id') = $1
+-- 参数: ["usr_abc123"]
+```
+
+---
+
+## 关键设计决策总结
 
 | 决策点 | 设计选择 | 原因 |
 |--------|---------|------|
+| 字段键解析 | resolveFilterFieldKeys 统一入口 | 支持三种键名格式（id/name/dbFieldName），尽早统一为 ID |
+| 当前用户替换 | replaceCurrentUserTagInFilter | "Me" 占位符在查询时才知实际用户，需延迟替换 |
+| 无效节点容错 | sanitizeRecordFilter | View 默认 filter 可能引用已删字段，静默剔除而非报错 |
 | 条件表示 | Specification 模式 | 类型安全、可组合、可扩展新操作符 |
 | SQL 生成 | Visitor 模式 | 分离领域逻辑与数据库实现，支持多种数据库 |
 | OR 分支处理 | 克隆独立访问者 | 每个 OR 分支需要独立的条件累积状态 |
+| 字段引用路由 | classifyFieldReferenceComparison | 不同字段类型间比较策略不同，hostTableAlias 影响兼容性判定 |
 | NULL 处理 | IS DISTINCT FROM / COALESCE | 符合 SQL 三值逻辑，确保 NULL 行被正确筛选 |
 | 日期查询 | 时区转换 + DATE 截断 | 支持用户时区的日期精确匹配 |
-| 用户/链接字段 | JSONB 存储 | 灵活的结构化数据存储，支持按 id/title 查询 |
+| 表名机制 | DbTableName 可自定义 | 不强制 bse/tbl 前缀，支持用户指定任意 schema.table |
 | 业务表管理 | 动态 Kysely 建表 | 支持用户自定义字段，无需迁移流程 |
 | 系统表管理 | Prisma | 元数据结构稳定，享受 Prisma 生态 |

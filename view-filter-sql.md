@@ -700,24 +700,27 @@ const resolveDateRange = (
 };
 ```
 
-**各 date mode 的范围计算规则**：
+**各 date mode 的范围计算规则**（基准日 2026-05-28 周四, timeZone=UTC, weekStart=1）：
 
-| mode | 范围计算 | 示例（今天=2026-05-28 周四） |
-|------|---------|---------------------------|
-| `today` | `[startOf('day'), endOf('day')]` | `[2026-05-28T00:00, 2026-05-28T23:59:59]` |
-| `tomorrow` / `yesterday` | 当天 | - |
-| `currentWeek` | `[startOf('week'), endOf('week')]` | **周一为起始**：`[05-26, 06-01]` |
-| `currentMonth` | 当月 | `[05-01, 05-31]` |
-| `currentYear` | 当年 | `[01-01, 12-31]` |
-| `lastWeek` | 上周（周一起始） | `[05-19, 05-25]` |
-| `nextWeekPeriod` | 下周（周一起始） | `[06-02, 06-08]` |
-| `oneWeekAgo` | 7 天前的那一天 | `[05-21, 05-21]` |
-| `daysAgo(3)` | 3 天前的那一天 | `[05-25, 05-25]` |
-| `pastWeek` | 过去 7 天（含今天） | `[05-22, 05-28]` |
-| `nextWeek` | 未来 7 天（含今天） | `[05-28, 06-03]` |
-| `exactDate('2026-05-28')` | 指定日期（无时区） | `[05-28T00:00, 05-28T23:59:59]` |
+| mode | 范围计算 | range.start | range.end |
+|------|---------|-------------|-----------|
+| `today` | `[startOf('day'), endOf('day')]` | `2026-05-28T00:00:00.000Z` | `2026-05-28T23:59:59.999Z` |
+| `tomorrow` / `yesterday` | 当天 | - | - |
+| `currentWeek` | `[cursorDate.startOf('week').startOf('day'), cursorDate.endOf('week').endOf('day')]` | `2026-05-25T00:00:00.000Z` (周一) | `2026-05-31T23:59:59.999Z` (周日) |
+| `currentMonth` | 当月 | `2026-05-01T00:00:00.000Z` | `2026-05-31T23:59:59.999Z` |
+| `currentYear` | 当年 | `2026-01-01T00:00:00.000Z` | `2026-12-31T23:59:59.999Z` |
+| `lastWeek` | cursorDate - 1 week, 然后 startOf/endOf('week') | `2026-05-18T00:00:00.000Z` (周一) | `2026-05-24T23:59:59.999Z` (周日) |
+| `nextWeekPeriod` | cursorDate + 1 week, 然后 startOf/endOf('week') | `2026-06-01T00:00:00.000Z` (周一) | `2026-06-07T23:59:59.999Z` (周日) |
+| `oneWeekAgo` | 7 天前的那一天 | `2026-05-21T00:00:00.000Z` | `2026-05-21T23:59:59.999Z` |
+| `daysAgo(3)` | 3 天前的那一天 | `2026-05-25T00:00:00.000Z` | `2026-05-25T23:59:59.999Z` |
+| `pastWeek` | 过去 7 天（含今天） | `2026-05-21T00:00:00.000Z` | `2026-05-28T23:59:59.999Z` |
+| `nextWeek` | 未来 7 天（含今天） | `2026-05-28T00:00:00.000Z` | `2026-06-03T23:59:59.999Z` |
+| `exactDate('2026-05-28')` | 指定日期 | `2026-05-28T00:00:00.000Z` | `2026-05-28T23:59:59.999Z` |
 
-> **注意**：周起始是周一（第 567-569 行明确设置 `weekStart: 1`），这会影响所有周相关的计算。
+> **注意**：
+> - 周起始是周一（第 567-569 行明确设置 `weekStart: 1`），这会影响所有周相关的计算。
+> - `endOf('day')` 产生 `23:59:59.999`（毫秒精度），不是 `23:59:59`。
+> - `pastWeek` / `nextWeek` 与 `lastWeek` / `nextWeekPeriod` 不同：前者是基于天的 7 天滑动窗口（含今天），后者是基于周的日历周。
 
 ##### 两条路径的参数位对应关系表
 
@@ -1095,18 +1098,23 @@ visitDateIsWithIn → applyIsWithin → buildIsWithinCondition
   → resolveDateValue(value)
     → resolveDateRange({ mode: "currentWeek", timeZone: "UTC" })
 
-假设今天是 2026-05-28 (周四, Asia/Shanghai):
-  dateUtil = new DateUtil("UTC")  # 按 UTC 时区计算
-  本周开始 = 2026-05-25T00:00:00Z (周一 00:00 UTC)
-  本周结束 = 2026-05-31T23:59:59Z (周日 23:59:59 UTC)
-  → return { start: "2026-05-25T00:00:00Z", end: "2026-05-31T23:59:59Z" }
+基准日 2026-05-28 (周四, UTC):
+  dateUtil = new DateUtil("UTC")
+  cursorDate = dateUtil.date()  // 2026-05-28Txx:xx:xxZ (当前 UTC 时间)
+  weekStart = cursorDate.startOf('week').startOf('day')  // 周一
+  weekEnd   = cursorDate.endOf('week').endOf('day')       // 周日
 
-⚠️ 注意：buildIsWithinCondition 中**没有 AT TIME ZONE 转换
+  → return {
+      start: "2026-05-25T00:00:00.000Z",   // 周一 00:00
+      end:   "2026-05-31T23:59:59.999Z"     // 周日 23:59:59.999
+    }
+
+⚠️ 注意：buildIsWithinCondition 中**没有 AT TIME ZONE 转换**
   时区转换完全在 resolveDateRange 内部完成
   range.start / range.end 已经是对应时区的 ISO 字符串
 
 SQL: "t"."col_due_date" between $1 and $2
-参数: ["2026-05-25T00:00:00Z", "2026-05-31T23:59:59Z"]
+参数: ["2026-05-25T00:00:00.000Z", "2026-05-31T23:59:59.999Z"]
 ```
 
 ### B.7 最终 SQL
@@ -1123,7 +1131,7 @@ WHERE (
 
 **参数绑定**：
 ```typescript
-["Open", "2026-05-25T00:00:00Z", "2026-05-31T23:59:59Z"]
+["Open", "2026-05-25T00:00:00.000Z", "2026-05-31T23:59:59.999Z"]
 ```
 
 ### B.8 补充：含字段引用和 hostTableAlias 的场景
@@ -1186,163 +1194,118 @@ jsonb_extract_path_text(to_jsonb("t"."col_assignee"), 'id') = $1
 
 ### B.10 isWithIn 与 isBefore 的 SQL 对照
 
-使用完全相同的日期场景进行对比：**今天 = 2026-05-28 (周四), timeZone = "UTC", date mode = "today"**
+**固定基准日**：2026-05-28 (周四), timeZone=UTC, weekStart=1
 
-#### 对照 1: Due Date isWithIn today
+**resolveDateRange 统一输出**（所有操作符共享）：
+
+| mode | range.start | range.end |
+|------|-------------|-----------|
+| `today` | `2026-05-28T00:00:00.000Z` | `2026-05-28T23:59:59.999Z` |
+| `currentWeek` | `2026-05-25T00:00:00.000Z` (周一) | `2026-05-31T23:59:59.999Z` (周日) |
+
+---
+
+#### 对照 1: isWithIn today
 
 ```json
-{
-  "fieldId": "fldDueDate1",
-  "operator": "isWithIn",
-  "value": {
-    "mode": "today",
-    "timeZone": "UTC"
-  }
-}
+{ "fieldId": "fldDueDate1", "operator": "isWithIn", "value": { "mode": "today", "timeZone": "UTC" } }
 ```
 
-**调用路径**：
-```
-visitDateIsWithIn
-  → applyIsWithin
-    → buildIsWithinCondition
-      → resolveDateRange({ mode: "today", tz: "UTC" })
-         → start: 2026-05-28T00:00:00Z
-         → end:   2026-05-28T23:59:59Z
-      → SQL: column BETWEEN start AND end
-```
+**调用路径**：`visitDateIsWithIn → applyIsWithin → buildIsWithinCondition`
 
-**最终 SQL**：
+**SQL**：
 ```sql
 "t"."col_due_date" between $1 and $2
 ```
-**参数**：`["2026-05-28T00:00:00Z", "2026-05-28T23:59:59Z"]`
+**参数**：`["2026-05-28T00:00:00.000Z", "2026-05-28T23:59:59.999Z"]`
 
-**匹配的数据**：所有日期在今天范围内的记录（包含边界）
+**匹配范围**：`2026-05-28 00:00:00.000` ≤ col ≤ `2026-05-28 23:59:59.999` → **今天全天**
 
 ---
 
-#### 对照 2: Due Date isBefore today
+#### 对照 2: isBefore today
 
 ```json
-{
-  "fieldId": "fldDueDate1",
-  "operator": "isBefore",
-  "value": {
-    "mode": "today",
-    "timeZone": "UTC"
-  }
-}
+{ "fieldId": "fldDueDate1", "operator": "isBefore", "value": { "mode": "today", "timeZone": "UTC" } }
 ```
 
-**调用路径**：
-```
-visitDateIsBefore
-  → applyDateComparison(field, value, '<')
-    → buildDateComparisonCondition(field, value, '<', ...)
-      → resolveDateRange({ mode: "today", tz: "UTC" })
-         → start: 2026-05-28T00:00:00Z
-         → end:   2026-05-28T23:59:59Z
-      → 边界选择: operator === '<' → boundary = range.start
-         → boundary: 2026-05-28T00:00:00Z
-      → SQL: column < boundary
-```
+**调用路径**：`visitDateIsBefore → applyDateComparison('<') → buildDateComparisonCondition`
 
-**最终 SQL**：
+**边界选择**：`operator === '<' → boundary = range.start = 2026-05-28T00:00:00.000Z`
+
+**SQL**：
 ```sql
 "t"."col_due_date" < $1
 ```
-**参数**：`["2026-05-28T00:00:00Z"]`
+**参数**：`["2026-05-28T00:00:00.000Z"]`
 
-**匹配的数据**：今天开始之前的记录 → **昨天及以前**
+**匹配范围**：col < `2026-05-28 00:00:00.000` → **昨天及以前**
 
 ---
 
-#### 对照 3: Due Date isOnOrBefore today
+#### 对照 3: isOnOrBefore today
 
-```json
-{
-  "fieldId": "fldDueDate1",
-  "operator": "isOnOrBefore",
-  "value": { "mode": "today", "timeZone": "UTC" }
-}
-```
+**边界选择**：`operator === '<=' → boundary = range.end = 2026-05-28T23:59:59.999Z`
 
-**边界选择**：`operator === '<=' → boundary = range.end`
-
-**最终 SQL**：
+**SQL**：
 ```sql
 "t"."col_due_date" <= $1
 ```
-**参数**：`["2026-05-28T23:59:59Z"]`
+**参数**：`["2026-05-28T23:59:59.999Z"]`
 
-**匹配的数据**：今天结束或之前 → **今天及以前**
+**匹配范围**：col ≤ `2026-05-28 23:59:59.999` → **今天及以前**
 
 ---
 
-#### 对照 4: Due Date isAfter today
+#### 对照 4: isAfter today
 
-```json
-{
-  "fieldId": "fldDueDate1",
-  "operator": "isAfter",
-  "value": { "mode": "today", "timeZone": "UTC" }
-}
-```
+**边界选择**：`operator === '>' → boundary = range.end = 2026-05-28T23:59:59.999Z`
 
-**边界选择**：`operator === '>' → boundary = range.end`
-
-**最终 SQL**：
+**SQL**：
 ```sql
 "t"."col_due_date" > $1
 ```
-**参数**：`["2026-05-28T23:59:59Z"]`
+**参数**：`["2026-05-28T23:59:59.999Z"]`
 
-**匹配的数据**：今天结束之后 → **明天及以后**
+**匹配范围**：col > `2026-05-28 23:59:59.999` → **明天及以后**
 
 ---
 
-#### 对照 5: Due Date isOnOrAfter today
+#### 对照 5: isOnOrAfter today
 
-```json
-{
-  "fieldId": "fldDueDate1",
-  "operator": "isOnOrAfter",
-  "value": { "mode": "today", "timeZone": "UTC" }
-}
-```
+**边界选择**：`operator === '>=' → boundary = range.start = 2026-05-28T00:00:00.000Z`
 
-**边界选择**：`operator === '>=' → boundary = range.start`
-
-**最终 SQL**：
+**SQL**：
 ```sql
 "t"."col_due_date" >= $1
 ```
-**参数**：`["2026-05-28T00:00:00Z"]`
+**参数**：`["2026-05-28T00:00:00.000Z"]`
 
-**匹配的数据**：今天开始或之后 → **今天及以后**
+**匹配范围**：col ≥ `2026-05-28 00:00:00.000` → **今天及以后**
 
 ---
 
 #### 对照总结表（mode = "today"）
 
-| 操作符 | 边界选择 | SQL 形式 | 参数值 | 实际语义 |
-|--------|---------|---------|--------|---------|
-| `isWithIn` | start + end | `BETWEEN $1 AND $2` | `[00:00, 23:59:59]` | **今天** |
-| `isBefore` | start | `< $1` | `00:00` | **昨天及以前** |
-| `isOnOrBefore` | end | `<= $1` | `23:59:59` | **今天及以前** |
-| `isAfter` | end | `> $1` | `23:59:59` | **明天及以后** |
-| `isOnOrAfter` | start | `>= $1` | `00:00` | **今天及以后** |
+| 操作符 | 函数 | 边界选择 | SQL 形式 | 参数值 | 匹配范围 |
+|--------|------|---------|---------|--------|---------|
+| `isWithIn` | `buildIsWithinCondition` | start + end | `BETWEEN $1 AND $2` | `[00:00:00.000, 23:59:59.999]` | **今天全天** |
+| `isBefore` (`<`) | `buildDateComparisonCondition` | start | `< $1` | `00:00:00.000` | **昨天及以前** |
+| `isOnOrBefore` (`<=`) | `buildDateComparisonCondition` | end | `<= $1` | `23:59:59.999` | **今天及以前** |
+| `isAfter` (`>`) | `buildDateComparisonCondition` | end | `> $1` | `23:59:59.999` | **明天及以后** |
+| `isOnOrAfter` (`>=`) | `buildDateComparisonCondition` | start | `>= $1` | `00:00:00.000` | **今天及以后** |
 
-#### 对照总结表（mode = "currentWeek"，周一=2026-05-26）
+#### 对照总结表（mode = "currentWeek"）
 
-| 操作符 | 边界选择 | SQL 形式 | 参数值 | 实际语义 |
-|--------|---------|---------|--------|---------|
-| `isWithIn` | start + end | `BETWEEN $1 AND $2` | `[05-26, 06-01]` | **本周** |
-| `isBefore` | start | `< $1` | `05-26` | **上周末及以前** |
-| `isOnOrBefore` | end | `<= $1` | `06-01` | **本周及以前** |
-| `isAfter` | end | `> $1` | `06-01` | **下周一及以后** |
-| `isOnOrAfter` | start | `>= $1` | `05-26` | **本周及以后** |
+| 操作符 | 函数 | 边界选择 | SQL 形式 | 参数值 | 匹配范围 |
+|--------|------|---------|---------|--------|---------|
+| `isWithIn` | `buildIsWithinCondition` | start + end | `BETWEEN $1 AND $2` | `[05-25T00:00, 05-31T23:59:59.999]` | **本周(周一~周日)** |
+| `isBefore` (`<`) | `buildDateComparisonCondition` | start | `< $1` | `05-25T00:00:00.000` (周一) | **上周末及以前** |
+| `isOnOrBefore` (`<=`) | `buildDateComparisonCondition` | end | `<= $1` | `05-31T23:59:59.999` (周日) | **本周及以前** |
+| `isAfter` (`>`) | `buildDateComparisonCondition` | end | `> $1` | `05-31T23:59:59.999` (周日) | **下周一及以后** |
+| `isOnOrAfter` (`>=`) | `buildDateComparisonCondition` | start | `>= $1` | `05-25T00:00:00.000` (周一) | **本周及以后** |
+
+> **核心差异**：`isWithIn` 始终用 `BETWEEN start AND end`（闭区间，2 个参数位），`isBefore/After` 用单边界比较运算符（1 个参数位）。边界选择的关键在于 `operator === '>' || '<=' ? end : start`，即「严格大于/小于等于」取 end，「严格小于/大于等于」取 start——这保证了 `isAfter(today)` 不含今天、`isOnOrAfter(today)` 含今天的语义正确性。
 
 ---
 

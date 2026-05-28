@@ -63,7 +63,8 @@
     "run:plugin": "pnpm -F '@teable/plugin' dev"
   },
   "dependencies": {
-    "cross-env": "7.0.3"
+    "cross-env": "7.0.3",
+    "dayjs": "1.11.10"
   },
   "devDependencies": {
     "@commitlint/cli": "19.2.1",

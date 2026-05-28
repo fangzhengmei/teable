@@ -1,5 +1,17 @@
 # Teable Trash & Restore 机制全解析
 
+## 重点摘要
+
+本文档围绕 **三个核心要点** 深入解析 Teable 的 Trash & Restore 机制：
+
+| 要点 | 核心机制 | 关键代码位置 |
+|------|----------|--------------|
+| **V1/V2 分流** | `CanaryService` 根据 Base 的 `v2Enabled` 标志 + 灰度配置决策路径 | `trash.controller.ts:prepareRestoreTableCanary()` → `canaryService.shouldUseV2ForBaseWithReason()` |
+| **deletedTime 级联恢复** | 删除时 table/field/view 共享同一 `deletedTime` 时间戳，恢复时精确匹配批量清除 | `table-open-api.service.ts:restoreTable()` → `updateMany({ deletedTime })` |
+| **垃圾清理** | 恢复后在同一事务中删除 `record_trash`（快照内容）和 `table_trash`（操作索引） | `trash.service.ts:874` / `RestoreRecordsHandler.ts` `cleanupTrashRecordIds` |
+
+---
+
 ## 1. 整体架构概览
 
 Teable 的 Trash/Restore 系统采用**软删除 + 快照持久化**的双重策略，分为两个层级：
@@ -110,7 +122,7 @@ model RecordTrash {
 
 ## 3. Restore 主流程与依赖顺序重建
 
-### 3.1 API 入口与 V1/V2 分流
+### 3.1 API 入口与 V1/V2 分流（CanaryService 灰度控制）
 
 ```
 POST /api/trash/restore/:trashId
@@ -126,7 +138,21 @@ POST /api/trash/restore/:trashId
             └─ 否则 → restoreResource()（Space/Base/Table）
 ```
 
-V1/V2 分流的关键逻辑在 `CanaryService`，根据 base 的 `v2Enabled` 标志和灰度配置决定。
+**⚠️ V1/V2 分流的关键逻辑完全在 CanaryService**：
+- 决策入口：`getRestoreTableV2Decision(trashId)` → `canaryService.shouldUseV2ForBaseWithReason(base, 'restoreTable')`
+- 决策依据：Base 的 `v2Enabled` 标志 + 灰度配置（按百分比、按用户名单等）
+- 结果通过 `X-Teable-V2` 响应头返回给前端
+
+决策完整流程：
+```typescript
+// trash.service.ts:674
+async getRestoreTableV2Decision(trashId: string) {
+  const trash = await prisma.trash.findUnique({ where: { id: trashId } });
+  const baseId = trash.parentId;
+  const base = await prisma.base.findUnique({ where: { id: baseId, deletedTime: null } });
+  return this.canaryService.shouldUseV2ForBaseWithReason(base, 'restoreTable');
+}
+```
 
 ### 3.2 Space/Base/Table 恢复流程
 
@@ -194,7 +220,14 @@ async restoreTable(baseId: string, tableId: string) {
 }
 ```
 
-**关键设计**：V1 表格恢复时，字段和视图的恢复依靠 `deletedTime` 精确匹配。删除时 `table/field/view` 共享同一个 `deletedTime` 时间戳，恢复时通过这个时间戳批量清除，保证了恢复的原子性。
+**⚠️ 关键设计（V1 核心机制）：deletedTime 原子对齐恢复**
+V1 表格恢复时，字段和视图的恢复依靠 `deletedTime` 精确匹配实现级联恢复：
+1. **删除时**：`table/field/view` 在同一事务中被赋予**同一个精确的 deletedTime 时间戳**
+2. **恢复时**：通过 `where: { tableId, deletedTime }` 批量清除该时间戳
+3. **保证**：只有在"这次删除"中一起被删除的字段和视图才会一起恢复，保证原子性
+
+**为什么不用批量清 `deletedTime: { not: null }`？**
+因为表格可能多次删除-恢复，不同批次删除的字段有不同的 deletedTime，精确匹配避免恢复错误批次。
 
 #### Table 恢复（V2 — CQRS）
 
@@ -331,13 +364,24 @@ case TableTrashType.Record: {
     records,
     typecast: true,
   }, true);
-  // 清理 record_trash 和 table_trash
+  
+  // ⚠️ 清理 record_trash 和 table_trash（关键：在同一事务中）
   await this.dataPrismaService.$tx(async (prisma) => {
-    await prisma.recordTrash.deleteMany({ where: { id: { in: matchedRowIds } } });
+    // 1. 删除所有匹配的 record_trash 快照条目
+    await prisma.recordTrash.deleteMany({ where: { id: { in: matchedRecordTrashRowIds } } });
+    // 2. 删除 table_trash 中的操作索引条目
     await prisma.tableTrash.delete({ where: { id: trashId } });
+  }, {
+    timeout: this.thresholdConfig.bigTransactionTimeout,  // 大事务超时配置
   });
 }
 ```
+
+**⚠️ 垃圾清理机制（record_trash + table_trash）**
+1. **双表联动**：`table_trash` 是操作索引表（存记录 ID 列表），`record_trash` 是快照内容表（存完整记录 JSON）
+2. **原子删除**：恢复成功后，两表必须在同一事务中一起删除
+3. **精确匹配**：只删除本次恢复对应的 record_trash 行（通过 `createdTime <= trashItem.createdTime` 匹配的行）
+4. **大事务保护**：配置 `bigTransactionTimeout` 避免超大数据量恢复超时
 
 **快照时间匹配的核心问题**：同一 `recordId` 可能在 `record_trash` 中有多行（多次删除），恢复时必须取 `createdTime <= 当前trash条目.createdTime` 的最新快照，避免恢复到错误的版本。
 
@@ -358,7 +402,7 @@ async handle(context, command) {
     await this.unitOfWork.withTransaction(context, (txContext) =>
       tableRecordRepository.insertMany(txContext, table, records, {
         restoreRecordsById,              // 系统列恢复值
-        cleanupTrashRecordIds: batch.map(r => r.recordId),  // 清理 trash
+        cleanupTrashRecordIds: batch.map(r => r.recordId),  // ⚠️ V2：Repository 内部执行垃圾清理
       })
     );
     // 4. 发布 RecordsBatchCreated 事件
@@ -367,6 +411,10 @@ async handle(context, command) {
   }
 }
 ```
+
+**V2 垃圾清理设计差异**：
+- V1：在 trash.service 显示调用 `recordTrash.deleteMany` + `tableTrash.delete`
+- V2：通过 `cleanupTrashRecordIds` 参数传递给 `tableRecordRepository.insertMany()`，由 Repository 层在内部事务中清理
 
 **流式恢复** — `RestoreRecordsStreamHandler`：
 对于大批量记录，支持流式处理：
@@ -695,11 +743,12 @@ POST /api/trash/restore/:trashId
 | **软删除标记** | `deletedTime: DateTime?` | Space/Base/Table/Field/View |
 | **删除索引** | `Trash` 表 + `parentId` 层级 | 快速查询已删除资源 + 父级校验 |
 | **快照持久化** | `TableTrash` + `RecordTrash` | View/Field/Record 的完整数据保存 |
-| **时间戳对齐** | 删除时 table/field/view 共享 `deletedTime` | V1 批量恢复的匹配依据 |
+| **⚠️ deletedTime 时间戳对齐** | 删除时 table/field/view 共享精确 `deletedTime` | **V1 批量级联恢复的匹配依据** |
 | **快照版本匹配** | `createdTime <= trashItem.createdTime` | 同一记录多次删除-恢复的版本选择 |
 | **拓扑排序** | Kahn 算法 + 字段依赖图 | Field 恢复时的创建顺序 |
 | **递归 CTE** | `assertParentNotTrashed()` | 父级链路完整性校验 |
-| **V1/V2 双轨** | CanaryService 灰度分流 | 新旧架构平滑迁移 |
+| **⚠️ CanaryService 灰度分流** | `shouldUseV2ForBaseWithReason()` | **V1/V2 架构迁移路径决策** |
 | **CQRS 投影** | V2 领域事件 → 投影处理器 | Trash 表的读写分离 |
 | **流式批量** | `RestoreRecordsStreamHandler` | 大批量记录恢复的渐进式处理 |
 | **引用恢复** | `restoreReference()` + `isFieldConfigurationValid()` | Link/Lookup/Rollup 字段恢复后的校验 |
+| **⚠️ 原子垃圾清理** | 事务中同时删除 `record_trash` + `table_trash` | **恢复成功后清理快照** |

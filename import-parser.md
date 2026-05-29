@@ -2,500 +2,496 @@
 
 ## 概述
 
-导入解析器在导入 CSV/Excel 文件时，会自动推断每列的数据类型。整个推断流程分为三个核心环节：**数据采样** → **类型猜测** → **冲突回退**。
+导入解析器在导入 CSV/Excel 文件时，会自动推断每列的数据类型。整个推断流程严格按照以下顺序执行：
+
+**调用入口**：`import-open-api.service.ts:107-116` → `importer.genColumns()`
 
 核心代码位于 `apps/nestjs-backend/src/features/import/open-api/import.class.ts`。
 
 ---
 
-## 一、数据采样 (Sampling)
+## 一、代码实际执行顺序总览
 
-### 1.1 CSV 与 Excel 采样范围差异
+`genColumns()` 方法（L295-360）的精确执行步骤：
 
-| 维度 | CSV (CsvImporter) | Excel (ExcelImporter) |
-|------|------------------|----------------------|
-| **采样行数** | 前 500 行 (固定) | **全部行** (无限制) |
-| **动态类型转换** | `dynamicTyping: true` | `v.w ?? v.v` (优先格式化文本) |
-| **实现方式** | PapaParse `preview` 参数 | XLSX `!data` 全量读取 |
-| **Sheet 支持** | 单 Sheet | 多 Sheet (遍历 workbook.Sheets) |
+```
+1. L296: 取候选类型数组 → supportTypes = Importer.SUPPORTEDTYPE
+2. L297: 采样 → this.parse()
+3. L302: 转置 → zip(...cols)
+4. L304-348: 对每一列执行 map:
+   ├─ 4a. L306: 初始化 → isColumnEmpty = true
+   ├─ 4b. L307: 初始化 → validatingFieldTypes = [...supportTypes]
+   ├─ 4c. L308: 逐值遍历 for (let i = 0; i < column.length; i++):
+   │   ├─ L309-311: 提前终止 → if (length <= 1) break
+   │   ├─ L314-316: 跳过 → 空值/null/表头
+   │   ├─ L319: 标记 → isColumnEmpty = false
+   │   ├─ L322-325: LongText 短路 → 命中则 break
+   │   └─ L327-332: 通用收敛 → filter 过滤
+   ├─ 4d. L336-338: 空列回退 → isColumnEmpty === true 时替换
+   └─ 4e. L345: 最终取值 → validatingFieldTypes[0] || DEFAULT
+```
 
-#### CSV 采样实现
+---
+
+## 二、候选类型数组的实际来源
+
+### 2.1 唯一实际生效的来源
+
+```typescript
+// import.class.ts:296  ← genColumns() 方法第一行有效代码
+const supportTypes = Importer.SUPPORTEDTYPE;  // 硬编码基类引用
+```
+
+**关键事实**：
+- 写的是 `Importer.SUPPORTEDTYPE`（基类的静态属性）
+- 不是 `this.constructor.SUPPORTEDTYPE`，不是 `this.SUPPORTEDTYPE`
+- 因此**无论实例是 CsvImporter 还是 ExcelImporter，候选类型数组始终相同**
+
+### 2.2 实际生效的候选类型顺序
+
+```typescript
+// import.class.ts:209-215  ← 基类 Importer
+public static readonly SUPPORTEDTYPE: IValidateTypes[] = [
+  FieldType.Checkbox,       // 位置 0 - 优先级最高
+  FieldType.Number,         // 位置 1
+  FieldType.Date,           // 位置 2
+  FieldType.LongText,       // 位置 3
+  FieldType.SingleLineText, // 位置 4 - 优先级最低（默认）
+];
+```
+
+**顺序的意义**：
+1. 初始化 `validatingFieldTypes` 时按此顺序展开
+2. 多类型共存时取 `validatingFieldTypes[0]`，即数组最前面的
+
+### 2.3 关于 ExcelImporter.SUPPORTEDTYPE
+
+```typescript
+// import.class.ts:494-500  ← ExcelImporter 类内部
+public static readonly SUPPORTEDTYPE: IValidateTypes[] = [
+  FieldType.Checkbox,
+  FieldType.Number,
+  FieldType.Date,
+  FieldType.SingleLineText,  // 顺序不同
+  FieldType.LongText,        // 移到了最后
+];
+```
+
+**真实地位**：这段代码虽然声明了，但**从未被引用**。经全代码库搜索确认，`ExcelImporter.SUPPORTEDTYPE` 在整个项目中没有任何调用点——它是**死代码**。
+
+**重要修正**：之前可能误以为 CSV 和 Excel 的候选类型顺序不同，实际上两者完全一致。
+
+---
+
+## 三、数据采样阶段 —— CSV 与 Excel 的输入值差异
+
+**执行位置**：L297 `const parseResult = await this.parse();`
+
+### 3.1 CSV 采样（CsvImporter.parse() 无参数分支）
 
 ```typescript
 // import.class.ts:455-469
-// 类型推断时调用 parse() 无参数 → 走 preview 500 行分支
-return new Promise((resolve, reject) => {
-  Papa.parse(stream, {
-    download: false,
-    dynamicTyping: true,      // 自动转换数字、布尔值
-    preview: CsvImporter.CHECK_LINES,  // = 500
-    complete: (result) => {
-      resolve({
-        [CsvImporter.DEFAULT_SHEETKEY]: result.data,
-      });
-    },
-  });
+Papa.parse(stream, {
+  download: false,
+  dynamicTyping: true,      // 关键参数
+  preview: CsvImporter.CHECK_LINES,  // = 500
+  complete: (result) => {
+    resolve({ [CsvImporter.DEFAULT_SHEETKEY]: result.data });
+  },
 });
 ```
 
-**关键点**：
-- `dynamicTyping: true` 让 PapaParse 自动将 "123" 转为 `number`，"true" 转为 `boolean`
-- 这意味着 CSV 的类型推断**基于转换后的值**，而非原始字符串
+**采样参数**：
+- `preview: 500` → 只取前 500 行
+- `dynamicTyping: true` → PapaParse 自动将 "123" 转为 `number`，"true" 转为 `boolean`
 
-#### Excel 采样实现
+### 3.2 Excel 采样（ExcelImporter.parse() 无参数分支）
 
 ```typescript
 // import.class.ts:518-539
-const asyncRs = async (stream: NodeJS.ReadableStream): Promise<IParseResult> =>
-  new Promise((res, rej) => {
-    const buffers: Uint8Array[] = [];
-    stream.on('data', function (data) {
-      buffers.push(data);
-    });
-    stream.on('end', function () {
-      const buf = Buffer.concat(buffers);
-      const workbook = XLSX.read(buf, { dense: true });  // 全量读取
-      const result: IParseResult = {};
-      Object.keys(workbook.Sheets).forEach((name) => {
-        result[name] = workbook.Sheets[name]['!data']?.map((item) =>
-          item.map((v) => v.w ?? v.v)  // 优先格式化文本，否则原始值
-        ) as unknown[][];
-      });
-      res(result);
-    });
-  });
+const buf = Buffer.concat(buffers);
+const workbook = XLSX.read(buf, { dense: true });  // 全量读取
+const result: IParseResult = {};
+Object.keys(workbook.Sheets).forEach((name) => {
+  result[name] = workbook.Sheets[name]['!data']?.map((item) =>
+    item.map((v) => v.w ?? v.v)  // 关键取值逻辑
+  ) as unknown[][];
+});
 ```
 
-**关键点**：
-- 无预览限制，**读取整个文件**到大文件性能问题
-- `v.w ?? v.v`：优先使用单元格的**格式化文本** (w)，否则用原始值 (v)
-- 这意味着 Excel 的类型推断**基于文本表示**，而非单元格的实际类型
+**采样参数**：
+- 无行数限制 → 读取全部行
+- `v.w ?? v.v` → 优先取格式化文本（`v.w`），否则取原始值（`v.v`）
+- 无论哪种，到达类型推断时都是 `string` 类型
 
-### 1.2 采样数据处理
+### 3.3 采样输入值差异对照表
 
-采样数据通过 lodash 的 `zip(...cols)` 进行矩阵转置，从「行优先」转为「列优先」，便于按列进行类型推断：
+| 原始文件内容 | CSV 传入验证函数的值 | Excel 传入验证函数的值 |
+|-------------|---------------------|----------------------|
+| `"123"` | `123` (number) | `"123"` (string) |
+| `"true"` | `true` (boolean) | `"true"` (string) |
+| `"false"` | `false` (boolean) | `"false"` (string) |
+| `"2022-11-10"` | `"2022-11-10"` (string*) | `"2022-11-10"` (string) |
+| `""` (空) | `""` (string) | `""` (string) |
+| 空单元格 | 不存在 / `""` | `""` (string) |
 
-```typescript
-// import.class.ts:301-302
-for (const [sheetName, cols] of Object.entries(parseResult)) {
-  const zipColumnInfo = zip(...cols);  // 转置：rows → columns
-  // ...
-}
-```
+*注：日期格式的字符串 PapaParse 不会自动转换，仍为 string。
+
+### 3.4 采样参数对类型推断的影响
+
+| 差异维度 | CSV (dynamicTyping=true) | Excel (v.w ?? v.v) |
+|---------|--------------------------|-------------------|
+| 采样行数 | 前 500 行 | 全部行 |
+| 输入类型多样性 | number / boolean / string / null | 全部为 string |
+| LongText 检测 | 含 `\n` 的字符串 | 含 `\n` 的字符串 |
+| Number 检测输入 | 可能已经是 number 类型 | 一定是 string 类型 |
+| Checkbox 检测输入 | 可能已经是 boolean 类型 | 一定是 string 类型 |
 
 ---
 
-## 二、类型猜测 (Type Guessing)
+## 四、LongText 判断为何优先于通用过滤？
 
-### 2.1 候选类型顺序何时生效？
+### 4.1 代码顺序决定优先级
 
-**候选类型顺序在两处生效**：
-
-#### 生效点 1：初始化候选类型池
+看 L308-333 逐值遍历的循环内部：
 
 ```typescript
-// import.class.ts:307
-let validatingFieldTypes = [...supportTypes];  // 按顺序初始化
-```
-
-此时 `validatingFieldTypes` 包含所有支持的类型，**顺序决定了最终优先级**。
-
-#### 生效点 2：最终类型选择
-
-```typescript
-// import.class.ts:345
-type: validatingFieldTypes[0] || Importer.DEFAULT_COLUMN_TYPE,
-```
-
-当有多个类型都通过所有值的验证时，**取数组第一个**（即优先级最高的）。
-
-### 2.2 支持的类型及优先级
-
-#### CSV (Importer 基类) 类型顺序
-
-```typescript
-// import.class.ts:209-215
-public static readonly SUPPORTEDTYPE: IValidateTypes[] = [
-  FieldType.Checkbox,      // 优先级 1 (最严格)
-  FieldType.Number,        // 优先级 2
-  FieldType.Date,          // 优先级 3
-  FieldType.LongText,      // 优先级 4
-  FieldType.SingleLineText,// 优先级 5 (最宽泛)
-];
-```
-
-#### Excel (ExcelImporter) 类型顺序
-
-**关键差异**：ExcelImporter 覆盖了类型顺序，LongText 优先级最低！
-
-```typescript
-// import.class.ts:494-500
-public static readonly SUPPORTEDTYPE: IValidateTypes[] = [
-  FieldType.Checkbox,      // 1
-  FieldType.Number,        // 2
-  FieldType.Date,          // 3
-  FieldType.SingleLineText,// 4 (↑ 上移了)
-  FieldType.LongText,      // 5 (↓ 移到最后)
-];
-```
-
-**为什么 Excel 的 LongText 在最后？**
-- Excel 单元格通常不会显式包含换行符
-- 避免误判：长文本优先识别为 SingleLineText
-
-### 2.3 类型验证 Schema
-
-各类型使用 Zod Schema 验证：
-
-#### 1. Checkbox 验证规则
-- 布尔值或字符串 "true"/"false"（不区分大小写）
-
-```typescript
-[FieldType.Checkbox]: z.union([z.string(), z.boolean()]).refine(
-  (value: unknown) => {
-    if (typeof value === 'boolean') return true;
-    if (typeof value === 'string') {
-      return value.toLowerCase() === 'false' || value.toLowerCase() === 'true';
-    }
-    return false;
-  }
-)
-```
-
-#### 2. Number 验证规则
-- 可被 `Number()` 转换为有效数字
-
-```typescript
-[FieldType.Number]: z.any().refine(
-  (value) => !isNaN(Number(value))
-)
-```
-
-#### 3. Date 验证规则
-- **白名单正则匹配**日期格式（避免误判如 "CC-38716" 这样的字符串）
-- 年份在合理范围 (1-9999)
-- 支持格式：
-  - `YYYY-MM-DD`
-  - `YYYY-MM-DD HH:mm:ss`
-  - ISO 8601 格式
-  - `DD-MM-YYYY` / `MM-DD-YYYY`
-  - `YYYY/MM/DD`
-  - `MM/DD/YYYY`
-
-```typescript
-const dateFormatPatterns: RegExp[] = [
-  /^\d{4}-\d{2}-\d{2}$/,
-  /^\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?(?:\.\d{1,3})?$/,
-  // ... 更多格式
-];
-
-function isValidDateForImport(value: unknown): boolean {
-  // 1. 白名单正则匹配
-  // 2. Date.parse() 验证
-  // 3. 年份范围校验
-}
-```
-
-#### 4. LongText 验证规则
-- 包含换行符 `\n`
-
-```typescript
-[FieldType.LongText]: z.string().refine(
-  (value) => z.string().safeParse(value) && /\n/.test(value)
-)
-```
-
-#### 5. SingleLineText 验证规则
-- 任意字符串（兜底类型）
-
----
-
-## 三、冲突回退 (Conflict Fallback)
-
-### 3.1 核心算法：逐步收敛
-
-```typescript
-// import.class.ts:306-333
-let isColumnEmpty = true;
-let validatingFieldTypes = [...supportTypes];  // 初始：所有类型
-
+// L308: 开始循环
 for (let i = 0; i < column.length; i++) {
-  // 优化点：只剩 1 种类型，提前终止循环
-  if (validatingFieldTypes.length <= 1) {
-    break;
-  }
-
-  // 跳过：空值、null、表头行 (i===0)
-  if (column[i] === '' || column[i] == null || i === 0) {
-    continue;
-  }
-
-  // 标记：列非空
+  // L309-311: 提前终止
+  if (validatingFieldTypes.length <= 1) break;
+  
+  // L314-316: 跳过空值、null、表头
+  if (column[i] === '' || column[i] == null || i === 0) continue;
+  
+  // L319: 标记非空
   isColumnEmpty = false;
-
-  // ========== LongText 快速路径 ==========
+  
+  // ========== LongText 检测在这里 ==========
+  // L322-325: 先执行 LongText 检查
   if (validateZodSchemaMap[FieldType.LongText].safeParse(column[i]).success) {
     validatingFieldTypes = [FieldType.LongText];
-    break;  // 立即终止，不再检测其他类型
+    break;  // 直接 break，后续代码不执行
   }
-
-  // ========== 常规过滤 ==========
+  
+  // ========== 通用过滤在这里 ==========
+  // L327-332: 后执行通用 filter
   const matchTypes = validatingFieldTypes.filter((type) => {
     const schema = validateZodSchemaMap[type];
     return schema.safeParse(column[i]).success;
   });
-
   validatingFieldTypes = matchTypes;
 }
 ```
 
-### 3.2 回退条件详解
+**优先级来源**：
+1. **代码位置优先**：L322-325 在 L327-332 之前
+2. **短路逻辑**：LongText 命中后直接 `break`，永远不会走到后面的通用 filter
+3. **直接覆盖**：`validatingFieldTypes = [FieldType.LongText]` 直接替换整个数组
 
-#### 回退条件 1：LongText 快速路径
+### 4.2 LongText 短路的判定逻辑
 
-**触发时机**：遍历过程中**任意一个值**匹配 LongText
-
-**后果**：
-- `validatingFieldTypes` 被直接设为 `[FieldType.LongText]`
-- `break` 跳出循环，**不再检测后续值**
-- 最终类型一定是 LongText
+LongText 的验证 Schema：
 
 ```typescript
-// 只要有一个值包含换行符 → 整列判定为 LongText
-if (validateZodSchemaMap[FieldType.LongText].safeParse(column[i]).success) {
-  validatingFieldTypes = [FieldType.LongText];
-  break;
-}
+// import.class.ts:102-104
+[FieldType.LongText]: z.string().refine(
+  (value) => z.string().safeParse(value) && /\n/.test(value)
+),
 ```
 
-**设计意图**：
-- 换行符是 LongText 的强特征
-- 一旦发现，无需继续检测，提升性能
+即：值是字符串 **且** 包含换行符 `\n`。
 
-#### 回退条件 2：空列默认类型
+### 4.3 短路机制的特殊性
 
-**触发时机**：遍历结束后 `isColumnEmpty === true`
+| 特性 | LongText 短路 | 常规 filter 收敛 |
+|------|--------------|-----------------|
+| 判定逻辑 | 一票通过（一个值命中即判定） | 全票通过（所有值都必须通过） |
+| 执行时机 | 每个值先执行 | LongText 未命中时才执行 |
+| 对候选池的操作 | 直接替换为 `[LongText]` | filter 收缩候选池 |
+| 是否终止循环 | 是（break） | 否（继续下一个值） |
+| 与候选顺序的关系 | 无关（直接覆盖） | 有关（顺序决定最终取哪个） |
 
-**后果**：
-- `validatingFieldTypes` 被替换为 `[Importer.DEFAULT_COLUMN_TYPE]`
-- 即 `[FieldType.SingleLineText]`
+**重要结论**：LongText 短路机制完全绕过了候选类型数组的顺序。即使 `ExcelImporter.SUPPORTEDTYPE` 被正确引用（LongText 在最后），短路机制也会让它优先命中——**和它在候选数组中的位置无关**。
+
+---
+
+## 五、最终类型确定与默认值回退的触发条件
+
+### 5.1 两个回退点的区别
+
+代码中有**两个独立的回退机制**，在不同时机触发：
+
+| 回退机制 | 代码位置 | 触发条件 | 操作 |
+|---------|----------|----------|------|
+| **空列回退** | L336-338 | `isColumnEmpty === true` | 直接替换 `validatingFieldTypes = [SingleLineText]` |
+| **默认值回退** | L345 | `validatingFieldTypes[0]` 为 undefined | `|| Importer.DEFAULT_COLUMN_TYPE` |
+
+### 5.2 空列回退（L336-338）
 
 ```typescript
 // import.class.ts:336-338
 validatingFieldTypes = !isColumnEmpty
   ? validatingFieldTypes
-  : [Importer.DEFAULT_COLUMN_TYPE];  // SingleLineText
+  : [Importer.DEFAULT_COLUMN_TYPE];
 ```
 
-**如何判断空列？**
-```typescript
-// 初始为 true
-let isColumnEmpty = true;
+**触发条件详解**：`isColumnEmpty === true`
 
-// 遇到非空、非表头值时设为 false
-if (column[i] === '' || column[i] == null || i === 0) {
-  continue;  // 跳过，不修改 isColumnEmpty
-}
-isColumnEmpty = false;  // 只要有一个非空值，就不是空列
-```
+`isColumnEmpty` 的判断逻辑：
+- 初始值：`true`（L306）
+- 何时设为 `false`：遍历中遇到**非空、非 null、非表头**的值时（L319）
+- 注意：表头行（i===0）即使有值，也不会触发 `isColumnEmpty = false`（被 L314 的 continue 跳过了）
 
-**注意**：表头行 (i===0) 即使有值，也不会影响空列判断！
+**触发后的效果**：
+- 直接**替换** `validatingFieldTypes` 为 `[Importer.DEFAULT_COLUMN_TYPE]`
+- 即 `[FieldType.SingleLineText]`
+- 这会覆盖前面所有遍历的结果
 
-#### 回退条件 3：所有类型都不匹配
-
-**触发时机**：`validatingFieldTypes` 变成空数组
-
-**后果**：
-- `validatingFieldTypes[0]` 为 `undefined`
-- 触发 `||` 运算符，回退到 `Importer.DEFAULT_COLUMN_TYPE`
+### 5.3 默认值回退（L345）
 
 ```typescript
-// import.class.ts:345
-type: validatingFieldTypes[0] || Importer.DEFAULT_COLUMN_TYPE,
+// import.class.ts:344-346
+return {
+  type: validatingFieldTypes[0] || Importer.DEFAULT_COLUMN_TYPE,  // DEFAULT = SingleLineText
+  name: name.toString(),
+};
 ```
 
-#### 回退条件 4：多类型共存，取优先级最高的
+**触发条件详解**：`validatingFieldTypes[0]` 为 falsy 值
 
-**触发时机**：遍历结束后 `validatingFieldTypes.length > 1`
+什么时候会发生？
+- `validatingFieldTypes` 是**空数组** `[]`
+- 此时 `[][0]` 返回 `undefined`
+- `undefined || Importer.DEFAULT_COLUMN_TYPE` → 取默认值
 
-**后果**：取数组第一个元素（候选类型顺序决定）
+**空数组如何产生？**
+- 某个值无法通过候选池中**任何类型**的验证
+- `filter` 后 `matchTypes` 为空数组
+- 后续值继续遍历，可能一直保持为空
 
-```typescript
-// 例如：某列所有值既是 Number 也是 SingleLineText
-// validatingFieldTypes = [Number, SingleLineText]
-// 最终取 Number（优先级更高）
-type: validatingFieldTypes[0]  // Number
+**示例**：
+```
+候选池: [Checkbox, Number, Date, LongText, SingleLineText]
+某值: "not-a-number" "not-a-date" "not-a-bool" 但也不是空字符串
+→ filter 后所有类型都不匹配（假设此值特殊到连 SingleLineText 都不通过）
+→ matchTypes = []
+→ validatingFieldTypes = []
+→ 最终: undefined || SingleLineText → SingleLineText
 ```
 
-### 3.3 回退决策树
+### 5.4 最终取值的完整决策链
+
+按执行顺序：
 
 ```
-                              ┌─────────────────────┐
-                              │  开始遍历列值       │
-                              └──────────┬──────────┘
-                                         │
-                                         ▼
-                        ┌─────────────────────────────────┐
-                        │  遇到值匹配 LongText?           │
-                        └──────────┬─────────┬───────────┘
-                                   │ 是      │ 否
-                                   ▼         ▼
-                        ┌──────────────┐  ┌──────────────────┐
-                        │  设为 LongText│  │  过滤不匹配类型  │
-                        │  立即终止     │  └─────────┬────────┘
-                        └──────┬───────┘            │
-                               │                    ▼
-                               │          ┌───────────────────────┐
-                               │          │  只剩 ≤1 种类型?       │
-                               │          └──────────┬────────────┘
-                               │                     │ 是        否
-                               │                     ▼          │
-                               │          ┌──────────────┐       │
-                               │          │  提前终止     │       │
-                               │          └──────┬───────┘       │
-                               │                 │               │
-                               └─────────────────┼───────────────┘
-                                                 │
-                                                 ▼
-                              ┌─────────────────────────────────┐
-                              │  遍历结束，检查 isColumnEmpty?    │
-                              └──────────┬─────────┬───────────┘
-                                         │ 是      │ 否
-                                         ▼         ▼
-                              ┌──────────────┐  ┌──────────────────┐
-                              │  SingleLineText│  │  取 validating[0]│
-                              └──────┬───────┘  └─────────┬────────┘
-                                     │                     │
-                                     └──────────┬──────────┘
-                                                │
-                                                ▼
-                                      ┌──────────────────┐
-                                      │  最终类型确定     │
-                                      └──────────────────┘
+1. 遍历结束后，先检查空列回退 (L336-338):
+   if (isColumnEmpty):
+       validatingFieldTypes = [SingleLineText]
+       → 最终类型一定是 SingleLineText
+       → 不会走到下一步
+
+2. 再执行最终取值 (L345):
+   if (validatingFieldTypes[0] 存在):
+       → 取 validatingFieldTypes[0]
+   else:
+       → 取 SingleLineText (默认值回退)
+```
+
+**取值优先级（从高到低）**：
+
+| 优先级 | 触发场景 | 结果类型 | 触发位置 |
+|--------|---------|----------|----------|
+| 1 | 空列回退触发 | SingleLineText | L336-338 |
+| 2 | LongText 短路命中 | LongText | L322-325（提前设置） |
+| 3 | `validatingFieldTypes[0]` 存在 | 数组第一个类型（候选顺序决定） | L345 `||` 左侧 |
+| 4 | `validatingFieldTypes` 为空数组 | SingleLineText | L345 `||` 右侧 |
+
+---
+
+## 六、演化示例（按照实际执行顺序）
+
+### 示例 1：混合数字和文本
+
+列值：`["Header", "123", "456", "abc"]`
+
+```
+L306: isColumnEmpty = true
+L307: validatingFieldTypes = [Checkbox, Number, Date, LongText, SingleLineText]
+
+i=0: "Header"
+  L309: length=5 > 1 → 继续
+  L314: i===0 → continue
+  (isColumnEmpty 保持 true)
+
+i=1: "123" (CSV: number 123, Excel: string "123")
+  L309: length=5 > 1 → 继续
+  L314: 值非空、i!==0 → 不跳过
+  L319: isColumnEmpty = false
+  L322: LongText? 无换行 → 否
+  L327: filter:
+    - Checkbox: ✗ (非 bool)
+    - Number: ✓ (Number(123) 不是 NaN)
+    - Date: ✗ (不匹配日期正则)
+    - LongText: ✗
+    - SingleLineText: ✓
+    matchTypes = [Number, SingleLineText]
+  L332: validatingFieldTypes = [Number, SingleLineText]
+
+i=2: "456"
+  L309: length=2 > 1 → 继续
+  L314: 值非空、i!==0 → 不跳过
+  L319: isColumnEmpty 保持 false
+  L322: LongText? 否
+  L327: filter:
+    - Number: ✓
+    - SingleLineText: ✓
+    matchTypes = [Number, SingleLineText]
+  L332: validatingFieldTypes = [Number, SingleLineText]
+
+i=3: "abc"
+  L309: length=2 > 1 → 继续
+  L314: 值非空、i!==0 → 不跳过
+  L319: isColumnEmpty 保持 false
+  L322: LongText? 否
+  L327: filter:
+    - Number: ✗ (Number("abc") 是 NaN)
+    - SingleLineText: ✓
+    matchTypes = [SingleLineText]
+  L332: validatingFieldTypes = [SingleLineText]
+
+循环结束 (i=3 是最后一个值)
+
+L336: isColumnEmpty = false → 不触发空列回退
+L345: validatingFieldTypes[0] = SingleLineText → 不取默认值
+最终类型: SingleLineText
+```
+
+### 示例 2：含换行符的值
+
+列值：`["Header", "hello\nworld"]`
+
+```
+L306: isColumnEmpty = true
+L307: validatingFieldTypes = [Checkbox, Number, Date, LongText, SingleLineText]
+
+i=0: "Header"
+  L314: i===0 → continue
+
+i=1: "hello\nworld"
+  L309: length=5 > 1 → 继续
+  L314: 值非空、i!==0 → 不跳过
+  L319: isColumnEmpty = false
+  L322: LongText? 含 \n → ✓ 是！
+  L323: validatingFieldTypes = [LongText]
+  L324: break → 立即终止循环！
+
+循环结束 (break 跳出)
+
+L336: isColumnEmpty = false → 不触发空列回退
+L345: validatingFieldTypes[0] = LongText
+最终类型: LongText
+```
+
+### 示例 3：空列
+
+列值：`["Header", "", "", null]`
+
+```
+L306: isColumnEmpty = true
+L307: validatingFieldTypes = [Checkbox, Number, Date, LongText, SingleLineText]
+
+i=0: "Header"
+  L314: i===0 → continue
+
+i=1: ""
+  L314: 值为空 → continue
+
+i=2: ""
+  L314: 值为空 → continue
+
+i=3: null
+  L314: 值为 null → continue
+
+循环结束 (所有值被跳过)
+(isColumnEmpty 保持 true，因为 L319 从未执行)
+
+L336: isColumnEmpty = true → 触发空列回退！
+  validatingFieldTypes = [SingleLineText]
+
+L345: validatingFieldTypes[0] = SingleLineText
+最终类型: SingleLineText
 ```
 
 ---
 
-## 四、完整流程示意图
+## 七、CSV 与 Excel 类型推断的一致性与差异
 
-```
-┌─────────────────┐
-│   数据采样      │
-│  CSV: 前500行   │
-│  Excel: 全部行  │
-└────────┬────────┘
-         │
-         ▼
-┌───────────────────────────────┐
-│  初始化候选类型池              │
-│  CSV: [Checkbox, Number, Date,│
-│        LongText, SingleLineText]│
-│  Excel: [Checkbox, Number, Date,│
-│          SingleLineText, LongText]│
-└────────┬───────────────────────┘
-         │
-         ▼
-┌─────────────────┐
-│  逐行验证      │
-│  逐个值检测       │
-├─────────────────┤
-│  ✓ LongText? ──→ 是 → 立即终止 → LongText
-│         │           │
-│         ▼ 否        │
-│  过滤不匹配类型     │
-│         │           │
-│         ▼           │
-│  只剩1种类型? ──→ 是 → 终止
-│         │ 否        │
-│         ▼           │
-│  下一行 ←──────────┘
-│         │
-│         ▼ 所有值处理完
-└────────┬────────┘
-         │
-         ▼
-┌───────────────────────────────┐
-│  isColumnEmpty?               │
-│  ├─ 是 → SingleLineText       │
-│  └─ 否 → 取 validatingFieldTypes[0] │
-└───────────────────────────────┘
-```
+### 7.1 完全一致的环节
+
+| 环节 | 说明 |
+|------|------|
+| **候选类型数组** | 都使用 `Importer.SUPPORTEDTYPE`，顺序完全相同 |
+| **逐值收敛算法** | 相同：for 循环 + filter 收缩 |
+| **LongText 短路机制** | 相同：代码位置在通用 filter 之前，命中即 break |
+| **空列回退** | 相同：`isColumnEmpty` 判断逻辑一致 |
+| **最终取值** | 相同：`validatingFieldTypes[0] \|\| DEFAULT_COLUMN_TYPE` |
+| **表头跳过** | 相同：`i === 0` 时 continue |
+| **空值跳过** | 相同：`''` 和 `null` 时 continue |
+
+### 7.2 真正不同的点
+
+| 差异点 | CSV | Excel | 实际影响 |
+|--------|-----|-------|----------|
+| **采样范围** | 前 500 行 | 全部行 | CSV 可能漏判第 501 行及之后的异常值 |
+| **值类型输入** | dynamicTyping 自动转换（可能是 number/boolean） | 全部是 string | 极端值（如 `"1e999"`、`"0x10"`）的 Number 验证结果可能不同 |
+| **Sheet 处理** | 单 Sheet（key 固定为 `Import Table`） | 多 Sheet 独立遍历 | Excel 每个 Sheet 分别执行 genColumns |
+
+### 7.3 值类型差异的实际影响
+
+| 原始值 | CSV 传入类型 | Excel 传入类型 | Checkbox 验证结果 | Number 验证结果 |
+|--------|-------------|---------------|------------------|----------------|
+| `"true"` | boolean `true` | string `"true"` | ✓ 通过 | ✗ (NaN) |
+| `"false"` | boolean `false` | string `"false"` | ✓ 通过 | ✗ (NaN) |
+| `"123"` | number `123` | string `"123"` | ✗ | ✓ (123 不是 NaN) |
+| `"1e999"` | number `Infinity` | string `"1e999"` | ✗ | ✓ (Infinity 不是 NaN) |
+| `"0x10"` | number `16` | string `"0x10"` | ✗ | ✓ (16 不是 NaN) |
+
+注：两者的最终判定结果通常一致，但**极端值场景下可能出现差异**。
 
 ---
 
-## 五、关键设计决策
-
-### 5.1 顺序优先策略
-
-**何时生效？**
-1. 初始化候选类型池时
-2. 多类型共存时取第一个
-
-**为什么按这个顺序？**
-- Checkbox → Number → Date → LongText → SingleLineText
-- 从最具体到最宽泛
-- 确保 "123" 被识别为 Number 而非 String
-
-### 5.2 保守推断原则
-
-**只有当所有采样值都符合某类型才会被选中。**
-
-例如：
-- 100 个值中有 99 个是 Number，1 个是 String
-- Number 会被过滤掉（因为有 1 个不匹配）
-- 最终可能只剩 SingleLineText
-
-### 5.3 采样性能优化
-
-1. **提前终止**：只剩 1 种类型时立即停止遍历
-2. **LongText 快速路径**：发现换行符立即判定并终止
-3. **CSV 采样限制**：500 行平衡了准确性与性能
-
-### 5.4 边界情况处理表
+## 八、边界情况处理表
 
 | 场景 | 处理方式 | 代码位置 |
 |------|----------|----------|
-| 空列（所有值为空） | SingleLineText | L336-338 |
-| 混合类型（部分值不匹配） | 取仍匹配的最宽泛类型 | L327-332 |
-| 所有值都不匹配任何类型 | SingleLineText | L345 |
-| 表头行（i===0） | 跳过检测 | L314 |
-| 任意值含换行符 | LongText（立即终止） | L322-325 |
-| 候选类型池空 | SingleLineText | L345 |
+| 空列（全为空值/null） | 空列回退 → SingleLineText | L336-338 |
+| 混合类型（部分值不匹配某类型） | filter 收缩，取仍匹配的最前面类型 | L327-332 |
+| 所有值都不匹配任何类型 | 默认值回退 → SingleLineText | L345 `\|\|` |
+| 表头行有值但数据行全空 | 空列回退 → SingleLineText | L314 跳过 + L336-338 |
+| 任意数据值含换行符 | LongText 短路 → LongText | L322-325 |
+| 候选池被过滤为空数组 | 默认值回退 → SingleLineText | L345 `\|\|` |
+| 第 501 行出现异常值（仅 CSV） | 未被采样，可能误判 | L459 `preview: 500` |
+| 候选池只剩 1 种类型 | 提前终止循环 | L309-311 |
 
 ---
 
-## 六、CSV vs Excel 类型推断差异总结
+## 九、代码位置速查表
 
-| 维度 | CSV | Excel |
-|------|-----|-------|
-| **采样行数** | 前 500 行 | 全部行 |
-| **动态类型** | PapaParse 自动转换 | 基于文本表示 |
-| **LongText 优先级** | 第 4 位（在 SingleLineText 前） | 第 5 位（在最后） |
-| **类型推断依据** | 转换后的值类型 | 单元格文本 |
-| **Sheet 处理** | 单 Sheet | 多 Sheet 独立推断 |
-
-### 实际影响示例
-
-**示例 1：含换行符的单元格**
-- CSV：优先识别为 LongText（第 4 位）
-- Excel：优先识别为 SingleLineText（第 5 位，被 SingleLineText 抢占）
-
-**示例 2：大文件（10000 行）**
-- CSV：只看前 500 行，可能误判（后 9500 行有特殊值）
-- Excel：全部行都看，更准确但更慢
-
----
-
-## 七、代码位置速查表
-
-| 模块 | 文件路径 | 核心函数/常量 |
-|-------|----------|-----------|
-| 类型推断主逻辑 | `import.class.ts` | `genColumns()` L295-360 |
-| CSV 采样（类型推断用） | `import.class.ts` | `CsvImporter.parse()` 无参数分支 L454-470 |
-| Excel 全量采样 | `import.class.ts` | `ExcelImporter.parse()` L510-569 |
-| CSV 类型顺序 | `import.class.ts` | `Importer.SUPPORTEDTYPE` L209-215 |
-| Excel 类型顺序 | `import.class.ts` | `ExcelImporter.SUPPORTEDTYPE` L494-500 |
-| 日期验证函数 | `import.class.ts` | `isValidDateForImport()` L52-74 |
-| 类型验证 Schema | `import.class.ts` | `validateZodSchemaMap` L76-105 |
-| 空列回退逻辑 | `import.class.ts` | L336-338 |
-| LongText 快速路径 | `import.class.ts` | L322-325 |
+| 模块 | 文件 | 核心函数/常量 | 行号 |
+|-------|------|-----------|------|
+| 候选类型数组（唯一生效） | `import.class.ts` | `Importer.SUPPORTEDTYPE` | L209-215 |
+| Excel 候选类型（死代码） | `import.class.ts` | `ExcelImporter.SUPPORTEDTYPE` | L494-500 |
+| 类型推断主逻辑 | `import.class.ts` | `genColumns()` | L295-360 |
+| 候选数组来源 | `import.class.ts` | `const supportTypes = Importer.SUPPORTEDTYPE` | L296 |
+| 提前终止 | `import.class.ts` | `if (validatingFieldTypes.length <= 1) break` | L309-311 |
+| 跳过逻辑 | `import.class.ts` | `if ('' || null || i===0) continue` | L314-316 |
+| LongText 短路 | `import.class.ts` | `validatingFieldTypes = [LongText]; break` | L322-325 |
+| 通用收敛 filter | `import.class.ts` | `validatingFieldTypes = matchTypes` | L327-332 |
+| 空列回退 | `import.class.ts` | `!isColumnEmpty ? ... : [DEFAULT_COLUMN_TYPE]` | L336-338 |
+| 最终取值 + 默认值回退 | `import.class.ts` | `validatingFieldTypes[0] \|\| DEFAULT_COLUMN_TYPE` | L345 |
+| CSV 采样（类型推断用） | `import.class.ts` | `CsvImporter.parse()` 无参数分支 | L454-470 |
+| Excel 全量采样 | `import.class.ts` | `ExcelImporter.parse()` 无参数分支 | L510-541 |
+| 日期验证 | `import.class.ts` | `isValidDateForImport()` | L52-74 |
+| 类型验证 Schema | `import.class.ts` | `validateZodSchemaMap` | L76-105 |
+| 调用入口 | `import-open-api.service.ts` | `analyze()` → `importer.genColumns()` | L107-116 |

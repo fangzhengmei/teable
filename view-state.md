@@ -320,49 +320,88 @@ if (isEmptyStackHidden) {
 
 **作用时机**：在 stackCollection 最终返回前过滤。
 
-### 6.2 与列重排的交互链路
+### 6.2 与列重排的完整交互链路
 
 ```
-stackCollection (完整列表)
-    │
-    ├─→ useEffect 同步到 stackIds 本地状态
-    │      （KanbanContainer.tsx:39-41）
-    │
-    └─→ isEmptyStackHidden 过滤
-           ↓
-      渲染的 stackCollection（可能缺少空列）
-           ↓
-      列拖动 → onDragEnd → 只重排当前可见的 stackIds
-           ↓
-      newChoices 只包含可见列，丢失被隐藏的空列顺序？
+stackField.options.choices = [A, B, C] (A有数据, B空, C有数据)
+              │
+              ▼
+  KanbanProvider 计算 stackCollection
+              │
+              ├─ isEmptyStackHidden = false
+              │    stackCollection = [未分类, A, B, C]
+              │    stackIds = [未分类, A_id, B_id, C_id]
+              │    stackMap = {A_id: A, B_id: B, C_id: C}
+              │
+              └─ isEmptyStackHidden = true
+                   stackCollection = [未分类, A, C]  (B被过滤)
+                   stackIds = [未分类, A_id, C_id]  (B_id不存在)
+                   stackMap = {A_id: A, C_id: C}    (B_id不存在)
 ```
 
-### 6.3 关键边界分析
+### 6.3 列重排时的 choices 映射逻辑
 
-**边界 1：空列隐藏时拖动列的后果**
+```typescript
+// KanbanContainer.tsx:67-80
+const { choices } = stackField.options;                    // [A, B, C]
+const choiceMap = keyBy(choices, 'name');                 // {A_name: A, B_name: B, C_name: C}
+const newChoices = newStackIds
+  .map((choiceId) => {
+    if (choiceId === UNCATEGORIZED_STACK_ID) return;      // 未分类列跳过
+    const stack = stackMap[choiceId];                     // 从 stackMap 查找
+    if (stack == null) return;                            // ⚠️ 空列被过滤后 stack == null
+    return choiceMap[stack.data as string];               // stack.data 是 choice.name
+  })
+  .filter((choice): choice is NonNullable<typeof choice> => Boolean(choice));
+```
 
-当 `isEmptyStackHidden=true` 时，空列（count=0）不包含在 `stackCollection` 中，因此：
-1. `stackIds` 本地状态**不含空列**
-2. 拖动列时，`newStackIds` 只重排**可见列**
-3. 构造 `newChoices` 时，`stackMap[choiceId]` 找不到被隐藏的空列
-4. 最终 `newChoices` 数组**只包含当前可见的列**
+### 6.4 完整推导：空列隐藏时拖动列的真实行为
 
-**潜在问题**：隐藏的空列在字段 options.choices 中的顺序会丢失吗？
+**前提条件**：
+- choices = [A, B, C]（A、C 有数据，B 为空）
+- `isEmptyStackHidden = true`
 
-**实际行为**：不会完全丢失。因为：
-- 空列的 choice 对象仍存在于 `stackField.options.choices`
-- 但它们的顺序会被 `newChoices` 数组的末尾截断逻辑改变
-- `choiceMap[stack.data as string]` 查找不到时，该 choice 会被 `.filter(Boolean)` 过滤掉
-- **结论**：空列隐藏时拖动列会导致被隐藏的空列在 choices 数组中的顺序被打乱
+**拖动前**：
+- 可见列：[未分类, A, C]
+- `stackIds = [未分类_id, A_id, C_id]`
+- `stackMap = {A_id: A_stack, C_id: C_stack}`（B_id 不在其中）
 
-**边界 2：显示/隐藏空列触发的重渲染**
+**拖动操作**：将 C 拖到 A 前面
+
+**重排后的 newStackIds**：
+- `newStackIds = [未分类_id, C_id, A_id]`
+
+**构造 newChoices 的过程**：
+1. 遍历 `newStackIds`：
+   - 未分类_id → return（跳过）
+   - C_id → `stackMap[C_id]` → C_stack → `choiceMap[C_stack.data]` → C
+   - A_id → `stackMap[A_id]` → A_stack → `choiceMap[A_stack.data]` → A
+
+2. **B 完全没有出现在 newStackIds 中！**
+
+3. 最终 `newChoices = [C, A]`
+
+**最终结论**：
+- ❌ **B 被从 choices 数组中彻底删除了**
+- ❌ 不是"顺序被打乱"，而是"被移除"
+- ⚠️ 这是一个严重的 bug：空列隐藏时拖动列会导致被隐藏的空列从字段选项中**永久丢失**
+
+**验证方法**：
+1. 创建 SingleSelect 字段，添加 3 个选项
+2. 只给第 1、3 选项创建记录，保持第 2 个选项为空
+3. 开启"隐藏空列"
+4. 拖动第 3 列到第 1 列前面
+5. 关闭"隐藏空列"
+6. 检查字段选项：原第 2 个选项已被删除
+
+### 6.5 显示/隐藏空列触发的重渲染
 
 `isEmptyStackHidden` 变更时：
 1. `stackCollection` 重新计算
 2. `useEffect` 触发，`setStackIds` 同步新的完整/过滤后的列表
 3. 列顺序重置为字段 choices 的原始顺序
 
-**边界 3：未分类列的特殊性**
+### 6.6 未分类列的特殊性
 
 `UNCATEGORIZED_STACK_ID` 列：
 - 始终插入在 stackList 开头
@@ -370,17 +409,165 @@ stackCollection (完整列表)
 - 因此它不参与字段 choices 顺序的持久化
 - 它始终显示在最左边，不受列拖动影响
 
-### 6.4 建议的注意事项
+### 6.7 建议的修复方案
 
-1. 当需要精确控制列顺序时，应先关闭 `isEmptyStackHidden`
-2. 空列隐藏 + 列拖动是一个有副作用的组合操作
-3. 空列的实际顺序以 `stackField.options.choices` 为准，而非显示顺序
+在 `KanbanContainer.tsx` 的列重排逻辑中，构造 `newChoices` 时应：
+1. 遍历**原始完整的 choices 数组**，而非 `newStackIds`
+2. 根据 `newStackIds` 调整可见列的顺序
+3. 将被隐藏的空列附加到数组末尾（或保持其原始相对位置）
 
 ---
 
-## 7. 字段拖动的关键边界条件
+## 7. record 更新接口的完整核对
 
-### 7.1 看板列拖动（Stack Draggable）
+### 7.1 画廊卡片排序的 API 调用链
+
+**前端调用**（`GalleryViewBase.tsx:105-117`）：
+```typescript
+updateRecord({
+  tableId,
+  recordId: activeId as string,
+  recordRo: {
+    fieldKeyType: FieldKeyType.Id,
+    record: { fields: {} },          // 空对象，不修改字段
+    order: {
+      viewId,
+      anchorId: overId as string,
+      position: actualOldIndex > actualNewIndex ? 'before' : 'after',
+    },
+  },
+});
+```
+
+**后端处理链**：
+1. `RecordOpenApiController.updateRecord()`（`record-open-api.controller.ts:141-160`）
+   - 检查 V2FeatureGuard，由于 `fields` 为空且有 `order`，**强制走 v1**
+2. `RecordOpenApiService.updateRecord()`（`record-open-api.service.ts:172-207`）
+   - 转换为 `updateRecords` 调用：
+     ```typescript
+     await this.updateRecords(
+       tableId,
+       {
+         ...updateRecordRo,
+         records: [{ id: recordId, fields: updateRecordRo.record.fields }],
+       },
+       windowId,
+       isAiInternal
+     );
+     ```
+3. `RecordUpdateService.updateRecords()`（`record-modify/record-update.service.ts:61-147`）
+   - 在事务中处理 `order`：
+     ```typescript
+     if (order != null) {
+       const { viewId, anchorId, position } = order as IRecordInsertOrderRo;
+       await this.viewOpenApiService.updateRecordOrders(table, viewId, {
+         anchorId,
+         position,
+         recordIds: records.map((r) => r.id),
+       });
+     }
+     ```
+   - 然后处理字段值更新 + 计算字段联动
+
+**结论**：接口调用链是一致的。画廊的 `updateRecord` 会被转换为 `updateRecords`，在同一个事务中处理 order 更新。
+
+### 7.2 看板跨列移动的 API 调用链
+
+**前端调用**（`KanbanContainer.tsx:122-155`）：
+```typescript
+const recordRo: IUpdateRecordRo = {
+  fieldKeyType: FieldKeyType.Id,
+  record: {
+    fields: {
+      [fieldId]: fieldValue,    // 有字段值更新
+    },
+  },
+};
+if (targetCardId == null) {
+  recordRo.order = { viewId, anchorId: lastTargetCardId, position: 'after' };
+} else {
+  recordRo.order = { viewId, anchorId: targetCardId, position: 'before' };
+}
+updateRecord({ tableId, recordId: sourceCardId, recordRo });
+```
+
+**后端处理**：
+- 由于 `fields` 不为空，V2FeatureGuard 不会强制降级
+- 可以走 v2（如果金丝雀配置启用）
+- 处理逻辑与画廊类似，在同一个事务中处理字段值 + order
+
+### 7.3 看板同列卡片重排的 API 调用链
+
+**前端调用**（`KanbanContainer.tsx:92-100`）：
+```typescript
+updateRecordOrders({
+  tableId,
+  viewId,
+  order: {
+    anchorId: cards[targetIndex].id,
+    position: targetIndex > sourceIndex ? 'after' : 'before',
+    recordIds: [cards[sourceIndex].id],
+  },
+});
+```
+
+**后端处理**：
+- 走 `PUT /table/{tableId}/view/{viewId}/record-order` 接口
+- 有 `@UseV2Feature('reorderRecords')` 标记
+- 可以走 v2（如果金丝雀配置启用）
+
+### 7.4 API 方法与实际代码的一致性核对
+
+| 场景 | 前端调用 | 后端实际处理 | 一致性 |
+|---|---|---|---|
+| 画廊卡片排序 | `updateRecord(fields={}, order)` | `updateRecord` → `updateRecords` → `updateRecordOrders` | ✅ 一致 |
+| 看板跨列移动 | `updateRecord(fields={...}, order)` | `updateRecord` → `updateRecords` → `updateRecordOrders` | ✅ 一致 |
+| 看板同列卡片 | `updateRecordOrders` | 独立 API，直接处理 | ✅ 一致 |
+
+**不一致之处**：
+- 画廊调用 `updateRecord` 传入 `fields={}`，这是一个"空更新"，但后端仍然会走完整的记录更新流程（包括系统字段更新、计算字段联动等）
+- 从性能角度看，画廊应该直接调用 `updateRecordOrders` API，与看板同列卡片重排保持一致
+- 但当前实现是**正确的**，只是有优化空间
+
+---
+
+## 8. v1/v2 路径与行为的关联说明
+
+### 8.1 各场景的 v1/v2 路径判定
+
+| 场景 | API | Feature 标记 | V2Guard 检查 | 实际路径 |
+|---|---|---|---|---|
+| 画廊卡片排序 | `updateRecord` | `updateRecord` | `fields={}` 且有 `order` → **强制 v1** | v1 |
+| 看板跨列移动 | `updateRecord` | `updateRecord` | `fields` 非空 → 正常判定 | 可 v1 或 v2 |
+| 看板同列卡片 | `updateRecordOrders` | `reorderRecords` | 正常判定 | 可 v1 或 v2 |
+| 看板列重排 | `convertField` | 无 | 无标记 → **v1 仅** | v1 |
+
+### 8.2 空列隐藏 bug 与 v1/v2 的关联
+
+空列隐藏时拖动列导致 choices 丢失的 bug：
+- **与 v1/v2 无关**：因为列重排调用的是 `convertField` API，没有 `@UseV2Feature` 标记
+- 始终走 v1 路径
+- bug 存在于前端逻辑，不是后端版本差异导致的
+
+### 8.3 记录排序与 v1/v2 的行为差异
+
+v1 实现（`ViewOpenApiService.updateRecordOrders`）：
+- 在同一个事务中先更新 order，再更新记录字段
+- 顺序执行：updateRecordOrders → validateFieldsAndTypecast → systemFieldOps → computedOrchestrator
+- 有 `orderIndexesBefore` 用于事件通知
+
+v2 实现（`ViewOpenApiV2Service.updateRecordOrders`）：
+- 通过 `executeReorderRecordsEndpoint` 调用 DDD 命令总线
+- 具体实现位于 `packages/v2/` 目录
+- 错误处理通过 domain error code 映射
+
+**注意**：由于画廊卡片排序强制走 v1，即使空间在金丝雀列表中，画廊也始终用 v1 实现。
+
+---
+
+## 9. 字段拖动的关键边界条件
+
+### 9.1 看板列拖动（Stack Draggable）
 
 **权限条件**（`KanbanProvider.tsx:130`、`KanbanStackContainer.tsx:42`）：
 
@@ -405,7 +592,7 @@ const isSingleSelectField = fieldType === FieldType.SingleSelect && !isLookup;
 
 > 只有单选字段且非 lookup 字段才能拖动列。User、多选等其他字段类型的看板**不支持列重排**。
 
-### 7.2 看板卡片拖动（Card Draggable）
+### 9.2 看板卡片拖动（Card Draggable）
 
 **权限条件**（`KanbanProvider.tsx:134-136`）：
 
@@ -427,7 +614,7 @@ cardDraggable: Boolean(
 | `!cardDraggable` | 权限不足 |
 | `isComputed` | 计算字段（公式、自动编号等） |
 
-### 7.3 画廊卡片拖动（Card Draggable）
+### 9.3 画廊卡片拖动（Card Draggable）
 
 **权限条件**（`GalleryProvider.tsx:64`）：
 
@@ -442,7 +629,7 @@ cardDraggable: Boolean(permission['record|update'] && permission['view|update'])
 <SortableContext items={recordIds} strategy={rectSortingStrategy} disabled={!cardDraggable}>
 ```
 
-### 7.4 字段在列中显示顺序的拖动（ColumnMeta Order）
+### 9.4 字段在列中显示顺序的拖动（ColumnMeta Order）
 
 虽然看板和画廊视图不直接暴露字段顺序拖动 UI，但 `columnMeta.order` 字段仍然存在，用于控制卡片内字段的显示顺序。
 
@@ -458,9 +645,9 @@ view.updateColumnMeta(
 
 ---
 
-## 8. 分组重排的关键边界条件
+## 10. 分组重排的关键边界条件
 
-### 8.1 看板 stackCollection 计算的完整边界
+### 10.1 看板 stackCollection 计算的完整边界
 
 `KanbanProvider.tsx:141-228` 完整逻辑：
 
@@ -473,7 +660,7 @@ view.updateColumnMeta(
 | `value == null`（groupPoint 中） | 跳过该分组 |
 | `isEmptyStackHidden` | 过滤 `count > 0` 的列 |
 
-### 8.2 SingleSelect 字段的特殊处理
+### 10.2 SingleSelect 字段的特殊处理
 
 **列顺序来源**：
 - 列顺序 = `stackField.options.choices` 的顺序（`KanbanProvider.tsx:182-198`）
@@ -499,7 +686,7 @@ const newChoices = newStackIds
 3. 通过 `choiceMap[stack.data as string]` 反查完整 choice 对象
 4. 过滤掉 undefined（未找到的 choice）
 
-### 8.3 User 字段的特殊处理
+### 10.3 User 字段的特殊处理
 
 **列顺序来源**：
 - 列顺序 = 协作者列表的顺序（`KanbanProvider.tsx:200-220`）
@@ -510,7 +697,7 @@ const newChoices = newStackIds
 - User 字段 `isSingleSelectField=false`（因为 `fieldType !== FieldType.SingleSelect`）
 - 因此 User 字段的看板**不支持列拖动重排**
 
-### 8.4 其他字段类型的特殊处理
+### 10.4 其他字段类型的特殊处理
 
 **列顺序来源**：
 - 列顺序 = groupPoints 返回的顺序（`KanbanProvider.tsx:156-179, 222-227`）
@@ -523,9 +710,9 @@ const newChoices = newStackIds
 
 ---
 
-## 9. 持久化链路的关键边界
+## 11. 持久化链路的关键边界
 
-### 9.1 记录排序持久化（v1）
+### 11.1 记录排序持久化（v1）
 
 `ViewOpenApiService.updateRecordOrders()`（`apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:744-797`）：
 
@@ -544,7 +731,7 @@ const newChoices = newStackIds
 - 写入在 `dataPrismaService.$tx` 事务中
 - 视图 `lastModifiedTime` 更新走 OT 链路
 
-### 9.2 记录排序持久化（v2）
+### 11.2 记录排序持久化（v2）
 
 `ViewOpenApiV2Service.updateRecordOrders()`（`apps/nestjs-backend/src/features/view/open-api/view-open-api-v2.service.ts:36-65`）：
 
@@ -566,7 +753,7 @@ const result = await executeReorderRecordsEndpoint(context, v2Input, commandBus)
 - 错误处理通过 domain error code 映射
 - 具体实现位于 `packages/v2/` 目录
 
-### 9.3 手动排序（Manual Sort）
+### 11.3 手动排序（Manual Sort）
 
 `ViewOpenApiService.manualSort()`（`apps/nestjs-backend/src/features/view/open-api/view-open-api.service.ts:147-184`）：
 
@@ -583,7 +770,7 @@ const result = await executeReorderRecordsEndpoint(context, v2Input, commandBus)
 - 直接 SQL 更新，不走浮点 order 算法
 - 会重置所有间隙，相当于一次 shuffle
 
-### 9.4 浮点 Order 算法的边界
+### 11.4 浮点 Order 算法的边界
 
 `updateMultipleOrders()`（`apps/nestjs-backend/src/utils/update-order.ts:68-102`）：
 
@@ -602,7 +789,7 @@ if (gap < Number.EPSILON * 2) {
 - 释放浮点精度压力
 - 是一个相对重的操作（全表扫描 + 全量更新）
 
-### 9.5 跨列移动的双写原子性
+### 11.5 跨列移动的双写原子性
 
 看板跨列移动同时写：
 1. 字段值（改变所属列）
@@ -615,7 +802,7 @@ if (gap < Number.EPSILON * 2) {
 - `fields` 为空对象
 - **注意**：由于 `V2FeatureGuard.isUnsupportedV2Payload()` 的限制，这种纯排序请求**强制走 v1**
 
-### 9.6 OT 操作与事件的双轨
+### 11.6 OT 操作与事件的双轨
 
 视图变更同时走两条链路：
 
@@ -637,7 +824,7 @@ API 请求
 
 ---
 
-## 10. 三者之间的关联总结
+## 12. 三者之间的关联总结
 
 ```
 字段拖动 (Column Drag)
@@ -683,7 +870,39 @@ API 请求
 
 ---
 
-## 11. 关键文件索引
+## 13. 关键发现与建议
+
+### 13.1 已发现的 Bug
+
+**Bug 1：空列隐藏时拖动列导致 choices 丢失**
+- 位置：`KanbanContainer.tsx:67-80`
+- 现象：开启"隐藏空列"后拖动列，被隐藏的空列会从 `stackField.options.choices` 中被永久删除
+- 原因：构造 `newChoices` 时只遍历可见列的 `newStackIds`，空列不在其中
+- 修复建议：遍历原始 choices，根据 `newStackIds` 调整顺序而非过滤
+
+### 13.2 可优化点
+
+**优化点 1：画廊卡片排序应直接调用 updateRecordOrders**
+- 当前：画廊调用 `updateRecord(fields={}, order)` → 走完整的记录更新流程
+- 建议：直接调用 `updateRecordOrders` API，与看板同列卡片保持一致
+- 好处：减少不必要的字段验证、计算字段联动等开销
+
+**优化点 2：画廊排序应支持 v2**
+- 当前：由于 V2FeatureGuard 的限制，画廊的纯排序请求强制走 v1
+- 建议：修改 V2FeatureGuard 或画廊调用方式，让画廊也能走 v2 路径
+
+### 13.3 v1/v2 迁移状态
+
+| 功能 | v1 支持 | v2 支持 | 备注 |
+|---|---|---|---|
+| 看板列重排 | ✅ | ❌ | 无 @UseV2Feature 标记 |
+| 看板同列卡片 | ✅ | ✅ | 有标记 |
+| 看板跨列移动 | ✅ | ✅ | 有标记（需 fields 非空） |
+| 画廊卡片排序 | ✅ | ❌ | 强制走 v1 |
+
+---
+
+## 14. 关键文件索引
 
 | 文件 | 职责 |
 |---|---|
@@ -707,8 +926,11 @@ API 请求
 | `apps/nextjs-app/.../gallery/context/GalleryProvider.tsx` | 画廊 Context 组装 |
 | `apps/nestjs-backend/.../view-open-api.service.ts` | 后端视图操作服务（v1） |
 | `apps/nestjs-backend/.../view-open-api-v2.service.ts` | 后端视图操作服务（v2） |
+| `apps/nestjs-backend/.../record-open-api.controller.ts` | 记录 API Controller |
+| `apps/nestjs-backend/.../record-modify/record-update.service.ts` | 记录更新服务（处理 order） |
 | `apps/nestjs-backend/.../canary/canary.service.ts` | 金丝雀发布决策服务 |
 | `apps/nestjs-backend/.../canary/guards/v2-feature.guard.ts` | v1/v2 路由 Guard |
 | `apps/nestjs-backend/src/utils/update-order.ts` | 浮点 order 算法（updateOrder / updateMultipleOrders） |
+| `packages/openapi/src/record/update.ts` | 记录更新 API 定义 |
 | `packages/openapi/src/view/update-order.ts` | 视图排序 API 定义 |
 | `packages/openapi/src/view/update-record-order.ts` | 记录排序 API 定义 |

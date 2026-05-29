@@ -431,7 +431,357 @@ const SHARE_EXCLUDED_PERMISSIONS = new Set<Action>([
 
 ---
 
-## 七、核心代码模块索引
+## 八、三种越权场景错误处理
+
+### 8.1 错误码定义
+
+**代码路径**: `packages/core/src/errors/http/http-response.types.ts:15-66`
+
+```typescript
+export enum HttpErrorCode {
+  VALIDATION_ERROR = 'validation_error',       // 400 - 参数验证错误
+  UNAUTHORIZED = 'unauthorized',           // 401 - 未授权
+  UNAUTHORIZED_SHARE = 'unauthorized_share',   // 401 - 共享链接未授权
+  RESTRICTED_RESOURCE = 'restricted_resource', // 403 - 资源访问受限
+  NOT_FOUND = 'not_found',                    // 404 - 资源不存在
+}
+```
+
+---
+
+### 8.2 场景一：shareId 无效
+
+**拦截位置与错误码**：
+
+| 场景 | 文件路径 | 错误码 | HTTP 状态 |
+|-----|---------|---------|-----------|
+| 视图共享 - shareId 不存在/未启用/已删除 | `share-auth.service.ts:76` | `VALIDATION_ERROR` | 400 |
+| 基库共享 - shareId 不存在/未启用 | `base-share-auth.service.ts:71` | `NOT_FOUND` | 404 |
+| 基库共享 - 更新/删除时不存在 | `base-share.service.ts:167,208,231,253` | `NOT_FOUND` | 404 |
+| 基库共享 Guard - NOT_FOUND 特殊处理 | `base-share-auth.guard.ts:46-51` | `NOT_FOUND` | 404 |
+
+**视图共享拦截逻辑** (`share-auth.service.ts:70-79`)：
+```typescript
+const view = await this.prismaService.view.findFirst({
+  where: { shareId, enableShare: true, deletedTime: null },
+});
+if (!view) {
+  throw new CustomHttpException('Share view not found', HttpErrorCode.VALIDATION_ERROR, {
+    localization: { i18nKey: 'httpErrors.shareAuth.shareViewNotFound' },
+  });
+}
+```
+
+**基库共享拦截逻辑** (`base-share-auth.service.ts:65-74`)：
+```typescript
+const share = await this.prismaService.baseShare.findFirst({
+  where: { shareId, enabled: true },
+});
+if (!share || !share.enabled) {
+  throw new CustomHttpException('Base share not found', HttpErrorCode.NOT_FOUND, {
+    localization: { i18nKey: 'httpErrors.baseShare.notFound' },
+  });
+}
+```
+
+**关键区别**：
+- 视图共享使用 `VALIDATION_ERROR` (400)，基库共享使用 `NOT_FOUND` (404)
+- 基库共享 Guard 会特殊处理 `NOT_FOUND` 错误，直接抛出而不转换为 `UNAUTHORIZED_SHARE`
+
+---
+
+### 8.3 场景二：密码校验失败
+
+**拦截位置与错误码**：
+
+| 场景 | 文件路径 | 错误码 | HTTP 状态 |
+|-----|---------|---------|-----------|
+| 登录提交密码 - 视图 | `share-auth-local.guard.ts:19` | `VALIDATION_ERROR` | 400 |
+| 登录提交密码 - 基库 | `base-share-auth-local.guard.ts:19` | `VALIDATION_ERROR` | 400 |
+| JWT Token 验证失败 | `jwt.strategy.ts:126` | `UNAUTHORIZED` (转换为 `UNAUTHORIZED_SHARE`) | 401 |
+| Cookie Token 缺失/无效 - PermissionGuard | `permission.guard.ts:180,184` | `UNAUTHORIZED_SHARE` | 401 |
+| 视图共享 Guard 捕获异常 | `share-auth.guard.ts:68` | `UNAUTHORIZED_SHARE` | 401 |
+| 基库共享 Guard 捕获异常 | `base-share-auth.guard.ts:50` | `UNAUTHORIZED_SHARE` | 401 |
+| 基库共享 - 未启用密码却调用 auth 接口 | `share-auth.service.ts:56` | `VALIDATION_ERROR` | 400 |
+
+**登录时密码校验** (`share-auth-local.guard.ts:11-26`)：
+```typescript
+async canActivate(context: ExecutionContext) {
+  const req = context.switchToHttp().getRequest();
+  const shareId = req.params.shareId;
+  const password = req.body.password;
+  const authShareId = await this.shareAuthService.authShareView(shareId, password);
+  if (!authShareId) {
+    throw new CustomHttpException('Incorrect password.', HttpErrorCode.VALIDATION_ERROR, {
+      localization: { i18nKey: 'httpErrors.share.incorrectPassword' },
+    });
+  }
+  return true;
+}
+```
+
+**JWT Token 验证** (`jwt.strategy.ts:122-129`)：
+```typescript
+async validate(payload: IJwtShareInfo) {
+  const { shareId, password } = payload;
+  const authShareId = await this.shareAuthService.authShareView(shareId, password);
+  if (!authShareId) {
+    throw new UnauthorizedException();
+  }
+  return authShareId;
+}
+```
+
+**PermissionGuard 二次验证** (`permission.guard.ts:171-186`)：
+```typescript
+private async ensureBaseShareAuth(context: ExecutionContext, shareId: string) {
+  const requirePassword = await this.permissionService.baseShareRequiresPassword(shareId);
+  if (!requirePassword) return;
+  const cookies = cookie.parse(req.headers.cookie ?? '');
+  const token = cookies[shareId];
+  if (!token) {
+    throw new CustomHttpException('Unauthorized', HttpErrorCode.UNAUTHORIZED_SHARE);
+  }
+  const valid = await this.permissionService.validateBaseSharePasswordToken(shareId, token);
+  if (!valid) {
+    throw new CustomHttpException('Unauthorized', HttpErrorCode.UNAUTHORIZED_SHARE);
+  }
+}
+```
+
+**密码 Token 验证逻辑** (`permission.service.ts:581-599`)：
+```typescript
+async validateBaseSharePasswordToken(shareId: string, token: string) {
+  const payload = await this.jwtService.verifyAsync<{ shareId: string; password: string }>(token);
+  if (payload.shareId !== shareId) return false;
+  const baseShare = await this.prismaService.baseShare.findFirst({
+    where: { shareId, enabled: true },
+    select: { password: true },
+  });
+  if (!baseShare?.password) return false;
+  return payload.password === baseShare.password;
+}
+```
+
+---
+
+### 8.4 场景三：共享节点越权
+
+**拦截位置与错误码**：
+
+| 场景 | 文件路径 | 错误码 | HTTP 状态 |
+|-----|---------|---------|-----------|
+| 访问资源不属于共享节点 | `permission.service.ts:629-632` | `RESTRICTED_RESOURCE` | 403 |
+| 权限不足（操作超出共享权限范围） | `permission.service.ts:971-979` | `RESTRICTED_RESOURCE` | 403 |
+| PermissionGuard 资源 ID 不存在 | `permission.guard.ts:138` | `RESTRICTED_RESOURCE` | 403 |
+| 复制权限不足（allowSave=false） | `base-share-open.controller.ts:166` | `RESTRICTED_RESOURCE` | 403 |
+| 视图 Socket 越权访问其他视图 | `share-socket.service.ts:46` | `RESTRICTED_RESOURCE` | 403 |
+| 视图 Socket 字段越权 | `share-socket.service.ts:93` | `RESTRICTED_RESOURCE` | 403 |
+| 视图 Socket 记录越权 | `share-socket.service.ts:151,163` | `RESTRICTED_RESOURCE` | 403 |
+
+**节点归属检查** (`permission.service.ts:620-633`)：
+```typescript
+const resourceBelongsToShare = await this.checkResourceBelongsToShare(
+  resourceId, baseId, nodeId
+);
+if (!resourceBelongsToShare) {
+  this.logger.warn(
+    `[BaseShare] Resource ${resourceId} is not accessible via share ${shareId}`
+  );
+  throw new CustomHttpException(
+    `Resource ${resourceId} is not accessible via share ${shareId}`,
+    HttpErrorCode.RESTRICTED_RESOURCE
+  );
+}
+```
+
+**操作权限验证** (`permission.service.ts:966-980`)：
+```typescript
+async validBaseSharePermissions(shareId: string, resourceId: string, permissions: Action[]) {
+  const sharePermissions = await this.getBaseSharePermissions(shareId, resourceId);
+  if (permissions.every((permission) => sharePermissions.includes(permission))) {
+    return sharePermissions;
+  }
+  throw new CustomHttpException(
+    `Base share access denied, not allowed to operate ${permissions.join(', ')} on ${resourceId}`,
+    HttpErrorCode.RESTRICTED_RESOURCE,
+    { localization: { i18nKey: notAllowedOperationI18nKey } }
+  );
+}
+```
+
+**视图 Socket 越权检查** (`share-socket.service.ts:40-49`)：
+```typescript
+if (ids.length > 1 || ids[0] !== view.id) {
+  throw new CustomHttpException(
+    'View permission not allowed: read',
+    HttpErrorCode.RESTRICTED_RESOURCE,
+    { localization: { i18nKey: 'httpErrors.shareSocket.viewPermissionNotAllowed' } }
+  );
+}
+```
+
+---
+
+## 九、PermissionGuard 与基础共享权限的关联
+
+### 9.1 关联架构
+
+PermissionGuard 是全局权限守卫，它通过两条路径与共享权限关联：
+
+```
+                    +-------------------+
+                    |  请求进入      |
+                    +---------+---------+
+                              |
+                              v
+                    +---------+---------+
+                    | PermissionGuard     |
+                    | canActivate()   |
+                    +---------+---------+
+                              |
+            +-----------------+-----------------+
+            |                                   |
+            v                                   v
++-----------+-----------+           +-----------+-----------+
+| 路径匹配 /api/share/*  |           | 其他路径（通过 Header） |
+| BaseShareAuthGuard       |           | X-Tea-Base-Share     |
+| + ShareAuthGuard       |           | getBaseShareHeader()   |
++-----------+-----------+           +-----------+-----------+
+            |                                   |
+            v                                   v
+| 认证层（匿名/密码验证）               | tryBaseSharePermissionCheck() |
+            |                                   |
+            v                                   v
+| PermissionGuard.baseSharePermissionCheck() |
+                        |
+                        v
+              +-----------+-----------+
+              | validBaseSharePermissions() |
+              | checkResourceBelongsToShare()   |
+              | getBaseSharePermissions()  |
+              +-------------------------------+
+```
+
+### 9.2 共享路径的关联
+
+**代码路径**: `base-share-open.controller.ts:150-154`
+
+```typescript
+@HttpCode(200)
+@UseGuards(BaseShareAuthGuard, PermissionGuard)
+@Permissions('base|create')
+@ResourceMeta('spaceId', 'body')
+@Post('/:shareId/base/copy')
+async copyBaseShare(...) { ... }
+```
+
+**执行顺序**：
+1. **BaseShareAuthGuard** (`base-share-auth.guard.ts:20-52`)：
+   - 验证 shareId 有效性
+   - 设置匿名用户或保留登录用户身份
+   - 有密码则走 JWT 验证
+   - 捕获异常并转换错误码
+
+2. **PermissionGuard** (`permission.guard.ts:132-169`)：
+   ```typescript
+   protected async baseSharePermissionCheck(context: ExecutionContext, shareId: string) {
+     await this.ensureBaseShareAuth(context, shareId);  // 二次密码验证
+     const resourceId = ...;
+     const permissions = this.reflector.get(PERMISSIONS_KEY, ...);
+     const ownPermissions = await this.permissionService.validBaseSharePermissions(
+       shareId, resourceId, permissions
+     );
+     this.cls.set('permissions', ownPermissions);
+     return true;
+   }
+   ```
+
+### 9.3 非共享路径的关联
+
+**通过 Header 关联**: `permission.guard.ts:410-447`
+
+```typescript
+protected async permissionCheckWithPublicFallback(...) {
+  // 1. RESOURCE-level: exclusively use resource-specific auth
+  if (allowAnonymousType === AllowAnonymousType.RESOURCE) {
+    const result = await this.resolveResourcePermission(context, baseShareHeader, templateHeader);
+    if (result !== undefined) return result;
+  }
+
+  // 2. Share link — permissions are bounded by the link
+  if (baseShareHeader) {
+    const result = await this.tryBaseSharePermissionCheck(context, baseShareHeader);
+    if (result !== undefined) return result;
+  }
+  // ...
+}
+```
+
+**Header 提取** (`auth/utils.ts:30-34`)：
+```typescript
+export const getBaseShareHeader = (request: Request): string | undefined => {
+  const baseShareHeader =
+    request.headers[BASE_SHARE_ID_HEADER.toLowerCase()] || request.headers[BASE_SHARE_ID_HEADER];
+  return typeof baseShareHeader === 'string' ? baseShareHeader : undefined;
+};
+```
+
+**ShareId 解析** (`permission.service.ts:994-999`)：
+```typescript
+getBaseShareIdByHeader(shareHeader: string): string | null {
+  if (!shareHeader || !shareHeader.startsWith('shr')) {
+    return null;
+  }
+  return shareHeader;
+}
+```
+
+### 9.4 关键关联点
+
+1. **双重密码验证**：
+   - BaseShareAuthGuard 验证一次
+   - PermissionGuard.ensureBaseShareAuth 二次验证
+   - 防止绕过 Guard 直接访问接口
+
+2. **CLS 权限传递**：
+   - `this.cls.set('permissions', ownPermissions)`
+   - 下游服务通过 CLS 获取共享权限
+
+3. **共享身份标记**：
+   - `this.cls.set('baseShare', { baseId, nodeId })`
+   - 标记当前处于共享访问上下文
+
+4. **权限天花板**：
+   - 共享权限是所有用户的权限上限
+   - 即使是管理员，通过共享链接访问也受共享权限限制
+   - 注释说明：`Share link check — when share header is present, share permissions are the ceiling for ALL users`
+
+### 9.5 跳过共享检查的条件
+
+**代码路径**: `permission.guard.ts:304-318`
+
+```typescript
+// Skip share path for endpoints without @Permissions
+const permissions = this.reflector.get(PERMISSIONS_KEY, ...);
+if (!permissions?.length) {
+  return undefined;
+}
+// Skip share check when the target resource is outside the share scope
+const resourceId = this.getResourceId(context) || this.defaultResourceId(context);
+if (!resourceId || resourceId.startsWith(IdPrefix.Space)) {
+  return undefined;
+}
+```
+
+**跳过场景**：
+1. 接口没有 `@Permissions()` 装饰器（如 `/user/me`）
+2. 资源是 space 级别的接口
+3. 资源 ID 不存在
+
+---
+
+## 十、核心代码模块索引
 
 | 功能模块 | 文件路径 | 关键行 |
 |---------|---------|-------|
@@ -447,3 +797,13 @@ const SHARE_EXCLUDED_PERMISSIONS = new Set<Action>([
 | 节点边界检查 | `apps/nestjs-backend/src/features/auth/permission.service.ts` | 658-715 |
 | 匿名用户定义 | `packages/core/src/auth/anonymous.ts` | 1-10 |
 | 匿名认证策略 | `apps/nestjs-backend/src/features/auth/strategies/anonymous/anonymous.strategy.ts` | 14-18 |
+| 错误码定义 | `packages/core/src/errors/http/http-response.types.ts` | 15-66 |
+| 视图密码登录 Guard | `apps/nestjs-backend/src/features/share/guard/share-auth-local.guard.ts` | 11-26 |
+| 基库密码登录 Guard | `apps/nestjs-backend/src/features/base-share/guard/base-share-auth-local.guard.ts` | 11-26 |
+| PermissionGuard | `apps/nestjs-backend/src/features/auth/guard/permission.guard.ts` | 1-491 |
+| 共享权限验证 | `apps/nestjs-backend/src/features/auth/permission.service.ts` | 966-980 |
+| 密码 Token 验证 | `apps/nestjs-backend/src/features/auth/permission.service.ts` | 581-599 |
+| Header 工具函数 | `apps/nestjs-backend/src/features/auth/utils.ts` | 24-34 |
+| shareId 解析 | `apps/nestjs-backend/src/features/auth/permission.service.ts` | 994-999 |
+| 视图 Socket 越权检查 | `apps/nestjs-backend/src/features/share/share-socket.service.ts` | 40-49,90-96,148-163 |
+| 复制权限检查 | `apps/nestjs-backend/src/features/base-share/base-share-open.controller.ts` | 163-172 |

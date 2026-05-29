@@ -332,27 +332,135 @@ export const initAxios = (options: IInitAxiosOptions = {}) => {
 
 以下内容为基于代码架构的推断，**社区版中未实现**。
 
-**1. OrganizationMiddleware 推断实现**
+**1. passport.initialize() 与 SessionStrategy 的职责边界**
 
-⚠️ **时序问题已纠正**：NestJS 中间件在 Guard 之前执行，而 `user.id` 由 AuthGuard 内的 Strategy 注入 CLS。因此 OrganizationMiddleware 执行时 `cls.get('user.id')` 尚不可用。但 Session 认证场景下，`passport.initialize()` 在中间件阶段就已执行（[session.module.ts:19](apps/nestjs-backend/src/features/auth/session/session.module.ts#L19)），会从 Session Cookie 反序列化用户到 `req.user`。因此中间件应从 `req.user` 获取用户 ID，而非 CLS。
+⚠️ **关键校正**：之前的文档错误地将 `req.user` 的来源归为 `passport.initialize()`。代码证实两者职责完全不同：
+
+| 组件 | 执行阶段 | 职责 | 是否设置 req.user |
+|------|----------|------|-------------------|
+| `passport.initialize()` | 中间件阶段 | 在 `req` 上挂载 `_passport` 属性，初始化 Passport 实例 | ❌ **不设置** |
+| `SessionStrategy.authenticate()` | Guard 阶段（AuthGuard 内） | 从 `req.session.passport.user` 反序列化用户到 `req.user` | ✅ **设置** |
+
+**代码证据**：
+
+`passport.initialize()` 注册为中间件：
+源码位置：[session.module.ts:19](apps/nestjs-backend/src/features/auth/session/session.module.ts#L19)
+```typescript
+consumer
+  .apply(this.sessionHandleService.sessionMiddleware, passport.initialize())
+  .forRoutes('/api/*');
+```
+
+`SessionStrategy.authenticate()` 设置 `req.user` 的逻辑：
+源码位置：[session.passport.ts:30-44](apps/nestjs-backend/src/features/auth/strategies/session.passport.ts#L30-L44)
+```typescript
+authenticate(req: any, options?: { pauseStream?: boolean }): void {
+  const user: any = req.session?.[_key]?.user;  // 从 session.passport.user 读取
+  if (user) {
+    _deserializeUser(user, req, function (err, user) {
+      // ...
+      const property = req._userProperty || 'user';
+      req[property] = user;  // ← 这里才设置 req.user ✅ 代码已证实
+      success(user);
+    });
+  } else {
+    fail('No user');
+  }
+}
+```
+
+`SessionSerializer.deserializeUser()` 返回 `{ id: user.id }`：
+源码位置：[session.serializer.ts:16-18](apps/nestjs-backend/src/features/auth/session/session.serializer.ts#L16-L18)
+```typescript
+async deserializeUser(payload: any, done: Function) {
+  done(null, payload);  // 直接返回 { id: userId }，不做额外查询
+}
+```
+
+**结论**：
+- ✅ **代码已证实**：`req.user` 由 `SessionStrategy.authenticate()` 设置，不是 `passport.initialize()` 设置
+- ✅ **代码已证实**：`SessionStrategy` 在 AuthGuard 内执行，属于 Guard 阶段，不在中间件阶段
+- ✅ **代码已证实**：`passport.initialize()` 不反序列化用户，只初始化 Passport 上下文
+- 🔮 **仅推断**：OrganizationMiddleware 在中间件阶段能从 `req.user` 获取用户 ID（因为 `req.user` 实际上也要到 Guard 阶段才设置）
+
+**2. 中间件阶段的用户上下文边界分析**
+
+⚠️ **核心问题**：中间件阶段**无法获取用户身份**，无论哪种认证方式。
+
+```
+中间件阶段（AuthGuard 执行前）可用的上下文：
+
+┌────────────────────────────────────────────────────────────────┐
+│ Session 认证                                                    │
+├────────────────────────────────────────────────────────────────┤
+│ ✅ req.session         ← session 中间件已解析                   │
+│ ✅ req.sessionID       ← 可用                                  │
+│ ✅ req.session.passport ← 包含 { user: { id: userId } }       │
+│ ❌ req.user            ← 尚未设置（SessionStrategy 未执行）     │
+│ ❌ cls.user.id         ← 尚未设置（AuthGuard 未执行）           │
+│                                                                │
+│ 💡 可行方案：从 req.session.passport.user.id 读取用户 ID       │
+│    代码支撑：SessionHandleService.getUserId() 方法             │
+│    源码：session-handle.service.ts:43-55                       │
+│    该方法通过 sessionStore 直接读取 session.passport.user.id   │
+├────────────────────────────────────────────────────────────────┤
+│ AccessToken 认证                                               │
+├────────────────────────────────────────────────────────────────┤
+│ ✅ req.headers.authorization ← 可用，包含 Bearer <token>       │
+│ ❌ req.user            ← 尚未设置                              │
+│ ❌ cls.user.id         ← 尚未设置                              │
+│                                                                │
+│ 💡 可行方案：从 Authorization Header 提取 token 并验证         │
+│    但这需要在中间件中复制 AccessTokenService 的验证逻辑        │
+│    这会与 AuthGuard 内的 AccessTokenStrategy 产生重复          │
+├────────────────────────────────────────────────────────────────┤
+│ JWT 认证                                                       │
+├────────────────────────────────────────────────────────────────┤
+│ ✅ req.headers.authorization ← 可用，包含 Bearer <jwt>         │
+│ ❌ req.user            ← 尚未设置                              │
+│ ❌ cls.user.id         ← 尚未设置                              │
+│                                                                │
+│ 💡 可行方案：从 Authorization Header 提取 JWT 并解码           │
+│    但 JWT payload 不直接包含 userId（可能含 baseId 等）        │
+│    需要完整解析才能确定用户身份                                 │
+├────────────────────────────────────────────────────────────────┤
+│ 无认证（匿名/公开接口）                                         │
+├────────────────────────────────────────────────────────────────┤
+│ ❌ 无任何用户身份信息                                           │
+│ ✅ X-Tea-Org-Id Header 仍可存在                               │
+│ 💡 可行方案：仅注入 orgId，不查询用户关联的组织                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**3. OrganizationMiddleware 推断实现（校正版）**
+
+基于上述分析，OrganizationMiddleware 获取用户 ID 的可行方案因认证方式而异：
 
 ```typescript
-// 企业版 OrganizationMiddleware（架构推断）
+// 企业版 OrganizationMiddleware（架构推断，校正版）
 @Injectable()
 export class OrganizationMiddleware implements NestMiddleware {
   constructor(
     private readonly cls: ClsService<IClsStore>,
-    private readonly organizationService: OrganizationService
+    private readonly organizationService: OrganizationService,
+    private readonly sessionHandleService: SessionHandleService
   ) {}
 
   async use(req: Request, res: Response, next: NextFunction) {
     const orgId = req.headers['x-tea-org-id'] as string;
-    // ⚠️ 此处必须从 req.user 读取，不能从 CLS 读取
-    // 因为中间件在 AuthGuard 之前执行，CLS 中尚无 user.id
-    // req.user 由 passport.initialize() 中间件设置（仅 Session 认证）
-    const userId = (req.user as { id: string })?.id;
+    if (!orgId) { next(); return; }
 
-    if (orgId && userId) {
+    // 方案 A：Session 认证 — 从 req.session.passport.user.id 读取
+    // ✅ 代码已证实：session.passport.user 在中间件阶段可用
+    // 代码支撑：SessionHandleService.getUserId(sessionId) 方法
+    const userId = req.session?.passport?.user?.id;
+
+    // 方案 B：AccessToken/JWT 认证 — 从 Authorization Header 提取
+    // 🔮 仅推断：需要在中间件中提前解析 token
+    // ⚠️ 这会与 AuthGuard 内的 Strategy 产生逻辑重复
+    // const userId = await this.extractUserIdFromRequest(req);
+
+    if (userId) {
       const organization = await this.organizationService.getUserOrganization(
         userId,
         orgId
@@ -376,31 +484,56 @@ export class OrganizationMiddleware implements NestMiddleware {
 }
 ```
 
-**2. 中间件与 Guard 的执行时序分析**
+**4. 中间件与 Guard 的执行时序分析（校正版）**
 
 ```
 NestJS 请求处理管线（代码已证实的执行顺序）：
 
 1. 中间件阶段
-   ├── session middleware           ← Session Cookie 解析
-   ├── passport.initialize()        ← 将 Session 中的用户反序列化到 req.user
-   ├── ClsMiddleware                ← 初始化 CLS 上下文
-   ├── SessionCsrfMiddleware        ← CSRF 处理
-   └── RequestInfoMiddleware        ← 注入请求信息
-   └── 🔮 OrganizationMiddleware    ← 需在此阶段注入组织信息
-       ⚠️ 此时 CLS 中尚无 user.id（AuthGuard 未执行）
-       ⚠️ 但 req.user 可用（passport.initialize() 已执行）
-       ⚠️ 仅限 Session 认证，AccessToken/JWT 场景下 req.user 不可用
+   ├── session middleware           ← ✅ 解析 Session Cookie，填充 req.session
+   ├── passport.initialize()        ← ✅ 在 req 上挂载 _passport（不设置 req.user）
+   ├── ClsMiddleware                ← ✅ 初始化 CLS 上下文
+   ├── SessionCsrfMiddleware        ← ✅ CSRF 处理
+   ├── RequestInfoMiddleware        ← ✅ 注入请求信息
+   └── 🔮 OrganizationMiddleware    ← 推断：需在此阶段注入组织信息
+       │
+       │  中间件阶段可用的用户信息来源：
+       │  ┌─ Session 认证 → ✅ req.session.passport.user.id（代码已证实）
+       │  ├─ AccessToken  → 🔮 req.headers.authorization（需提前解析 token）
+       │  ├─ JWT          → 🔮 req.headers.authorization（需提前解析 JWT）
+       │  └─ 匿名         → ❌ 无用户信息
+       │
+       │  ⚠️ req.user 此时不可用（任何认证方式下都不行）
+       │  ⚠️ CLS 中 user.id 不可用（AuthGuard 未执行）
 
 2. Guard 阶段
-   ├── AuthGuard                    ← 执行 Strategy，注入 user.id 到 CLS
-   │   ├── SessionStrategy          ← cls.set('user.id', ...)
-   │   ├── AccessTokenStrategy      ← cls.set('user.id', ..., 'accessTokenId')
-   │   └── JwtStrategy              ← cls.set('user.id', ..., 'tempAuthBaseId')
-   └── PermissionGuard              ← 执行权限校验，注入 permissions 到 CLS
+   ├── AuthGuard                    ← ✅ 执行 Strategy 链
+   │   │
+   │   ├── SessionStrategy          ← ✅ 代码已证实：设置 req.user + cls.set('user.*')
+   │   │   │  1. 从 req.session.passport.user 读取
+   │   │   │  2. SessionSerializer.deserializeUser() 返回 { id }
+   │   │   │  3. SessionStrategy.validate() 查询用户
+   │   │   │  4. 设置 req[property] = user  →  req.user ✅
+   │   │   │  5. cls.set('user.id', user.id) ✅
+   │   │
+   │   ├── AccessTokenStrategy      ← ✅ 代码已证实：设置 req.user + cls.set('user.*', 'accessTokenId')
+   │   │   │  1. 从 Authorization Header 提取 Bearer token
+   │   │   │  2. AccessTokenService.validate() 验证令牌
+   │   │   │  3. UserService.getUserById() 查询用户
+   │   │   │  4. Passport 内部设置 req.user ✅
+   │   │   │  5. cls.set('user.id', user.id) ✅
+   │   │
+   │   └── JwtStrategy              ← ✅ 代码已证实：设置 req.user + cls.set('user.*', 'tempAuthBaseId')
+   │       │  1. 从 Authorization Header 提取 JWT
+   │       │  2. 验证 JWT 签名
+   │       │  3. 查询用户
+   │       │  4. Passport 内部设置 req.user ✅
+   │       │  5. cls.set('user.id', user.id) ✅
+   │
+   └── PermissionGuard              ← ✅ 执行权限校验，注入 permissions 到 CLS
 ```
 
-**3. 中间件注册顺序推断**
+**5. 中间件注册顺序推断**
 
 源码位置：[global.module.ts:126-134](apps/nestjs-backend/src/global/global.module.ts#L126-L134)
 
@@ -877,8 +1010,10 @@ HTTP 请求发送到后端
 ─────────────────────────────────────────
         │
         ▼
-✅ session middleware + passport.initialize()
-        │   └─► 将 Session 用户反序列化到 req.user（仅 Session 认证）
+✅ session middleware（解析 Cookie → req.session）
+        │
+        ▼
+✅ passport.initialize()（挂载 _passport，不设置 req.user）
         │
         ▼
 ✅ ClsMiddleware 初始化请求上下文
@@ -892,10 +1027,11 @@ HTTP 请求发送到后端
         ▼
 🔮 OrganizationMiddleware（企业版推断）
         │   ├─► 读取 X-Tea-Org-Id Header
-        │   ├─► 从 req.user 获取 userId（⚠️ 不能从 CLS 读取，此时 AuthGuard 未执行）
-        │   ├─► 查询用户组织信息（含部门列表）
+        │   ├─► ✅ 从 req.session.passport.user.id 获取 userId（Session 认证）
+        │   │   ⚠️ 不能从 req.user 或 CLS 读取（两者此时均不可用）
+        │   │   ⚠️ AccessToken/JWT 场景需提前解析 token（仅推断）
+        │   ├─► 🔮 查询用户组织信息（含部门列表）
         │   └─► cls.set('organization', { id, name, isAdmin, departments })
-        │   ⚠️ 注意：AccessToken/JWT 认证场景下 req.user 不可用，需要其他方案
         │
         ▼
 ✅ AuthGuard 认证（Strategy 链）
@@ -947,12 +1083,13 @@ HTTP 请求发送到后端
    - AccessToken 策略会额外写入 `accessTokenId`，影响后续权限计算
    - 注入的用户信息包括：`user.id`、`user.name`、`user.email`、`user.isAdmin`
 
-2. **中间件阶段 user.id 不可用**（✅ 代码已证实）：
+2. **中间件阶段 user.id 和 req.user 均不可用**（✅ 代码已证实）：
    - NestJS 中间件在 Guard 之前执行
    - `user.id` 由 AuthGuard 内的 Strategy 注入 CLS，中间件执行时 CLS 中尚无 `user.id`
-   - Session 认证下，`passport.initialize()` 在中间件阶段执行，将用户反序列化到 `req.user`
-   - 因此 OrganizationMiddleware 只能从 `req.user` 获取用户 ID（而非 CLS）
-   - AccessToken/JWT 认证场景下 `req.user` 不可用，企业版需要其他方案
+   - `req.user` 由 `SessionStrategy.authenticate()` 设置（[session.passport.ts:43-44](apps/nestjs-backend/src/features/auth/strategies/session.passport.ts#L43-L44)），也在 Guard 阶段执行
+   - `passport.initialize()` 仅挂载 `_passport` 属性，**不**设置 `req.user`
+   - Session 认证下，中间件阶段可从 `req.session.passport.user.id` 获取用户 ID（代码支撑：[session-handle.service.ts:43-55](apps/nestjs-backend/src/features/auth/session/session-handle.service.ts#L43-L55)）
+   - AccessToken/JWT 场景下，中间件阶段仅有 `req.headers.authorization`，需提前解析
 
 3. **组织切换 → CLS 注入**（🔮 仅推断）：
    - 前端组织切换的 UI 触发点在社区版代码中不可见
@@ -1084,13 +1221,13 @@ PermissionGuard.resourcePermission()
  │    ┌─ Authorization: Bearer xxx   │
  │    └─> GET /space/list            │
  │                                    │
- │                                    │  5. ✅ session + passport.initialize()
- │                                    │      └─> 将 Session 用户反序列化到 req.user
- │                                    │  6. ✅ ClsMiddleware 初始化 CLS
- │                                    │  7. ✅ RequestInfoMiddleware 注入请求信息
- │                                    │  8. ✅ AuthGuard 认证
- │                                    │      └─> cls.set('user.id', userId)
- │                                    │         此时 user.id 才写入 CLS ✅
+ │                                    │  5. ✅ session middleware（解析 Cookie → req.session）
+│                                    │  6. ✅ passport.initialize()（挂载 _passport，不设置 req.user）
+│                                    │  7. ✅ ClsMiddleware 初始化 CLS
+│                                    │  8. ✅ RequestInfoMiddleware 注入请求信息
+│                                    │  9. ✅ AuthGuard 认证
+│                                    │      ├─> SessionStrategy: 设置 req.user + cls.set('user.*')
+│                                    │      └─> 此时 req.user 和 cls.user.id 才可用 ✅
  │                                    │
  │                                    │  9. ✅ PermissionGuard 权限校验
  │                                    │      ├─> PermissionGuard.resourcePermission()
@@ -1133,21 +1270,22 @@ PermissionGuard.resourcePermission()
  │    ├─ X-Tea-Org-Id: org_xxx       │
  │    └─> GET /space/list            │
  │                                    │
- │                                    │  5. ✅ session + passport.initialize()
- │                                    │      └─> req.user 可用（仅 Session 认证）
- │                                    │  6. ✅ ClsMiddleware 初始化 CLS
- │                                    │  7. ✅ RequestInfoMiddleware 注入请求信息
- │                                    │  8. 🔮 OrganizationMiddleware
- │                                    │      ├─> 读取 X-Tea-Org-Id
- │                                    │      ├─> ⚠️ 从 req.user 获取 userId
- │                                    │      │   （不能从 CLS 读取，此时 AuthGuard 未执行）
- │                                    │      ├─> 查询组织信息（含部门）
- │                                    │      └─> cls.set('organization', {...})
- │                                    │      ⚠️ AccessToken/JWT 场景下 req.user 不可用
- │                                    │
- │                                    │  9. ✅ AuthGuard 认证
- │                                    │      └─> cls.set('user.id', userId)
- │                                    │         此时 user.id 才写入 CLS ✅
+ │                                    │  5. ✅ session middleware（解析 Cookie → req.session）
+│                                    │  6. ✅ passport.initialize()（挂载 _passport，不设置 req.user）
+│                                    │  7. ✅ ClsMiddleware 初始化 CLS
+│                                    │  8. ✅ RequestInfoMiddleware 注入请求信息
+│                                    │  9. 🔮 OrganizationMiddleware
+│                                    │      ├─> 读取 X-Tea-Org-Id
+│                                    │      ├─> ✅ Session 认证：从 req.session.passport.user.id 获取 userId
+│                                    │      │   ⚠️ req.user 此时不可用（SessionStrategy 未执行）
+│                                    │      │   ⚠️ CLS 中 user.id 不可用（AuthGuard 未执行）
+│                                    │      ├─> 🔮 AccessToken/JWT：从 Authorization Header 提取并解析
+│                                    │      ├─> 🔮 查询组织信息（含部门）
+│                                    │      └─> cls.set('organization', {...})
+│                                    │
+│                                    │  10. ✅ AuthGuard 认证
+│                                    │       ├─> SessionStrategy: 设置 req.user + cls.set('user.*')
+│                                    │       └─> 此时 req.user 和 cls.user.id 才可用 ✅
  │                                    │
  │                                    │  10. ✅ PermissionGuard 权限校验
  │                                    │       ├─> PermissionGuard.resourcePermission()
@@ -1189,7 +1327,7 @@ PermissionGuard.resourcePermission()
 |--------|------|------|----------|------|
 | 前端组织切换 UI | - | 当前组织状态 | 🔮 仅推断 | 社区版无此 UI 组件，`useOrganization.refetch` 未被用作切换触发点 |
 | 前端 initAxios 拦截器 | 当前组织状态 | 请求头 `X-Tea-Org-Id` | 🔮 仅推断 | Header 名称和注入方式均未在代码中找到 |
-| OrganizationMiddleware.use() | 请求头 `X-Tea-Org-Id`，`req.user` | `organization.id`, `organization.name`, `organization.isAdmin`, `organization.departments` | 🔮 仅推断 | ⚠️ 必须从 `req.user` 获取 userId（非 CLS），仅 Session 认证可用 |
+| OrganizationMiddleware.use() | 请求头 `X-Tea-Org-Id`，`req.session.passport.user.id` | `organization.id`, `organization.name`, `organization.isAdmin`, `organization.departments` | 🔮 仅推断 | ⚠️ Session 认证下可从 `req.session.passport.user.id` 获取 userId；⚠️ `req.user` 在中间件阶段不可用；⚠️ AccessToken/JWT 需提前解析 token（无代码先例） |
 
 ### 9.5 ✅ 现有实现数据流向图
 
@@ -1238,9 +1376,14 @@ Authorization Header
 | NestJS 中间件在 Guard 之前执行 | ✅ 代码已证实 | NestJS 框架机制，[global.module.ts:126-134](apps/nestjs-backend/src/global/global.module.ts#L126-L134) |
 | `user.id` 由 AuthGuard 内的 Strategy 注入 CLS | ✅ 代码已证实 | [session.strategy.ts:36](apps/nestjs-backend/src/features/auth/strategies/session.strategy.ts#L36), [access-token.strategy.ts:52](apps/nestjs-backend/src/features/auth/strategies/access-token.strategy.ts#L52), [jwt.strategy.ts:57](apps/nestjs-backend/src/features/auth/strategies/jwt.strategy.ts#L57) |
 | 中间件执行时 CLS 中尚无 `user.id` | ✅ 代码已证实 | 中间件在 Guard 之前执行，`user.id` 由 Guard 内的 Strategy 注入 |
-| `passport.initialize()` 在中间件阶段将用户反序列化到 `req.user` | ✅ 代码已证实 | [session.module.ts:19](apps/nestjs-backend/src/features/auth/session/session.module.ts#L19) |
-| OrganizationMiddleware 应从 `req.user` 获取 userId（而非 CLS） | ✅ 代码已证实 | 基于上述时序推导，中间件执行时 CLS 中尚无 `user.id` |
-| AccessToken/JWT 场景下中间件中 `req.user` 不可用 | ✅ 代码已证实 | `passport.initialize()` 仅处理 Session 认证，AccessToken/JWT 由 Guard 内的 Strategy 处理 |
+| `passport.initialize()` 不设置 `req.user`，只挂载 `_passport` | ✅ 代码已证实 | [session.module.ts:19](apps/nestjs-backend/src/features/auth/session/session.module.ts#L19)，passport 源码确认 |
+| `req.user` 由 `SessionStrategy.authenticate()` 设置 | ✅ 代码已证实 | [session.passport.ts:43-44](apps/nestjs-backend/src/features/auth/strategies/session.passport.ts#L43-L44)：`req[property] = user` |
+| `SessionStrategy` 在 AuthGuard 内执行，属 Guard 阶段 | ✅ 代码已证实 | [session.strategy.ts:14](apps/nestjs-backend/src/features/auth/strategies/session.strategy.ts#L14)：`PassportStrategy(PassportSessionStrategy)` |
+| 中间件阶段 `req.user` 不可用（任何认证方式） | ✅ 代码已证实 | `req.user` 由 Strategy 设置，Strategy 在 Guard 阶段执行 |
+| Session 认证下，中间件阶段 `req.session.passport.user.id` 可用 | ✅ 代码已证实 | session 中间件已解析，[session-handle.service.ts:52](apps/nestjs-backend/src/features/auth/session/session-handle.service.ts#L52)：`session.passport.user.id` |
+| AccessToken/JWT 场景下中间件阶段仅有 `req.headers.authorization` | ✅ 代码已证实 | 无其他用户信息来源，token 解析在 Guard 阶段的 Strategy 中进行 |
+| OrganizationMiddleware 可从 `req.user` 获取 userId | 🔮 仅推断 | `req.user` 在中间件阶段不可用，此前推断有误 |
+| OrganizationMiddleware 从 `req.session.passport.user.id` 获取 userId | 🔮 仅推断 | 虽然数据在中间件阶段存在，但此用法在仓库中无先例 |
 | `useOrganization.refetch` 是组织切换触发点 | 🔮 仅推断 | 仓库中无任何代码调用 `refetch` 作为切换触发点，所有使用仅读取 `organization` |
 | `X-Tea-Org-Id` Header 传递方式 | 🔮 仅推断 | Header 名称和注入方式均未在代码中找到 |
 | OrganizationMiddleware 实现 | 🔮 仅推断 | 社区版无此中间件，企业版实现不可见 |

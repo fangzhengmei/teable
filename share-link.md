@@ -1273,3 +1273,175 @@ permissionCheckWithPublicFallback()
    - `allowAnonymousType === RESOURCE` 时，只认资源级鉴权（共享/模板）
    - 即使有有效的 baseShareHeader，如果后续 templateHeader 也无效，会降级到步骤 2
    - 步骤 2 中相同的 shareHeader 会重新走 `tryBaseSharePermissionCheck`，不会丢失
+
+---
+
+## 十四、双 Header 场景代码逐行复核
+
+### 14.1 问题说明
+
+当请求同时携带 `X-Tea-Base-Share` 和 `X-Tea-Template` 时，`resolveResourcePermission` 中 baseShare 失败后的走向需要逐行确认：
+- baseShare 校验**抛异常**时，template 分支是否还会执行？
+- baseShare 校验**返回 undefined** 时，template 分支是否执行？
+- 步骤 1 中 `resolveResourcePermission` 返回 undefined 后，步骤 2 是否会再次执行 baseShare 检查？
+
+### 14.2 resolveResourcePermission 逐行标注
+
+**代码路径**: `permission.guard.ts:326-339`
+
+```typescript
+private async resolveResourcePermission(
+  context: ExecutionContext,
+  baseShareHeader: string | undefined,       // ① 非空
+  templateHeader: string | undefined         // ② 非空
+): Promise<boolean | undefined> {
+  if (baseShareHeader) {                      // ③ true，进入
+    const result = await this.tryBaseSharePermissionCheck(
+      context, baseShareHeader
+    );                                        // ④ 关键：result 可能是什么？
+    if (result !== undefined) return result;  // ⑤ result === true → 直接返回，template 不执行
+  }                                           //    result === undefined → 继续到 template
+  if (templateHeader) {                       // ⑥ 仅在 result === undefined 时到达
+    return this.templatePermissionCheck(
+      context, templateHeader
+    );                                        // ⑦ template 无论通过/失败，都直接 return
+  }
+  return undefined;                           // ⑧ 无 templateHeader 时到达
+}
+```
+
+**关键发现**：`tryBaseSharePermissionCheck` 只有两种返回值：
+- `true` — 校验通过
+- `undefined` — 格式错 / 无 @Permissions / 资源 ID 不存在
+
+**不存在"抛异常后返回 undefined"的情况**。当 shareId 格式正确、有 @Permissions、有 resourceId 时，`tryBaseSharePermissionCheck` 会调用 `baseSharePermissionCheck`，后者**直接抛异常**，不返回 undefined。异常会穿透 `resolveResourcePermission` 向上传播。
+
+### 14.3 tryBaseSharePermissionCheck 逐行标注
+
+**代码路径**: `permission.guard.ts:292-320`
+
+```typescript
+private async tryBaseSharePermissionCheck(
+  context: ExecutionContext,
+  baseShareHeader: string | undefined
+): Promise<boolean | undefined> {
+  if (!baseShareHeader) {                     // A. 无 header → return undefined
+    return undefined;
+  }
+  const shareId = this.permissionService
+    .getBaseShareIdByHeader(baseShareHeader); // B. 格式校验
+  if (!shareId) {                             // C. 不以 'shr' 开头 → return undefined
+    return undefined;                         //    ⚠ 不会抛异常
+  }
+  const permissions = this.reflector
+    .getAllAndOverride(PERMISSIONS_KEY, ...);  // D. 提取 @Permissions 装饰器
+  if (!permissions?.length) {                 // E. 无装饰器 → return undefined
+    return undefined;                         //    ⚠ 不会抛异常
+  }
+  const resourceId = this.getResourceId(...)
+    || this.defaultResourceId(context);        // F. 提取资源 ID
+  if (!resourceId || resourceId
+    .startsWith(IdPrefix.Space)) {            // G. 无资源 ID 或 space 级 → return undefined
+    return undefined;                         //    ⚠ 不会抛异常
+  }
+  return await this.baseSharePermissionCheck(
+    context, shareId
+  );                                          // H. 唯一可能抛异常的位置
+}
+```
+
+**返回值映射**：
+
+| 行号 | 条件 | 返回值 | 是否抛异常 | 对 template 分支的影响 |
+|-----|------|-------|----------|---------------------|
+| A | 无 header | `undefined` | 否 | template 分支执行 |
+| C | shareId 格式错 | `undefined` | 否 | template 分支执行 |
+| E | 无 @Permissions | `undefined` | 否 | template 分支执行 |
+| G | 无 resourceId 或 space 级 | `undefined` | 否 | template 分支执行 |
+| H | 有 shareId + 有 @Permissions + 有 resourceId | `true` 或 **抛异常** | **是** | template 分支**不执行** |
+
+### 14.4 步骤 1 → 步骤 2 的降级条件
+
+**代码路径**: `permission.guard.ts:422-433`
+
+```typescript
+// 步骤 1
+if (allowAnonymousType === AllowAnonymousType.RESOURCE) {
+  const result = await this.resolveResourcePermission(
+    context, baseShareHeader, templateHeader
+  );
+  if (result !== undefined) return result;
+  // result === undefined → fall through 到步骤 2
+}
+
+// 步骤 2
+if (baseShareHeader) {
+  const result = await this.tryBaseSharePermissionCheck(
+    context, baseShareHeader
+  );
+  if (result !== undefined) return result;
+}
+```
+
+**步骤 1 返回 undefined 的唯一路径**：
+`resolveResourcePermission` 中 `tryBaseSharePermissionCheck` 返回 `undefined`，**且** `templateHeader` 为空或不存在。
+
+**关键判断**：如果 `templateHeader` 存在，`resolveResourcePermission` 会在第 ⑥ 行执行 `templatePermissionCheck()`，该函数：
+- 通过 → return `true`（非 undefined，步骤 1 整体 return `true`）
+- 失败 → **抛异常**（不会返回 undefined）
+
+所以步骤 1 返回 `undefined` 的完整条件是：
+1. `tryBaseSharePermissionCheck` 返回 `undefined`（行 C/E/G）
+2. **且** `templateHeader` 不存在
+
+如果 `templateHeader` 存在，步骤 1 要么返回 `true`，要么抛异常，**永远不会到达步骤 2**。
+
+### 14.5 双 Header 可复核表格
+
+**前提**：请求同时携带 `X-Tea-Base-Share` 和 `X-Tea-Template`，`allowAnonymousType === RESOURCE`。
+
+| # | baseShare 状态 | template 状态 | 步骤 1 执行路径 | 步骤 1 返回值 | 是否进入步骤 2 | 最终权限归属 | 最终错误码 |
+|---|---------------|--------------|----------------|-------------|-------------|------------|-----------|
+| 1 | shareId 格式错（非 shr 开头） | 有效 template | baseShare→undefined→template 分支 | true 或抛异常 | **否** | 模板权限 | 通过则无；失败则匿名→401/登录→403 |
+| 2 | shareId 格式错 | template 无效/过期 | baseShare→undefined→template 分支 | 抛异常 | **否** | **拒绝** | 匿名→`UNAUTHORIZED`(401) / 登录→`RESTRICTED_RESOURCE`(403) |
+| 3 | shareId 有效 + 无 @Permissions 装饰器 | 有效 template | baseShare→undefined→template 分支 | true 或抛异常 | **否** | 模板权限 | 同 #1 |
+| 4 | shareId 有效 + 无 @Permissions | template 无效 | baseShare→undefined→template 分支 | 抛异常 | **否** | **拒绝** | 同 #2 |
+| 5 | shareId 有效 + space 级资源 | 有效 template | baseShare→undefined→template 分支 | true 或抛异常 | **否** | 模板权限 | 同 #1 |
+| 6 | shareId 有效 + space 级资源 | template 无效 | baseShare→undefined→template 分支 | 抛异常 | **否** | **拒绝** | 同 #2 |
+| 7 | shareId 有效 + 有 @Permissions + 有 resourceId + **校验通过** | —（不执行） | baseShare→true | true | **否** | 共享权限 | 无 |
+| 8 | shareId 有效 + 有 @Permissions + 有 resourceId + **校验失败** | —（不执行） | baseSharePermissionCheck 抛异常 | 抛异常 | **否** | **拒绝** | `RESTRICTED_RESOURCE`(403) |
+| 9 | shareId 有效 + 有 @Permissions + 有 resourceId + **密码未验证** | —（不执行） | ensureBaseShareAuth 抛异常 | 抛异常 | **否** | **拒绝** | `UNAUTHORIZED_SHARE`(401) |
+
+### 14.6 非 RESOURCE 模式下的双 Header
+
+**前提**：`allowAnonymousType !== RESOURCE`（即 USER/PUBLIC/无装饰器），双 header 同时存在。
+
+| # | 步骤 1 | 步骤 2 执行路径 | 步骤 2 返回值 | 是否进入步骤 3/4 | 最终权限归属 |
+|---|-------|----------------|-------------|----------------|------------|
+| 10 | 跳过（非 RESOURCE） | tryBaseSharePermissionCheck → 格式错 | undefined | 是 | 取决于步骤 3/4 |
+| 11 | 跳过 | tryBaseSharePermissionCheck → 校验通过 | true | 否 | 共享权限 |
+| 12 | 跳过 | tryBaseSharePermissionCheck → 校验失败 | 抛异常 | 否 | **拒绝** (403) |
+| 13 | 跳过 | tryBaseSharePermissionCheck → 无 @Permissions | undefined | 是 | 取决于步骤 3/4 |
+
+**注意**：步骤 2 中 `tryBaseSharePermissionCheck` 抛异常时，**template header 不参与任何兜底**。Template 权限只在步骤 1 (RESOURCE) 或步骤 4 (PUBLIC 兜底) 中使用。
+
+### 14.7 修正之前的结论
+
+**原文档 13.7 第 4 点**：
+> "即使有有效的 baseShareHeader，如果后续 templateHeader 也无效，会降级到步骤 2"
+> "步骤 2 中相同的 shareHeader 会重新走 tryBaseSharePermissionCheck，不会丢失"
+
+**修正**：这段描述只有在 `templateHeader` **不存在**时才成立。当 `templateHeader` 存在时：
+
+1. **baseShare 返回 undefined（格式错/条件不满足）+ templateHeader 存在**：
+   - template 分支**一定执行**（`resolveResourcePermission` 第 ⑥ 行）
+   - template 通过 → return `true`，**不进入步骤 2**
+   - template 失败 → 抛异常，**不进入步骤 2**
+
+2. **baseShare 校验失败（抛异常）+ templateHeader 存在**：
+   - 异常直接穿透 `resolveResourcePermission`，**template 分支不执行**
+   - **不进入步骤 2**
+
+3. **只有 `templateHeader` 不存在时**，步骤 1 返回 `undefined`，才进入步骤 2 重新走 baseShare 检查。
+
+**结论**：双 header 同时存在时，baseShare 和 template 在步骤 1 中是**短路优先**关系，不是**并行回退**关系。baseShare 抛异常会完全阻断 template 的执行机会。

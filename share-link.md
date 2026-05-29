@@ -1008,3 +1008,268 @@ if (!resourceId || resourceId.startsWith(IdPrefix.Space)) {
 | 基库共享密码验证 | `apps/nestjs-backend/src/features/base-share/base-share-auth.service.ts` | 36-59 |
 | tryBaseSharePermissionCheck | `apps/nestjs-backend/src/features/auth/guard/permission.guard.ts` | 292-320 |
 | ensureBaseShareAuth | `apps/nestjs-backend/src/features/auth/guard/permission.guard.ts` | 171-186 |
+
+---
+
+## 十三、permissionCheckWithPublicFallback 分支详解
+
+### 13.1 方法入口与前置提取
+
+**代码路径**: `permission.guard.ts:410-447`
+
+```typescript
+protected async permissionCheckWithPublicFallback(
+  context: ExecutionContext,
+  permissionCheck: () => Promise<boolean>
+) {
+  const req = context.switchToHttp().getRequest();
+  const templateHeader = getTemplateHeader(req);       // X-Tea-Template
+  const baseShareHeader = getBaseShareHeader(req);      // X-Tea-Base-Share
+  const allowAnonymousType = this.reflector.getAllAndOverride<AllowAnonymousType | undefined>(
+    IS_ALLOW_ANONYMOUS,
+    [context.getHandler(), context.getClass()]
+  );
+
+  // 步骤 1: RESOURCE 级别 → 排他性资源鉴权
+  // 步骤 2: Share link → 共享权限天花板
+  // 步骤 3: Anonymous → 匿名用户处理
+  // 步骤 4: Authenticated → 常规检查 + PUBLIC 兜底
+}
+```
+
+**AllowAnonymousType 枚举** (`allow-anonymous.decorator.ts:3-7`)：
+```typescript
+export enum AllowAnonymousType {
+  RESOURCE = 'resource',  // 排他性资源鉴权（共享/模板）
+  USER = 'user',          // 仅需登录即可访问
+  PUBLIC = 'public',      // 允许匿名 + PUBLIC 兜底
+}
+```
+
+---
+
+### 13.2 四步决策流程
+
+```
+permissionCheckWithPublicFallback()
+        │
+        ├─ 步骤 1: allowAnonymousType === RESOURCE ?
+        │    └─ resolveResourcePermission(baseShareHeader, templateHeader)
+        │         ├─ baseShareHeader 存在 → tryBaseSharePermissionCheck()
+        │         │    ├─ shareId 有效 + 校验通过 → return true（共享权限）
+        │         │    ├─ shareId 格式错 → return undefined → 尝试模板
+        │         │    └─ shareId 校验失败 → 抛 RESTRICTED_RESOURCE ← 不兜底
+        │         ├─ templateHeader 存在 → templatePermissionCheck()
+        │         │    ├─ 校验通过 → return true（模板权限）
+        │         │    └─ 校验失败 → 抛异常 ← 不兜底
+        │         └─ 两者都无 → return undefined → 降级到步骤 2
+        │
+        ├─ 步骤 2: baseShareHeader 存在 ?
+        │    └─ tryBaseSharePermissionCheck()
+        │         ├─ return true → 共享权限放行
+        │         └─ return undefined → 降级到步骤 3
+        │
+        ├─ 步骤 3: isAnonymous() ?
+        │    └─ resolveAnonymousPermission()
+        │         ├─ allowAnonymousType === PUBLIC → templatePermissionCheck()
+        │         ├─ allowAnonymousType === USER → return true
+        │         └─ 其他 → throw UnauthorizedException (401)
+        │
+        └─ 步骤 4: 登录用户 → permissionCheck()
+             ├─ 通过 → return true（常规权限）
+             └─ 失败 → allowAnonymousType === PUBLIC ?
+                  ├─ 是 → resolvePublicFallback()
+                  │    ├─ tryBaseShareFallback() → 吞掉异常
+                  │    │    ├─ 通过 → return true（共享权限）
+                  │    │    └─ 失败 → return undefined → 继续兜底
+                  │    ├─ templatePermissionCheck()
+                  │    │    ├─ 通过 → return true（模板权限）
+                  │    │    └─ 失败 → throw originalError（原始错误）
+                  │    └─ 都无 header → templatePermissionCheck() → 同上
+                  └─ 否 → throw error（原始错误直接抛出）
+```
+
+---
+
+### 13.3 场景一：Malformed Share Header
+
+**定义**：请求头携带 `X-Tea-Base-Share: <非法值>`（不以 `shr` 开头）。
+
+**代码追踪**：
+
+```
+步骤 1 (RESOURCE):
+  resolveResourcePermission() → tryBaseSharePermissionCheck()
+    getBaseShareIdByHeader("非法值")
+      → 不以 'shr' 开头 → return null
+    → return undefined
+  无 templateHeader → return undefined
+  → 降级到步骤 2
+
+步骤 2:
+  baseShareHeader 存在 → tryBaseSharePermissionCheck()
+    getBaseShareIdByHeader("非法值") → return null
+    → return undefined
+  → 降级到步骤 3
+
+步骤 3 (匿名用户):
+  → resolveAnonymousPermission()
+  → 取决于 allowAnonymousType
+
+步骤 4 (登录用户):
+  → permissionCheck() → 常规权限检查
+```
+
+**结论**：malformed share header **静默降级**，不影响后续判断。请求最终归属于：
+- 匿名用户 → 模板权限（PUBLIC）/ 放行（USER）/ 401（无装饰器）
+- 登录用户 → **常规权限**（完全忽略共享 header）
+
+**关键**：`tryBaseSharePermissionCheck` 和 `tryBaseShareFallback` 都不会因 malformed header 抛出异常。
+
+---
+
+### 13.4 场景二：BaseShare 校验失败
+
+**定义**：shareId 格式正确（以 `shr` 开头），但数据库中不存在或 `enabled=false`。
+
+**代码追踪（步骤 1 - RESOURCE 路径）**：
+
+```
+步骤 1 (RESOURCE):
+  resolveResourcePermission() → tryBaseSharePermissionCheck()
+    getBaseShareIdByHeader("shrInvalid") → return "shrInvalid"
+    @Permissions 装饰器存在, resourceId 存在
+    → baseSharePermissionCheck(context, "shrInvalid")
+      → ensureBaseShareAuth() → baseShareRequiresPassword("shrInvalid")
+        → 数据库查不到 → return false → 跳过密码验证
+      → validBaseSharePermissions("shrInvalid", resourceId, permissions)
+        → getBaseSharePermissions("shrInvalid", resourceId)
+          → getBaseShareInfo("shrInvalid") → return null
+          → throw RESTRICTED_RESOURCE (403)  ← 直接抛出，不兜底
+```
+
+**步骤 1 中校验失败会直接抛异常，不会降级到步骤 2-4。**
+
+**代码追踪（步骤 2 - 非 RESOURCE 路径）**：
+
+```
+步骤 2:
+  baseShareHeader 存在 → tryBaseSharePermissionCheck()
+    → baseSharePermissionCheck() → 抛 RESTRICTED_RESOURCE (403)
+    → 异常向上传播，不返回 undefined
+```
+
+**步骤 2 中校验失败也直接抛异常。**
+
+**代码追踪（步骤 4 - PUBLIC 兜底路径）**：
+
+```
+步骤 4 (登录用户, 常规权限检查失败, allowAnonymousType === PUBLIC):
+  → resolvePublicFallback()
+    → tryBaseShareFallback()
+      → baseSharePermissionCheck() → 抛 RESTRICTED_RESOURCE
+      → catch 捕获 → return undefined  ← 吞掉异常！
+    → baseShareResult === undefined → 继续兜底
+    → templatePermissionCheck()
+      → 校验通过 → return true（模板权限）
+      → 校验失败 → throw originalError（常规权限的原始错误）
+```
+
+**关键差异**：`tryBaseShareFallback` 会吞掉 baseShare 校验失败的异常，降级为模板权限检查。
+
+**结论**：
+
+| 上下文 | 校验失败后的归属 | 最终错误码 |
+|-------|---------------|-----------|
+| 步骤 1 (RESOURCE) | **不降级**，直接抛出 | `RESTRICTED_RESOURCE` (403) |
+| 步骤 2 (非 RESOURCE) | **不降级**，直接抛出 | `RESTRICTED_RESOURCE` (403) |
+| 步骤 4 PUBLIC 兜底 | 降级为**模板权限** | 模板失败则抛常规权限的原始错误 |
+
+---
+
+### 13.5 场景三：PUBLIC 兜底
+
+**定义**：接口装饰 `@AllowAnonymous(AllowAnonymousType.PUBLIC)`，登录用户常规权限检查失败。
+
+**代码追踪**：
+
+```
+步骤 4:
+  permissionCheck() → 失败 → 抛异常
+  allowAnonymousType === PUBLIC → resolvePublicFallback(context, baseShareHeader, error)
+
+  resolvePublicFallback():
+  ├─ tryBaseShareFallback()
+  │    ├─ 无 baseShareHeader → return undefined
+  │    ├─ shareId 格式错 → return undefined
+  │    ├─ baseSharePermissionCheck() 通过 → return true（共享权限）
+  │    └─ baseSharePermissionCheck() 失败 → catch → return undefined
+  │
+  ├─ baseShareResult !== undefined → return baseShareResult
+  │
+  └─ baseShareResult === undefined → templatePermissionCheck()
+       ├─ 通过 → return true（模板权限）
+       └─ 失败 → throw originalError（常规权限的原始错误，不是模板错误）
+```
+
+**tryBaseShareFallback 与 tryBaseSharePermissionCheck 的核心区别**：
+
+| 维度 | tryBaseSharePermissionCheck | tryBaseShareFallback |
+|-----|---------------------------|---------------------|
+| 调用位置 | 步骤 1、步骤 2 | 步骤 4 的 resolvePublicFallback |
+| 异常处理 | **不捕获**，直接向上传播 | **吞掉异常**，return undefined |
+| 返回 undefined 含义 | 格式错/条件不满足，跳过共享检查 | 格式错/校验失败，降级到模板 |
+| 校验失败时 | 请求被拒绝 (403) | 请求降级到模板权限 |
+| 设计意图 | 共享权限作为天花板，不可绕过 | 共享权限作为兜底尝试，失败不应阻断 |
+
+**结论**：PUBLIC 兜底时的权限归属顺序：
+1. 有 baseShareHeader 且校验通过 → **共享权限**
+2. 有 baseShareHeader 但校验失败 → **模板权限**（异常被吞掉）
+3. 无 baseShareHeader → **模板权限**
+4. 模板权限也失败 → **抛常规权限的原始错误**（非模板错误）
+
+---
+
+### 13.6 完整分支归属与错误码速查
+
+**行号参考**: `permission.guard.ts:410-447`
+
+| 条件组合 | 归属权限 | 放行条件 | 失败错误码 |
+|---------|---------|---------|-----------|
+| RESOURCE + valid shareHeader + 校验通过 | 共享权限 | baseSharePermissionCheck 通过 | `RESTRICTED_RESOURCE` (403) |
+| RESOURCE + valid shareHeader + 校验失败 | **无降级** | 不放行 | `RESTRICTED_RESOURCE` (403) |
+| RESOURCE + malformed shareHeader + valid templateHeader | 模板权限 | templatePermissionCheck 通过 | 匿名→`UNAUTHORIZED`(401) / 登录→`RESTRICTED_RESOURCE`(403) |
+| RESOURCE + 无 header | 降级步骤 2-4 | 取决于后续步骤 | 取决于后续步骤 |
+| 非RESOURCE + valid shareHeader + 校验通过 | 共享权限 | tryBaseSharePermissionCheck 通过 | `RESTRICTED_RESOURCE` (403) |
+| 非RESOURCE + valid shareHeader + 校验失败 | **无降级** | 不放行 | `RESTRICTED_RESOURCE` (403) |
+| 非RESOURCE + malformed shareHeader | 降级步骤 3/4 | 取决于后续步骤 | 取决于后续步骤 |
+| 匿名 + PUBLIC | 模板权限 | templatePermissionCheck 通过 | `UNAUTHORIZED`(401) 或 `RESTRICTED_RESOURCE`(403) |
+| 匿名 + USER | 无需权限 | return true | 不失败 |
+| 匿名 + 无装饰器 | **拒绝** | 不放行 | `UNAUTHORIZED` (401) |
+| 登录 + 常规权限通过 | 常规权限 | permissionCheck 通过 | `RESTRICTED_RESOURCE` (403) |
+| 登录 + 常规失败 + PUBLIC + shareHeader通过 | 共享权限 | tryBaseShareFallback 通过 | `RESTRICTED_RESOURCE` (403) |
+| 登录 + 常规失败 + PUBLIC + shareHeader失败 | 模板权限 | templatePermissionCheck 通过 | 抛常规权限原始错误 |
+| 登录 + 常规失败 + PUBLIC + 模板失败 | **拒绝** | 不放行 | 常规权限原始错误 |
+| 登录 + 常规失败 + 非PUBLIC | **拒绝** | 不放行 | 常规权限原始错误 |
+
+---
+
+### 13.7 关键设计洞察
+
+1. **共享权限的两面性**：
+   - 步骤 1/2 中：共享权限是**天花板**（ceiling），校验失败直接拒绝，不降级
+   - 步骤 4 兜底中：共享权限是**垫脚石**（fallback），校验失败被吞掉，降级到模板
+
+2. **malformed header 的隐含风险**：
+   - `getBaseShareIdByHeader` 对非 `shr` 前缀的值返回 `null`
+   - 所有共享检查被静默跳过，请求走常规权限
+   - **不会报错**，但也不会走共享路径——攻击者无法通过伪造 header 绕过常规权限
+
+3. **resolvePublicFallback 的错误保留**：
+   - 模板权限检查失败时，抛出的不是模板错误，而是**常规权限的原始错误**
+   - 这意味着用户看到的是"你没有操作权限"而非"模板权限不足"，避免暴露内部权限结构
+
+4. **RESOURCE 级别的排他性**：
+   - `allowAnonymousType === RESOURCE` 时，只认资源级鉴权（共享/模板）
+   - 即使有有效的 baseShareHeader，如果后续 templateHeader 也无效，会降级到步骤 2
+   - 步骤 2 中相同的 shareHeader 会重新走 `tryBaseSharePermissionCheck`，不会丢失

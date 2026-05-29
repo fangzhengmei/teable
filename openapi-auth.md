@@ -334,6 +334,8 @@ export const initAxios = (options: IInitAxiosOptions = {}) => {
 
 **1. OrganizationMiddleware 推断实现**
 
+⚠️ **时序问题已纠正**：NestJS 中间件在 Guard 之前执行，而 `user.id` 由 AuthGuard 内的 Strategy 注入 CLS。因此 OrganizationMiddleware 执行时 `cls.get('user.id')` 尚不可用。但 Session 认证场景下，`passport.initialize()` 在中间件阶段就已执行（[session.module.ts:19](apps/nestjs-backend/src/features/auth/session/session.module.ts#L19)），会从 Session Cookie 反序列化用户到 `req.user`。因此中间件应从 `req.user` 获取用户 ID，而非 CLS。
+
 ```typescript
 // 企业版 OrganizationMiddleware（架构推断）
 @Injectable()
@@ -345,7 +347,10 @@ export class OrganizationMiddleware implements NestMiddleware {
 
   async use(req: Request, res: Response, next: NextFunction) {
     const orgId = req.headers['x-tea-org-id'] as string;
-    const userId = this.cls.get('user.id');
+    // ⚠️ 此处必须从 req.user 读取，不能从 CLS 读取
+    // 因为中间件在 AuthGuard 之前执行，CLS 中尚无 user.id
+    // req.user 由 passport.initialize() 中间件设置（仅 Session 认证）
+    const userId = (req.user as { id: string })?.id;
 
     if (orgId && userId) {
       const organization = await this.organizationService.getUserOrganization(
@@ -371,7 +376,31 @@ export class OrganizationMiddleware implements NestMiddleware {
 }
 ```
 
-**2. 中间件注册顺序推断**
+**2. 中间件与 Guard 的执行时序分析**
+
+```
+NestJS 请求处理管线（代码已证实的执行顺序）：
+
+1. 中间件阶段
+   ├── session middleware           ← Session Cookie 解析
+   ├── passport.initialize()        ← 将 Session 中的用户反序列化到 req.user
+   ├── ClsMiddleware                ← 初始化 CLS 上下文
+   ├── SessionCsrfMiddleware        ← CSRF 处理
+   └── RequestInfoMiddleware        ← 注入请求信息
+   └── 🔮 OrganizationMiddleware    ← 需在此阶段注入组织信息
+       ⚠️ 此时 CLS 中尚无 user.id（AuthGuard 未执行）
+       ⚠️ 但 req.user 可用（passport.initialize() 已执行）
+       ⚠️ 仅限 Session 认证，AccessToken/JWT 场景下 req.user 不可用
+
+2. Guard 阶段
+   ├── AuthGuard                    ← 执行 Strategy，注入 user.id 到 CLS
+   │   ├── SessionStrategy          ← cls.set('user.id', ...)
+   │   ├── AccessTokenStrategy      ← cls.set('user.id', ..., 'accessTokenId')
+   │   └── JwtStrategy              ← cls.set('user.id', ..., 'tempAuthBaseId')
+   └── PermissionGuard              ← 执行权限校验，注入 permissions 到 CLS
+```
+
+**3. 中间件注册顺序推断**
 
 源码位置：[global.module.ts:126-134](apps/nestjs-backend/src/global/global.module.ts#L126-L134)
 
@@ -391,24 +420,32 @@ configure(consumer: MiddlewareConsumer) {
 }
 ```
 
-**3. 组织切换完整链路推断**
+**4. 组织切换触发点推断**
+
+⚠️ **代码事实核查**：仓库中 `useOrganization` 的 `refetch` 方法未被任何代码调用为"组织切换触发点"。`useOrganization()` 的所有实际使用场景仅是**读取** `organization` 数据：
+
+| 使用位置 | 用途 | 是否调用 refetch |
+|----------|------|-------------------|
+| [DepartmentSelector.tsx:56](packages/sdk/src/components/member-selector/DepartmentSelector.tsx#L56) | 读取 organization 判断是否有组织 | ❌ 未调用 |
+| [DepartmentList.tsx:56](packages/sdk/src/components/member-selector/DepartmentList.tsx#L56) | 读取 organization 判断是否有组织 | ❌ 未调用 |
+| [AccessTokenForm.tsx:50](apps/nextjs-app/src/features/app/blocks/setting/access-token/form/AccessTokenForm.tsx#L50) | 读取 organization 判断是否显示空间范围 | ❌ 未调用 |
+
+因此，**将 `useOrganization.refetch` 视为组织切换触发点仅属推断，无直接代码支持**。企业版中组织切换的 UI 触发点和交互流程在社区版代码中不可见。
+
+**5. 组织切换完整链路推断**
 
 ```
 前端触发（企业版）                     后端处理（企业版）
 ───────────────────                  ──────────────────────────
-用户点击切换组织
+🔮 用户通过组织切换 UI 操作
+（具体 UI 组件在社区版中不存在）
        │
        ▼
-useOrganization.refetch()
+🔮 更新当前组织状态
+（实现方式不可见，可能是 Context/Store）
        │
        ▼
-getOrganizationMe() API
-       │
-       ▼
-更新 React Query Cache
-       │
-       ▼
-initAxios 拦截器注入 X-Tea-Org-Id
+🔮 initAxios 拦截器注入 X-Tea-Org-Id
        │
        ▼
 后续请求携带组织 Header
@@ -419,19 +456,19 @@ initAxios 拦截器注入 X-Tea-Org-Id
                                       读取 X-Tea-Org-Id
                                          │
                                          ▼
+                                      从 req.user 获取 userId（⚠️ 非 CLS）
+                                         │
+                                         ▼
                                       查询组织信息（含部门）
                                          │
                                          ▼
                                       cls.set('organization', {...})
                                          │
                                          ▼
+                                      AuthGuard 认证
+                                         │
+                                         ▼
                                       PermissionGuard 权限校验
-                                         │
-                                         ▼
-                                      getDepartmentIds()
-                                         │
-                                         ▼
-                                      协作者查询（用户 + 部门）
                                          │
                                          ▼
                                       返回新权限
@@ -836,40 +873,47 @@ HTTP 请求发送到后端
         │
         ▼
 ─────────────────────────────────────────
-                后端处理
+          后端处理（✅ 代码已证实 + 🔮 推断）
 ─────────────────────────────────────────
         │
         ▼
-ClsMiddleware 初始化请求上下文
+✅ session middleware + passport.initialize()
+        │   └─► 将 Session 用户反序列化到 req.user（仅 Session 认证）
         │
         ▼
-SessionCsrfMiddleware Session 处理
+✅ ClsMiddleware 初始化请求上下文
         │
         ▼
-RequestInfoMiddleware 注入请求信息
+✅ SessionCsrfMiddleware Session 处理
+        │
+        ▼
+✅ RequestInfoMiddleware 注入请求信息
         │
         ▼
 🔮 OrganizationMiddleware（企业版推断）
         │   ├─► 读取 X-Tea-Org-Id Header
+        │   ├─► 从 req.user 获取 userId（⚠️ 不能从 CLS 读取，此时 AuthGuard 未执行）
         │   ├─► 查询用户组织信息（含部门列表）
         │   └─► cls.set('organization', { id, name, isAdmin, departments })
+        │   ⚠️ 注意：AccessToken/JWT 认证场景下 req.user 不可用，需要其他方案
         │
         ▼
-AuthGuard 认证（AccessTokenStrategy）
-        │   ├─► 验证令牌签名
-        │   ├─► 查询用户信息
-        │   └─► 注入 user.* 和 accessTokenId 到 CLS
+✅ AuthGuard 认证（Strategy 链）
+        │   ├─► SessionStrategy: cls.set('user.*')
+        │   ├─► AccessTokenStrategy: cls.set('user.*', 'accessTokenId')
+        │   └─► JwtStrategy: cls.set('user.*', 'tempAuthBaseId')
+        │   此时 user.id 才写入 CLS ✅
         │
         ▼
-PermissionGuard 权限校验
+✅ PermissionGuard 权限校验
         │
         ├─► 读取 @Permissions() 和 @ResourceMeta()
         │
-        ├─► PermissionGuard.resourcePermission()
+        ├─► ✅ PermissionGuard.resourcePermission()
         │   │
-        │   ├─► PermissionService.validPermissions()
+        │   ├─► ✅ PermissionService.validPermissions()
         │   │     │
-        │   │     ├─► PermissionService.getPermissions()
+        │   │     ├─► ✅ PermissionService.getPermissions()
         │   │     │     ├─► getPermissionsByResourceId()
         │   │     │     │   ├─► getRoleByBaseId()
         │   │     │     │   │   ├─► getDepartmentIds()
@@ -882,7 +926,7 @@ PermissionGuard 权限校验
         │   │     │
         │   │     └─► intersection(userPerms, tokenPerms) → 返回 ownPermissions
         │   │
-        │   └─► cls.set('permissions', ownPermissions)  ← PermissionGuard 注入
+        │   └─► ✅ cls.set('permissions', ownPermissions)  ← PermissionGuard 注入
         │
         ▼
 执行业务逻辑（可从 CLS 读取上下文）
@@ -898,44 +942,50 @@ PermissionGuard 权限校验
 
 ### 6.2 关键关联点说明
 
-1. **Token 校验 → CLS 注入**：
+1. **Token 校验 → CLS 注入**（✅ 代码已证实）：
    - 三种认证策略最终都会将用户信息写入 CLS
    - AccessToken 策略会额外写入 `accessTokenId`，影响后续权限计算
    - 注入的用户信息包括：`user.id`、`user.name`、`user.email`、`user.isAdmin`
 
-2. **组织切换 → CLS 注入**（🔮 企业版推断）：
-   - 前端通过 `initAxios` 拦截器在请求头中注入 `X-Tea-Org-Id`
-   - 后端 `OrganizationMiddleware` 读取 Header，查询组织信息
-   - 将 `organization.id`、`organization.name`、`organization.isAdmin`、`organization.departments` 写入 CLS
-   - **注意**：组织中间件必须在 AuthGuard 之前执行，确保权限计算时能读取到组织信息
+2. **中间件阶段 user.id 不可用**（✅ 代码已证实）：
+   - NestJS 中间件在 Guard 之前执行
+   - `user.id` 由 AuthGuard 内的 Strategy 注入 CLS，中间件执行时 CLS 中尚无 `user.id`
+   - Session 认证下，`passport.initialize()` 在中间件阶段执行，将用户反序列化到 `req.user`
+   - 因此 OrganizationMiddleware 只能从 `req.user` 获取用户 ID（而非 CLS）
+   - AccessToken/JWT 认证场景下 `req.user` 不可用，企业版需要其他方案
 
-3. **组织切换 → 权限计算**（✅ 现有实现）：
+3. **组织切换 → CLS 注入**（🔮 仅推断）：
+   - 前端组织切换的 UI 触发点在社区版代码中不可见
+   - `useOrganization.refetch` 不是组织切换触发点（仅属推断，无直接代码支持）
+   - `X-Tea-Org-Id` Header 传递方式仅属推断
+   - OrganizationMiddleware 实现方式仅属推断
+
+4. **组织切换 → 权限计算**（✅ 代码已证实）：
    - 权限计算时通过 `getDepartmentIds()` 从 CLS 读取部门列表
    - `getRoleBySpaceId()` / `getRoleByBaseId()` 将部门 ID 加入协作者查询条件
    - SQL 查询：`principalId IN (userId, deptId1, deptId2, ...)`
    - 取最高权限角色：`getMaxLevelRole(collaborators)`
-   - 切换组织后，部门列表变化，协作者查询结果变化，最终权限也随之变化
 
-4. **PermissionService → CLS 注入**（✅ 现有实现）：
+5. **PermissionService → CLS 注入**（✅ 代码已证实）：
    - PermissionService 负责注入 `spaceId` 到 CLS
    - 注入时机：在 `getPermissionBySpaceId()`、`getUpperIdByBaseId()`、`getUpperIdByTableId()` 中
    - PermissionService **不负责**注入 `permissions` 到 CLS
 
-5. **PermissionGuard → CLS 注入**（✅ 现有实现）：
+6. **PermissionGuard → CLS 注入**（✅ 代码已证实）：
    - PermissionGuard 负责注入 `permissions` 到 CLS
    - 注入时机：在 `resourcePermission()`、`templatePermissionCheck()`、`baseSharePermissionCheck()` 中
    - 调用 `PermissionService.validPermissions()` 获取权限后，由 Guard 写入 CLS
 
-6. **CLS 上下文 → 权限校验**（✅ 现有实现）：
+7. **CLS 上下文 → 权限校验**（✅ 代码已证实）：
    - `PermissionService` 从 CLS 读取 `user.id`、`accessTokenId`、`organization.departments`
    - 权限计算结果由 `PermissionGuard` 写回 `cls.set('permissions', ownPermissions)`
    - 后续业务逻辑可直接从 CLS 读取权限列表
 
-7. **OpenAPI SDK → 后端鉴权**（✅ 现有实现）：
-   - SDK 通过 `configApi()` 设置的 `Authorization` 头传递令牌
-   - 后端通过 `AccessTokenStrategy` 解析并验证
-   - 服务端内部调用时通过 `runWithAxios()` 传递上下文
-   - 组织切换通过 HTTP Header `X-Tea-Org-Id` 传递（🔮 企业版推断）
+8. **OpenAPI SDK → 后端鉴权**（✅ 代码已证实 + 🔮 推断）：
+   - ✅ SDK 通过 `configApi()` 设置的 `Authorization` 头传递令牌
+   - ✅ 后端通过 `AccessTokenStrategy` 解析并验证
+   - ✅ 服务端内部调用时通过 `runWithAxios()` 传递上下文
+   - 🔮 组织切换通过 HTTP Header `X-Tea-Org-Id` 传递（仅推断）
 
 ## 7. 关键文件索引
 
@@ -1017,100 +1067,105 @@ PermissionGuard.resourcePermission()
 
 ## 9. 组织切换时序与关联关系总结
 
-### 9.1 ✅ 现有实现时序图（社区版）
+### 9.1 ✅ 代码已证实的时序图（社区版）
 
 ```
 前端                                  后端
  │                                    │
- │  1. 用户登录（Session/JWT）          │
+ │  1. ✅ 用户登录（Session/JWT）      │
  │                                    │
  │  ◄─────────────────────────────────┤
  │    2. 返回用户信息                  │
  │                                    │
- │  3. initAxios 注册拦截器           │
+ │  3. ✅ initAxios 注册拦截器         │
  │    └─> Base Share、Template Header │
  │                                    │
- │  4. 发起业务请求（如查询空间）      │
+ │  4. ✅ 发起业务请求                 │
  │    ┌─ Authorization: Bearer xxx   │
  │    └─> GET /space/list            │
  │                                    │
- │                                    │  5. ClsMiddleware 初始化 CLS
- │                                    │  6. RequestInfoMiddleware 注入请求信息
- │                                    │  7. AuthGuard 认证
+ │                                    │  5. ✅ session + passport.initialize()
+ │                                    │      └─> 将 Session 用户反序列化到 req.user
+ │                                    │  6. ✅ ClsMiddleware 初始化 CLS
+ │                                    │  7. ✅ RequestInfoMiddleware 注入请求信息
+ │                                    │  8. ✅ AuthGuard 认证
  │                                    │      └─> cls.set('user.id', userId)
+ │                                    │         此时 user.id 才写入 CLS ✅
  │                                    │
- │                                    │  8. PermissionGuard 权限校验
+ │                                    │  9. ✅ PermissionGuard 权限校验
  │                                    │      ├─> PermissionGuard.resourcePermission()
  │                                    │      │   ├─> PermissionService.validPermissions()
  │                                    │      │   │   ├─> getDepartmentIds()
  │                                    │      │   │   │   └─> cls.get('organization.departments')
- │                                    │      │   │   │      └─> 返回 []（社区版为 undefined）
- │                                    │      │   │   ├─> 查询协作者（仅用户ID）
+ │                                    │      │   │   │      └─> ✅ 返回 []（社区版为 undefined）
+ │                                    │      │   │   ├─> ✅ 查询协作者（仅用户ID）
  │                                    │      │   │   ├─> getPermissions(role)
  │                                    │      │   │   └─> 返回 ownPermissions
- │                                    │      │   └─> cls.set('permissions', ownPermissions)
+ │                                    │      │   └─> ✅ cls.set('permissions', ownPermissions)
  │                                    │      └─> 返回 true
  │                                    │
- │                                    │  9. 执行业务逻辑
+ │                                    │  10. ✅ 执行业务逻辑
  │                                    │      └─> 使用权限查询数据
  │                                    │
  │  ◄─────────────────────────────────┤
- │    10. 返回数据                     │
+ │    11. 返回数据                     │
  │                                    │
 ```
 
-### 9.2 🔮 企业版推断时序图
+### 9.2 🔮 仅推断的企业版时序图
+
+⚠️ 以下时序图中的组织切换触发点、X-Tea-Org-Id Header、OrganizationMiddleware 均为推断，无直接代码支持。
 
 ```
 前端                                  后端
  │                                    │
- │  1. 用户点击切换组织                │
- │    └─> useOrganization.refetch()  │
+ │  1. 🔮 用户通过组织切换 UI 操作     │
+ │    （具体 UI 组件在社区版中不存在）  │
  │                                    │
- │  2. 调用 getOrganizationMe()       │
- │    └─> GET /organization/me       │
+ │  2. 🔮 更新当前组织状态             │
+ │    （实现方式不可见）               │
  │                                    │
- │  ◄─────────────────────────────────┤
- │    3. 返回组织信息（含部门列表）    │
+ │  3. 🔮 initAxios 拦截器注入        │
+ │    └─> X-Tea-Org-Id Header        │
  │                                    │
- │  4. 更新 React Query Cache         │
- │    └─> organization 状态更新       │
- │                                    │
- │  5. initAxios 拦截器生效           │
- │    └─> 后续请求注入 X-Tea-Org-Id   │
- │                                    │
- │  6. 发起业务请求（如查询空间）      │
+ │  4. 🔮 发起业务请求                │
  │    ┌─ Authorization: Bearer xxx   │
  │    ├─ X-Tea-Org-Id: org_xxx       │
  │    └─> GET /space/list            │
  │                                    │
- │                                    │  7. ClsMiddleware 初始化 CLS
- │                                    │  8. RequestInfoMiddleware 注入请求信息
- │                                    │  9. OrganizationMiddleware（企业版推断）
+ │                                    │  5. ✅ session + passport.initialize()
+ │                                    │      └─> req.user 可用（仅 Session 认证）
+ │                                    │  6. ✅ ClsMiddleware 初始化 CLS
+ │                                    │  7. ✅ RequestInfoMiddleware 注入请求信息
+ │                                    │  8. 🔮 OrganizationMiddleware
  │                                    │      ├─> 读取 X-Tea-Org-Id
+ │                                    │      ├─> ⚠️ 从 req.user 获取 userId
+ │                                    │      │   （不能从 CLS 读取，此时 AuthGuard 未执行）
  │                                    │      ├─> 查询组织信息（含部门）
  │                                    │      └─> cls.set('organization', {...})
+ │                                    │      ⚠️ AccessToken/JWT 场景下 req.user 不可用
  │                                    │
- │                                    │  10. AuthGuard 认证
- │                                    │       └─> cls.set('user.id', userId)
+ │                                    │  9. ✅ AuthGuard 认证
+ │                                    │      └─> cls.set('user.id', userId)
+ │                                    │         此时 user.id 才写入 CLS ✅
  │                                    │
- │                                    │  11. PermissionGuard 权限校验
+ │                                    │  10. ✅ PermissionGuard 权限校验
  │                                    │       ├─> PermissionGuard.resourcePermission()
  │                                    │       │   ├─> PermissionService.validPermissions()
  │                                    │       │   │   ├─> getDepartmentIds()
  │                                    │       │   │   │   └─> cls.get('organization.departments')
- │                                    │       │   │   │      └─> 返回 [dept1, dept2, ...]
- │                                    │       │   │   ├─> 查询协作者（用户ID + 部门ID）
+ │                                    │       │   │   │      └─> 🔮 返回 [dept1, dept2, ...]
+ │                                    │       │   │   ├─> 🔮 查询协作者（用户ID + 部门ID）
  │                                    │       │   │   ├─> getPermissions(role)
  │                                    │       │   │   └─> 返回 ownPermissions
- │                                    │       │   └─> cls.set('permissions', ownPermissions)
+ │                                    │       │   └─> ✅ cls.set('permissions', ownPermissions)
  │                                    │       └─> 返回 true
  │                                    │
- │                                    │  12. 执行业务逻辑
+ │                                    │  11. ✅ 执行业务逻辑
  │                                    │       └─> 使用新权限查询数据
  │                                    │
  │  ◄─────────────────────────────────┤
- │    13. 返回新组织下的数据           │
+ │    12. 返回新组织下的数据           │
  │                                    │
 ```
 
@@ -1128,12 +1183,13 @@ PermissionGuard.resourcePermission()
 | PermissionGuard.templatePermissionCheck() | - | `permissions` | [permission.guard.ts:90-130](apps/nestjs-backend/src/features/auth/guard/permission.guard.ts#L90-L130) | ✅ |
 | PermissionGuard.baseSharePermissionCheck() | `user.id` | `permissions`, `user` | [permission.guard.ts:132-169](apps/nestjs-backend/src/features/auth/guard/permission.guard.ts#L132-L169) | ✅ |
 
-### 9.4 🔮 企业版推断关联关系
+### 9.4 🔮 仅推断的企业版关联关系
 
-| 触发点 | 读取 CLS 字段 | 写入 CLS 字段 | 实现状态 |
-|--------|--------------|--------------|----------|
-| 前端 initAxios 拦截器 | React Query Cache | 请求头 `X-Tea-Org-Id` | 🔮 推断 |
-| OrganizationMiddleware.use() | 请求头 `X-Tea-Org-Id` | `organization.id`, `organization.name`, `organization.isAdmin`, `organization.departments` | 🔮 推断 |
+| 触发点 | 读取 | 写入 | 实现状态 | 备注 |
+|--------|------|------|----------|------|
+| 前端组织切换 UI | - | 当前组织状态 | 🔮 仅推断 | 社区版无此 UI 组件，`useOrganization.refetch` 未被用作切换触发点 |
+| 前端 initAxios 拦截器 | 当前组织状态 | 请求头 `X-Tea-Org-Id` | 🔮 仅推断 | Header 名称和注入方式均未在代码中找到 |
+| OrganizationMiddleware.use() | 请求头 `X-Tea-Org-Id`，`req.user` | `organization.id`, `organization.name`, `organization.isAdmin`, `organization.departments` | 🔮 仅推断 | ⚠️ 必须从 `req.user` 获取 userId（非 CLS），仅 Session 认证可用 |
 
 ### 9.5 ✅ 现有实现数据流向图
 
@@ -1175,24 +1231,17 @@ Authorization Header
 └─────────────────────────────────────────────┘
 ```
 
-### 9.6 ✅ 设计要点总结（现有实现）
+### 9.6 ✅ 代码已证实 / 🔮 仅推断 的关键结论
 
-1. **职责分离**：
-   - PermissionGuard 负责流程控制和最终权限注入
-   - PermissionService 负责纯业务逻辑的权限计算
-   - 两者通过 CLS 传递上下文，解耦设计
-
-2. **无状态设计**：
-   - 权限不依赖服务端状态，每次请求重新计算
-   - 组织信息通过 HTTP Header 传递（企业版推断）
-   - 天然支持分布式部署
-
-3. **CLS 解耦**：
-   - 通过 CLS 传递上下文，业务代码无需关心组织切换
-   - 权限计算逻辑自动读取 `organization.departments`
-   - 切换组织后下一次请求自然使用新的部门列表
-
-4. **预留扩展**：
-   - 社区版虽然没有完整组织功能，但所有扩展点都已预留
-   - 企业版只需实现 OrganizationMiddleware 和组织服务即可
-   - 权限计算逻辑无需修改，自动支持部门协作者
+| 结论 | 标记 | 依据 |
+|------|------|------|
+| NestJS 中间件在 Guard 之前执行 | ✅ 代码已证实 | NestJS 框架机制，[global.module.ts:126-134](apps/nestjs-backend/src/global/global.module.ts#L126-L134) |
+| `user.id` 由 AuthGuard 内的 Strategy 注入 CLS | ✅ 代码已证实 | [session.strategy.ts:36](apps/nestjs-backend/src/features/auth/strategies/session.strategy.ts#L36), [access-token.strategy.ts:52](apps/nestjs-backend/src/features/auth/strategies/access-token.strategy.ts#L52), [jwt.strategy.ts:57](apps/nestjs-backend/src/features/auth/strategies/jwt.strategy.ts#L57) |
+| 中间件执行时 CLS 中尚无 `user.id` | ✅ 代码已证实 | 中间件在 Guard 之前执行，`user.id` 由 Guard 内的 Strategy 注入 |
+| `passport.initialize()` 在中间件阶段将用户反序列化到 `req.user` | ✅ 代码已证实 | [session.module.ts:19](apps/nestjs-backend/src/features/auth/session/session.module.ts#L19) |
+| OrganizationMiddleware 应从 `req.user` 获取 userId（而非 CLS） | ✅ 代码已证实 | 基于上述时序推导，中间件执行时 CLS 中尚无 `user.id` |
+| AccessToken/JWT 场景下中间件中 `req.user` 不可用 | ✅ 代码已证实 | `passport.initialize()` 仅处理 Session 认证，AccessToken/JWT 由 Guard 内的 Strategy 处理 |
+| `useOrganization.refetch` 是组织切换触发点 | 🔮 仅推断 | 仓库中无任何代码调用 `refetch` 作为切换触发点，所有使用仅读取 `organization` |
+| `X-Tea-Org-Id` Header 传递方式 | 🔮 仅推断 | Header 名称和注入方式均未在代码中找到 |
+| OrganizationMiddleware 实现 | 🔮 仅推断 | 社区版无此中间件，企业版实现不可见 |
+| 前端组织切换 UI 组件 | 🔮 仅推断 | 社区版无此 UI 组件 |

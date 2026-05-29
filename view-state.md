@@ -96,7 +96,7 @@ KanbanView (入口)
    - 排序位置：`{ viewId, anchorId, position }`（确定在目标列中的位置）
 3. 本地调用 `moveTo()` 乐观更新两个 stack 的 cardMap
 
-**持久化**：`PUT /table/{tableId}/record/{recordId}`，后端同时处理字段值更新和记录位置更新。
+**持久化**：`PATCH /table/{tableId}/record/{recordId}`，后端同时处理字段值更新和记录位置更新。
 
 ### 2.3 看板分组数据来源（GroupPoint）
 
@@ -166,7 +166,7 @@ GalleryView (入口)
    - `record.fields: {}`（空，不修改字段值）
    - `record.order: { viewId, anchorId, position }`（指定新位置）
 
-**持久化**：`PUT /table/{tableId}/record/{recordId}`，后端同时处理位置更新。
+**持久化**：`PATCH /table/{tableId}/record/{recordId}`，后端同时处理位置更新。
 
 ### 3.3 画廊与看板的拖动差异
 
@@ -237,15 +237,15 @@ GalleryView (入口)
 
 ### 4.4 SDK 模型层 API 映射
 
-| SDK 方法 | REST API | 用途 |
-|---|---|---|
-| `view.updateOption()` | `updateViewOptions` | 更新视图 options（如 stackFieldId） |
-| `view.updateColumnMeta()` | `updateViewColumnMeta` | 更新字段在视图中的元信息（order、visible 等） |
-| `view.updateOrder()` | `updateViewOrder` | 更新视图本身在视图列表中的排序 |
-| `view.manualSort()` | `manualSortView` | 手动排序触发全量排序 |
-| `stackField.convert()` | `convertField` | 转换字段类型/选项（看板列重排实质调用） |
-| `updateRecordOrders()` | `updateRecordOrders` | 批量更新记录排序 |
-| `updateRecord()` | `updateRecord` | 更新单条记录（含字段值 + order） |
+| SDK 方法 | HTTP | REST API 路径 | 用途 |
+|---|---|---|---|
+| `view.updateOption()` | PATCH | `updateViewOptions` | 更新视图 options（如 stackFieldId） |
+| `view.updateColumnMeta()` | PATCH | `updateViewColumnMeta` | 更新字段在视图中的元信息（order、visible 等） |
+| `view.updateOrder()` | PUT | `updateViewOrder` | 更新视图本身在视图列表中的排序 |
+| `view.manualSort()` | PUT | `manualSortView` | 手动排序触发全量排序 |
+| `stackField.convert()` | PUT | `convertField` | 转换字段类型/选项（看板列重排实质调用） |
+| `updateRecordOrders()` | PUT | `updateRecordOrders` | 批量更新记录排序 |
+| `updateRecord()` | PATCH | `updateRecord` | 更新单条记录（含字段值 + order） |
 
 ---
 
@@ -299,9 +299,14 @@ async updateRecordOrders(...) {
 
 ### 5.4 已启用 v2 的视图相关功能
 
-目前仅 `reorderRecords`（批量记录排序）标记了 `@UseV2Feature('reorderRecords')`：
-- **走 v2**：看板同列卡片重排（调用 `updateRecordOrders` API）
-- **走 v1**：画廊卡片排序、看板跨列移动
+目前以下功能标记了 `@UseV2Feature`：
+- `reorderRecords`：看板同列卡片重排（调用 `updateRecordOrders` API）
+- `updateRecord`：看板跨列移动、画廊卡片排序
+- `convertField`：看板列重排（改变 SingleSelect choices 顺序）
+
+**实际路由**：
+- **走 v2（金丝雀启用时）**：看板同列卡片重排、看板跨列移动、看板列重排
+- **强制走 v1**：画廊卡片排序（V2FeatureGuard 降级）
 
 ---
 
@@ -518,16 +523,18 @@ updateRecordOrders({
 
 ### 7.4 API 方法与实际代码的一致性核对
 
-| 场景 | 前端调用 | 后端实际处理 | 一致性 |
-|---|---|---|---|
-| 画廊卡片排序 | `updateRecord(fields={}, order)` | `updateRecord` → `updateRecords` → `updateRecordOrders` | ✅ 一致 |
-| 看板跨列移动 | `updateRecord(fields={...}, order)` | `updateRecord` → `updateRecords` → `updateRecordOrders` | ✅ 一致 |
-| 看板同列卡片 | `updateRecordOrders` | 独立 API，直接处理 | ✅ 一致 |
+| 场景 | 前端调用 | HTTP | 后端实际处理 | 一致性 |
+|---|---|---|---|---|
+| 画廊卡片排序 | `updateRecord(fields={}, order)` | PATCH | `updateRecord` → `updateRecords` → 内部 `updateRecordOrders` | ✅ 一致 |
+| 看板跨列移动 | `updateRecord(fields={...}, order)` | PATCH | `updateRecord` → `updateRecords` → 内部 `updateRecordOrders` | ✅ 一致 |
+| 看板同列卡片 | `updateRecordOrders` | PUT | 独立 API，直接处理 | ✅ 一致 |
+| 看板列重排 | `stackField.convert()` | PUT | `convertField` API → 字段结构变更 | ✅ 一致 |
 
 **不一致之处**：
 - 画廊调用 `updateRecord` 传入 `fields={}`，这是一个"空更新"，但后端仍然会走完整的记录更新流程（包括系统字段更新、计算字段联动等）
-- 从性能角度看，画廊应该直接调用 `updateRecordOrders` API，与看板同列卡片重排保持一致
+- 从性能角度看，画廊应该直接调用 `updateRecordOrders` API（PUT），与看板同列卡片重排保持一致
 - 但当前实现是**正确的**，只是有优化空间
+- 注意：后端 `RecordUpdateService.updateRecords` 内部调用 `this.viewOpenApiService.updateRecordOrders()` 是**直接调用 service 方法**，不再经过 Controller 层的 v1/v2 路由判断
 
 ---
 
@@ -535,19 +542,20 @@ updateRecordOrders({
 
 ### 8.1 各场景的 v1/v2 路径判定
 
-| 场景 | API | Feature 标记 | V2Guard 检查 | 实际路径 |
-|---|---|---|---|---|
-| 画廊卡片排序 | `updateRecord` | `updateRecord` | `fields={}` 且有 `order` → **强制 v1** | v1 |
-| 看板跨列移动 | `updateRecord` | `updateRecord` | `fields` 非空 → 正常判定 | 可 v1 或 v2 |
-| 看板同列卡片 | `updateRecordOrders` | `reorderRecords` | 正常判定 | 可 v1 或 v2 |
-| 看板列重排 | `convertField` | 无 | 无标记 → **v1 仅** | v1 |
+| 场景 | API | HTTP | Feature 标记 | V2Guard 检查 | 实际路径 |
+|---|---|---|---|---|---|
+| 画廊卡片排序 | `updateRecord` | PATCH | `updateRecord` | `fields={}` 且有 `order` → **强制 v1** | v1 |
+| 看板跨列移动 | `updateRecord` | PATCH | `updateRecord` | `fields` 非空 → 正常判定 | 可 v1 或 v2 |
+| 看板同列卡片 | `updateRecordOrders` | PUT | `reorderRecords` | 正常判定 | 可 v1 或 v2 |
+| 看板列重排 | `convertField` | PUT | `convertField` | 正常判定 | 可 v1 或 v2 |
 
 ### 8.2 空列隐藏 bug 与 v1/v2 的关联
 
 空列隐藏时拖动列导致 choices 丢失的 bug：
-- **与 v1/v2 无关**：因为列重排调用的是 `convertField` API，没有 `@UseV2Feature` 标记
-- 始终走 v1 路径
-- bug 存在于前端逻辑，不是后端版本差异导致的
+- **与 v1/v2 路径无关**：bug 存在于前端 `KanbanContainer.tsx` 的 `newChoices` 构造逻辑
+- `convertField` API 有 `@UseV2Feature('convertField')` 标记，可以走 v2 路径
+- 但无论走 v1 还是 v2，后端接收到的 `newChoices` 已经是不完整的（缺少被隐藏的空列）
+- 因此 bug 的根源是前端构造 `newChoices` 时丢失了空列，不是后端版本差异导致的
 
 ### 8.3 记录排序与 v1/v2 的行为差异
 
@@ -893,12 +901,12 @@ API 请求
 
 ### 13.3 v1/v2 迁移状态
 
-| 功能 | v1 支持 | v2 支持 | 备注 |
-|---|---|---|---|
-| 看板列重排 | ✅ | ❌ | 无 @UseV2Feature 标记 |
-| 看板同列卡片 | ✅ | ✅ | 有标记 |
-| 看板跨列移动 | ✅ | ✅ | 有标记（需 fields 非空） |
-| 画廊卡片排序 | ✅ | ❌ | 强制走 v1 |
+| 功能 | API | HTTP | @UseV2Feature | v1 支持 | v2 支持 | 备注 |
+|---|---|---|---|---|---|---|
+| 看板列重排 | `convertField` | PUT | `convertField` | ✅ | ✅ | 金丝雀启用时可走 v2 |
+| 看板同列卡片 | `updateRecordOrders` | PUT | `reorderRecords` | ✅ | ✅ | 金丝雀启用时可走 v2 |
+| 看板跨列移动 | `updateRecord` | PATCH | `updateRecord` | ✅ | ✅ | 需 fields 非空 |
+| 画廊卡片排序 | `updateRecord` | PATCH | `updateRecord` | ✅ | ❌ | V2FeatureGuard 强制走 v1 |
 
 ---
 
@@ -927,6 +935,7 @@ API 请求
 | `apps/nestjs-backend/.../view-open-api.service.ts` | 后端视图操作服务（v1） |
 | `apps/nestjs-backend/.../view-open-api-v2.service.ts` | 后端视图操作服务（v2） |
 | `apps/nestjs-backend/.../record-open-api.controller.ts` | 记录 API Controller |
+| `apps/nestjs-backend/.../field-open-api.controller.ts` | 字段 API Controller（含 convertField v1/v2 路由） |
 | `apps/nestjs-backend/.../record-modify/record-update.service.ts` | 记录更新服务（处理 order） |
 | `apps/nestjs-backend/.../canary/canary.service.ts` | 金丝雀发布决策服务 |
 | `apps/nestjs-backend/.../canary/guards/v2-feature.guard.ts` | v1/v2 路由 Guard |

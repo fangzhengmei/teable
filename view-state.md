@@ -414,7 +414,120 @@ const newChoices = newStackIds
 - 因此它不参与字段 choices 顺序的持久化
 - 它始终显示在最左边，不受列拖动影响
 
-### 6.7 建议的修复方案
+### 6.7 choice.name 映射的边界风险分析
+
+#### 6.7.1 `keyBy(choices, 'name')` 的碰撞行为
+
+看板列重排代码（`KanbanContainer.tsx:68`）使用 `keyBy(choices, 'name')` 构建查找映射：
+
+```typescript
+const choiceMap = keyBy(choices, 'name');  // { [name]: choice }
+```
+
+`lodash.keyBy` 的行为是：**当多个元素拥有相同 key 时，后出现的覆盖先出现的**。如果两个 choice 的 `name` 相同，`choiceMap` 中只保留最后一个，前一个被静默丢弃。
+
+#### 6.7.2 同名 choice 能否出现？— 各层校验梳理
+
+| 层级 | 机制 | 行为 | 代码位置 |
+|---|---|---|---|
+| Zod Schema | `selectFieldChoiceSchema` 只校验 `id/name/color` 非空 | ❌ 不校验 name 唯一性 | `select-option.schema.ts:4-8` |
+| v1 后端写入 | `prepareSelectOptions` 遍历 choices，用 `Set` 检测重名 | ✅ 抛出 `choice name X is already exists` | `field-supplement.service.ts:1307-1320` |
+| v2 后端写入 | 走 DDD 命令总线，同类型转换仍经过 `prepareSelectOptions` | ✅ 抛出相同错误 | `field-supplement.service.ts:1653-1656` |
+| v2 后端读取 | `deduplicateSelectChoiceDtos` 保留首个、丢弃后续 | ⚠️ 静默去重 | `DefaultTableMapper.ts:143-155` |
+| v2 导入 | `normalizeSelectChoices` 对 name 做 trim 后去重 | ⚠️ 静默去重 | `DotTeaFieldNormalizer.ts:22-54` |
+| 前端编辑器 | SelectEditor 无前端唯一性校验 | ❌ 无前端拦截 | `SelectEditor.tsx` |
+
+**结论**：通过正常 v1/v2 API 路径**不可能**创建同名 choice（后端 `prepareSelectOptions` 会直接拒绝）。但 Zod 层和前端层均无此校验，以下场景理论上可产生同名 choice：
+
+1. **直接操作数据库**绕过 API 校验
+2. **v2 导入流程**（dottea）：`normalizeSelectChoices` 会去重但保留首个，不报错
+3. **极端竞态条件**：两个并发请求同时添加同名选项（事务隔离级别不足时）
+
+#### 6.7.3 同名 choice 出现时的影响推导
+
+假设 choices 中存在两个同名选项（name 相同，id/color 不同）：
+
+```
+choices = [
+  { id: 'choA', name: 'Todo', color: 'red' },     ← 先出现
+  { id: 'choB', name: 'Todo', color: 'blue' },    ← 后出现
+]
+```
+
+**影响 1：`KanbanContainer.tsx:68` — 列重排丢选项**
+
+```typescript
+const choiceMap = keyBy(choices, 'name');
+// 结果: { 'Todo': { id: 'choB', name: 'Todo', color: 'blue' } }
+// choA 被静默丢失！
+```
+
+当用户拖动列重排时，`newChoices` 构造过程中 `choA` 永远不会被查找到，因为它被 `keyBy` 覆盖了。列重排完成后，只有 `choB` 会保留在 choices 中，`choA` 被永久删除。
+
+**影响 2：`SelectFieldCore.innerChoicesMap:60` — 单元格校验偏差**
+
+```typescript
+// select.field.abstract.ts:60
+this._innerChoicesMap = keyBy(choices, 'name');
+```
+
+`validateCellValue` 通过 `innerChoicesMap[value]` 查找。如果 cell 值为 `'Todo'`，它只匹配到 `choB`（blue），`choA`（red）的记录虽然字段值正确但无法被精确识别。这在 v1 的 `repair` 逻辑中不会出问题（因为 repair 只检查 name 是否在 map 中），但如果将来有基于 choice.id 的逻辑则会出错。
+
+**影响 3：`KanbanProvider.tsx:174` — stackMap 覆盖**
+
+```typescript
+if (type === FieldType.SingleSelect) {
+  stackMap[value as string] = obj;
+}
+```
+
+如果两个 groupPoint 的 value 都是 `'Todo'`，后一个会覆盖前一个的 stack 数据（count、id）。但 groupPoints 来自后端聚合查询，后端按 choice name 分组时自然合并，不会出现同一 name 两条 Header 记录的情况。
+
+#### 6.7.4 同名冲突 + 空列隐藏的复合风险
+
+两个 bug 独立但可叠加：
+
+| Bug | 丢失数据 | 触发条件 |
+|---|---|---|
+| 空列隐藏（6.4节） | 被隐藏的空列 choice | `isEmptyStackHidden=true` 且拖动列 |
+| 同名 keyBy（本节） | 先出现的同名 choice | choices 中存在同名选项且拖动列 |
+
+**叠加场景**：
+- choices = [A(red), B(blue, 空), A(green)]（B 为空，两个 A 同名）
+- `isEmptyStackHidden=true`
+- 可见列：[未分类, A(green)] ← B 被隐藏，keyBy 保留最后的 A
+- 拖动列后 `newChoices = [A(green)]`
+- **A(red) 和 B(blue) 同时丢失**
+
+**可复现路径**（需要绕过后端校验）：
+1. 直接修改数据库，向 SingleSelect 字段的 options.choices 插入同名项
+2. 开启"隐藏空列"
+3. 拖动任意列
+4. 关闭"隐藏空列"，检查字段选项：同名的第一个和被隐藏的空列均被删除
+
+#### 6.7.5 v1/v2 行为不一致
+
+| 维度 | v1 | v2 |
+|---|---|---|
+| 写入校验 | `prepareSelectOptions` 抛异常 | 同 v1（同类型转换） |
+| 读取处理 | 无去重 | `deduplicateSelectChoiceDtos` 静默去重（保留首个） |
+| 导入处理 | N/A | `normalizeSelectChoices` 静默去重（保留首个，trim 后比较） |
+| 前端 `keyBy` | 保留最后一个 | 保留最后一个 |
+
+**矛盾点**：v2 读取层去重保留**首个**，前端 `keyBy` 保留**最后一个**。如果同名 choice 混入数据库，v2 读取层和前端会呈现不同的选项。
+
+#### 6.7.6 建议的修复方案
+
+**短期（前端）**：
+1. `KanbanContainer.tsx` 列重排逻辑中，将 `keyBy(choices, 'name')` 改为 `keyBy(choices, 'id')`
+2. 相应修改 `choiceMap[stack.data as string]` 的查找方式，通过 `stackMap[choiceId]` → choice.id 匹配
+3. 同时修复空列隐藏问题（6.7节方案），使用原始 choices 遍历
+
+**长期（后端）**：
+1. 在 Zod `selectFieldOptionsSchema` 中增加 `z.array(selectFieldChoiceSchema).refine(choices => new Set(choices.map(c => c.name)).size === choices.length)` 强制唯一性
+2. 统一 v1/v2 对同名 choice 的处理策略：要么全部拒绝（推荐），要么全部去重但保持一致的保留策略
+
+### 6.8 建议的修复方案（空列隐藏）
 
 在 `KanbanContainer.tsx` 的列重排逻辑中，构造 `newChoices` 时应：
 1. 遍历**原始完整的 choices 数组**，而非 `newStackIds`
@@ -888,6 +1001,16 @@ API 请求
 - 原因：构造 `newChoices` 时只遍历可见列的 `newStackIds`，空列不在其中
 - 修复建议：遍历原始 choices，根据 `newStackIds` 调整顺序而非过滤
 
+**Bug 2：`keyBy(choices, 'name')` 同名选项碰撞丢数据**
+- 位置：`KanbanContainer.tsx:68`（列重排）、`select.field.abstract.ts:60`（单元格校验）
+- 现象：如果 choices 中存在同名选项，`keyBy` 保留最后一个，前一个被静默丢弃
+- 正常 API 路径下不会出现同名（后端 `prepareSelectOptions` 拒绝），但直接操作数据库或 v2 导入可能产生
+- 影响：列重排后同名的前一个 choice 永久丢失；单元格校验只能匹配最后一个
+- v1/v2 不一致：v2 读取层 `deduplicateSelectChoiceDtos` 保留**首个**，前端 `keyBy` 保留**最后一个**
+- 修复建议：前端改用 `keyBy(choices, 'id')`；Zod schema 增加 name 唯一性校验
+
+**Bug 1 + Bug 2 可叠加**：同名 + 空列隐藏时，一次拖动可同时丢失多个 choice
+
 ### 13.2 可优化点
 
 **优化点 1：画廊卡片排序应直接调用 updateRecordOrders**
@@ -943,3 +1066,9 @@ API 请求
 | `packages/openapi/src/record/update.ts` | 记录更新 API 定义 |
 | `packages/openapi/src/view/update-order.ts` | 视图排序 API 定义 |
 | `packages/openapi/src/view/update-record-order.ts` | 记录排序 API 定义 |
+| `packages/core/src/models/field/derivate/abstract/select-option.schema.ts` | Select choice schema（id/name/color，无 name 唯一性校验） |
+| `packages/core/src/models/field/derivate/abstract/select.field.abstract.ts` | SelectFieldCore（innerChoicesMap 使用 keyBy(choices,'name')） |
+| `apps/nestjs-backend/.../field-calculate/field-supplement.service.ts` | 后端 prepareSelectOptions（同名 choice 校验 + 抛异常） |
+| `apps/nestjs-backend/src/utils/major-field-keys-changed.ts` | 判断字段变更是否为"重大变更"（choices 变更算重大变更） |
+| `packages/v2/core/src/ports/mappers/defaults/DefaultTableMapper.ts` | v2 读取层 deduplicateSelectChoiceDtos（静默去重，保留首个） |
+| `packages/v2/dottea/src/normalizer/DotTeaFieldNormalizer.ts` | v2 导入 normalizeSelectChoices（trim 后去重，保留首个） |
